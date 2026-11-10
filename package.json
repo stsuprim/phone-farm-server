@@ -1,0 +1,22 @@
+{
+  "name": "phone-farm-server",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=20" },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "check": "tsc --noEmit",
+    "start": "node dist/index.js",
+    "dev:mock": "MOCK=true tsx src/index.ts",
+    "init-env": "node scripts/init-env.mjs",
+    "test": "tsx test/smoke.ts"
+  },
+  "dependencies": { "ws": "^8.18.0" },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/ws": "^8.5.12",
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.0"
+  }
+}

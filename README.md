@@ -1,0 +1,94 @@
+# Phone Farm Server
+
+Mac-mini-side server for an iPhone farm. Lotus's Windows "Phones" page talks to it over HTTP/WebSocket.
+Node 20+/TypeScript, one runtime dependency (`ws`). It discovers USB iPhones (libimobiledevice), runs one
+WebDriverAgent (WDA) per phone on its own ports, and exposes an authenticated API.
+
+## Try it without a Mac (mock mode)
+
+```
+npm install
+npm run init-env        # creates .env with a random API_TOKEN (gitignored)
+MOCK=true npm run dev:mock    # PowerShell: $env:MOCK="true"; npm run dev:mock
+npm test                # smoke test against an in-process mock server
+```
+Mock mode serves 4 fake phones (the 4th is "unplugged"), generated PNG screenshots/frames; taps and swipes show up
+as red rings/yellow lines on the next frame. Coordinates are iPhone points (390x844 logical screen).
+
+## API
+
+All endpoints except `/health` need `Authorization: Bearer <API_TOKEN>`. Errors: `{"error": "..."}` with 400/401/404/503/502.
+
+| Method | Path | Body / query | Result |
+|---|---|---|---|
+| GET | `/health` | – | `{ok, mock}` (no auth) |
+| GET | `/phones` | – | `[{udid, name, model, ios, battery, online, ready}]` (`battery` 0-100 or null; `model` is the product type e.g. `iPhone14,5`; `ready` = controllable) |
+| GET | `/phones/:udid/screenshot` | `?format=png` (default) or `jpeg` | image bytes (`jpeg` = latest MJPEG frame; mock always returns PNG, check `Content-Type`) |
+| WS | `/phones/:udid/stream` | token via header or `?token=` | first a text message `{"type":"hello","contentType":"image/jpeg"}`, then one binary message per frame (JPEG in real mode, PNG in mock) |
+| POST | `/phones/:udid/tap` | `{x, y}` | `{ok:true}` |
+| POST | `/phones/:udid/swipe` | `{x1, y1, x2, y2, ms}` (`ms` default 300) | `{ok:true}` |
+| POST | `/phones/:udid/type` | `{text}` | `{ok:true}` |
+| POST | `/phones/:udid/home` | `{}` | `{ok:true}` |
+| POST | `/phones/:udid/launch` | `{bundleId}` | `{ok:true}` |
+
+Coordinates are in points (WDA's coordinate space), not pixels.
+
+## Mac setup (real mode)
+
+1. **Xcode**: install from the App Store, open it once, accept the license, then
+   `sudo xcode-select -s /Applications/Xcode.app && sudo xcodebuild -runFirstLaunch`.
+   Sign in with an Apple ID in Xcode > Settings > Accounts (a free account works but its signing expires every 7 days and
+   allows few devices; a paid Developer account is strongly recommended for a farm). Note your **Team ID**.
+2. **Tools**: install [Homebrew](https://brew.sh), then
+   `brew install node libimobiledevice libusbmuxd ideviceinstaller`  (provides `idevice_id`, `ideviceinfo`, `iproxy`).
+3. **Appium + xcuitest driver** (used for its bundled WebDriverAgent project and for ad-hoc debugging):
+   `npm i -g appium && appium driver install xcuitest`.
+   WDA lives at `~/.appium/node_modules/appium-xcuitest-driver/node_modules/appium-webdriveragent`
+   (check with `ls`; set that as `WDA_PROJECT`). The server drives WDA directly over HTTP, so Appium doesn't have to be running.
+4. **Phones**: on each iPhone enable Settings > Privacy & Security > **Developer Mode** (reboot), connect by USB,
+   tap **Trust This Computer** and enter the passcode. Optional: Settings > Display & Brightness > Auto-Lock = Never,
+   and Settings > Developer > Enable UI Automation. Verify: `idevice_id -l` lists the UDID and `ideviceinfo -u <UDID> -k DeviceName` prints a name.
+5. **Server**: clone/copy this folder to the Mac, then `npm install && npm run init-env && npm run build`.
+   Edit `.env`: `WDA_PROJECT=<path from step 3>`, keep `MOCK=false`. Never commit `.env`; the token inside is what the Windows app needs.
+6. **Build + sign WDA once per phone** (reruns are fast):
+   `scripts/build-wda.sh <TEAM_ID> <UDID> [<UDID> ...]`
+   The first time, Xcode may ask to allow keychain access; click Always Allow. On each phone, if the runner is untrusted:
+   Settings > General > VPN & Device Management > trust your developer certificate.
+7. **Run**: `npm start`. Within ~10-30 s of plugging a phone in, `GET /phones` shows `online:true, ready:true`.
+   Per phone the server runs `xcodebuild test-without-building` (WDA) plus two `iproxy` forwards (WDA port 8100+n, MJPEG 9100+n;
+   the slot `n` per UDID is remembered in `data/ports.json`), restarts WDA with backoff if it dies, and stops it when the phone is unplugged.
+8. **Network**: the server listens on `HOST=0.0.0.0:8787`, so it is reachable on the LAN and via Tailscale
+   (`brew install --cask tailscale`, then use the Mac's Tailscale IP). Allow incoming connections for `node` if the macOS firewall asks.
+   Because this API can control phones, keep the token secret and don't port-forward it to the internet.
+
+### Run as a launchd service
+
+The service must run in the logged-in GUI session (xcodebuild/codesigning needs the login keychain), so enable
+auto-login for the Mac mini user and use a LaunchAgent:
+
+```
+cp deploy/com.lotus.phonefarm.plist ~/Library/LaunchAgents/
+# edit WorkingDirectory / log paths / node path (`which node`) in that file first
+launchctl load ~/Library/LaunchAgents/com.lotus.phonefarm.plist
+launchctl list | grep phonefarm          # check it's running
+tail -f ~/phone-farm-server/server.log   # logs (the token is never logged)
+launchctl unload ~/Library/LaunchAgents/com.lotus.phonefarm.plist   # stop
+```
+After `git pull`/code changes run `npm run build` and `launchctl kickstart -k gui/$(id -u)/com.lotus.phonefarm`.
+
+## Testing
+
+`npm run check` type-checks. `npm test` starts a mock server in-process and exercises auth, every endpoint and the stream.
+Against a live server: `URL=http://<mac>:8787 API_TOKEN=<token> npm test` (needs at least one online phone).
+
+## Settings (.env)
+
+`API_TOKEN`, `HOST`, `PORT`, `MOCK`, `MOCK_PHONES`, `WDA_PROJECT`, `WDA_DERIVED_DATA` (default `~/wda-build`),
+`WDA_BASE_PORT` (8100), `MJPEG_BASE_PORT` (9100), `POLL_MS` (5000), `AUTOSTART_WDA` (true).
+
+## Notes / known limits
+
+- Real mode could not be tested on Windows; the WDA and libimobiledevice calls follow their documented CLIs/endpoints.
+  First on-Mac run: check `GET /phones`, then `/screenshot`, and read `server.log` (`[wda xxxxxxxx]` lines) if a phone stays `ready:false`.
+- `iproxy` syntax used is the libusbmuxd 2.x form (`iproxy -u UDID LOCAL:REMOTE`).
+- `type` sends keystrokes via WDA; a keyboard must be focused on the phone.
