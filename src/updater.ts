@@ -30,11 +30,11 @@ export function startUpdater(minutes: number, onRestart: () => void, cwd = proce
       await sh('git', ['fetch', '--quiet', 'origin', 'main'], cwd);
       const local = await sh('git', ['rev-parse', 'HEAD'], cwd);
       const remote = await sh('git', ['rev-parse', 'origin/main'], cwd);
-      if (local === remote) return;
+      if (local === remote) return log(`up to date (${local.slice(0, 7)})`);
       if ((await sh('git', ['rev-list', '--count', 'origin/main..HEAD'], cwd)) !== '0') {
         return log('skip: local commits not on origin/main');
       }
-      if ((await sh('git', ['status', '--porcelain'], cwd)) !== '') {
+      if ((await sh('git', ['status', '--porcelain', '--untracked-files=no'], cwd)) !== '') {
         return log('skip: working tree has uncommitted changes');
       }
       const changed = (await sh('git', ['diff', '--name-only', 'HEAD', 'origin/main'], cwd)).split('\n');

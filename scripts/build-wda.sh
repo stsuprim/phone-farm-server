@@ -7,10 +7,12 @@ cd "$(dirname "$0")/.."
 set -a; [ -f .env ] && . ./.env; set +a
 PROJ="${WDA_PROJECT:?set WDA_PROJECT in .env}"
 OUT="${WDA_DERIVED_DATA:-$HOME/wda-build}"; OUT="${OUT/#\~/$HOME}"
-BUNDLE="${WDA_BUNDLE_ID:-com.${TEAM}.WebDriverAgentRunner}"
+TEAM_LC="$(printf "%s" "$TEAM" | tr "[:upper:]" "[:lower:]")"
+BUNDLE="${WDA_BUNDLE_ID:-com.${TEAM_LC}.WebDriverAgentRunner}"
 for UDID in "$@"; do
   echo "== $UDID"
   xcodebuild build-for-testing -project "$PROJ/WebDriverAgent.xcodeproj" -scheme WebDriverAgentRunner \
     -destination "id=$UDID" -derivedDataPath "$OUT" -allowProvisioningUpdates \
-    DEVELOPMENT_TEAM="$TEAM" CODE_SIGN_IDENTITY="Apple Development" \n    PRODUCT_BUNDLE_IDENTIFIER="$BUNDLE" | tail -n 5
+    DEVELOPMENT_TEAM="$TEAM" CODE_SIGN_IDENTITY="Apple Development" \
+    PRODUCT_BUNDLE_IDENTIFIER="$BUNDLE" | tail -n 5
 done
