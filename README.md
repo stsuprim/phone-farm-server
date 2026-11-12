@@ -37,6 +37,7 @@ recovering) or `WDA refused the request on <name>: ...` (WDA answered but said n
 | POST | `/phones/:udid/type` | `{text}` | `{ok:true}` |
 | POST | `/phones/:udid/home` | `{}` | `{ok:true}` |
 | POST | `/phones/:udid/launch` | `{bundleId}` | `{ok:true}` |
+| POST | `/phones/:udid/recover` | `{}` | drops the WDA session, restarts the runner if `/status` fails, makes a new warm session (in the phone's queue, after any waiting actions): `{ok:true, control}`, or 502 `{error}` naming WDA |
 | GET | `/update/status` | - | `{current, remote, upToDate, lastCheck, lastError}` (runs `git fetch`, compares local HEAD with `origin/main`) |
 | POST | `/update/now` | - | runs the updater immediately: `{started:true}` (built; process exits and launchd restarts it) or `{started:false, reason}` (dirty tree, up to date, build failed...). 503 in mock mode |
 

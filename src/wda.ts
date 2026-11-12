@@ -451,6 +451,28 @@ export class WdaManager {
     }
   }
 
+  /** Asked for (POST /recover): drop the session, restart the runner if /status fails, make a new warm session. */
+  async recoverNow(udid: string): Promise<ControlState> {
+    const e = this.entries.get(udid);
+    if (!e || !e.wanted) {
+      const err = new WdaError('unreachable', `WDA session for ${this.nameOf(udid)} is down: WebDriverAgent is not running`);
+      err.named = true;
+      throw err;
+    }
+    if (e.status === 'failed') {
+      if (e.timer) clearTimeout(e.timer);
+      e.timer = undefined;
+      this.launch(e);
+    }
+    if (e.recovering) await e.recovering.catch(() => {});
+    try {
+      await this.recover(e, 'requested by the client');
+    } catch (err) {
+      throw this.named(e, err);
+    }
+    return this.state(udid);
+  }
+
   /** Call a session-scoped WDA endpoint; on a WDA failure recover (new session / restarted runner) and retry once. */
   call(udid: string, method: string, sub: string, body?: unknown, timeout = 30000): Promise<any> {
     return this.withRecovery(udid, async (e) => this.raw(e, method, `/session/${await this.session(e)}${sub}`, body, timeout));

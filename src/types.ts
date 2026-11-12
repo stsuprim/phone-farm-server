@@ -62,6 +62,8 @@ export interface Backend {
   type(udid: string, text: string): Promise<void>;
   home(udid: string): Promise<void>;
   launch(udid: string, bundleId: string): Promise<void>;
+  /** Drop the WDA session, restart the runner if WDA doesn't answer, make a new warm session. */
+  recover(udid: string): Promise<ControlState>;
   /** Subscribe to image frames. Returns unsubscribe and the settings actually used. Throws HttpError if unknown/not ready. */
   subscribe(
     udid: string,

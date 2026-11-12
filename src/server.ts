@@ -76,7 +76,7 @@ export function createServer(backend: Backend, token: string, updater?: Updater)
         return send(res, 200, await updater.now());
       }
 
-      const m = /^\/phones\/([^/]+)\/(screenshot|tap|swipe|path|hold|touch|type|home|launch)$/.exec(path);
+      const m = /^\/phones\/([^/]+)\/(screenshot|tap|swipe|path|hold|touch|type|home|launch|recover)$/.exec(path);
       if (!m) return send(res, 404, { error: 'not found' });
       const udid = decodeURIComponent(m[1]!);
       const action = m[2]!;
@@ -91,6 +91,7 @@ export function createServer(backend: Backend, token: string, updater?: Updater)
       }
 
       if (req.method !== 'POST') throw new HttpError(405, 'use POST');
+      if (action === 'recover') return send(res, 200, { ok: true, control: await control.recover(udid) });
       const body = await readJson(req);
       await control.handle(udid, { ...body, type: action });
       send(res, 200, { ok: true });

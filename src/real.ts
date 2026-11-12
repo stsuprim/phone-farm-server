@@ -1,7 +1,7 @@
 import { execFile } from 'node:child_process';
 import { Config } from './config.js';
 import { MjpegSource } from './mjpeg.js';
-import { Backend, HttpError, Image, ImageFormat, PathPoint, PhoneInfo, ScreenInfo, StreamSettings } from './types.js';
+import { Backend, ControlState, HttpError, Image, ImageFormat, PathPoint, PhoneInfo, ScreenInfo, StreamSettings } from './types.js';
 import { WdaManager } from './wda.js';
 
 function run(cmd: string, args: string[]): Promise<string> {
@@ -142,6 +142,11 @@ export class RealBackend implements Backend {
   async launch(udid: string, bundleId: string) {
     this.known(udid);
     await this.wda.call(udid, 'POST', '/wda/apps/launch', { bundleId });
+  }
+
+  async recover(udid: string): Promise<ControlState> {
+    this.known(udid);
+    return this.wda.recoverNow(udid);
   }
 
   /** The MJPEG server is one per phone: it runs at the most any current subscriber asked for. */

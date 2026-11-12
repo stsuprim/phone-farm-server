@@ -72,6 +72,15 @@ try {
   assert.equal((await post(`/phones/${udid}/touch`, { phase: 'sideways', x: 1, y: 1 })).status, 400);
   ok('path/hold/touch (HTTP)');
 
+  const rec = await post(`/phones/${udid}/recover`, {});
+  assert.equal(rec.status, 200);
+  const recBody: any = await rec.json();
+  assert.equal(recBody.ok, true);
+  assert.ok(['ready', 'recovering', 'down'].includes(recBody.control));
+  assert.equal((await post(`/phones/nope/recover`, {})).status, 404);
+  assert.equal((await fetch(`${base}/phones/${udid}/recover`, { method: 'POST' })).status, 401);
+  ok('recover');
+
   // control socket: acks per id, in order
   const acks = await new Promise<any[]>((resolve, reject) => {
     const ws = new WebSocket(base.replace(/^http/, 'ws') + `/phones/${udid}/control?token=${token}`);

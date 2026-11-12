@@ -1,5 +1,5 @@
 import { encodePng } from './png.js';
-import { Backend, HttpError, Image, ImageFormat, PathPoint, PhoneInfo, ScreenInfo, StreamSettings } from './types.js';
+import { Backend, ControlState, HttpError, Image, ImageFormat, PathPoint, PhoneInfo, ScreenInfo, StreamSettings } from './types.js';
 
 const W = 270;
 const H = 585;
@@ -157,6 +157,11 @@ export class MockBackend implements Backend {
   }
   async launch(udid: string, bundleId: string) {
     this.live(udid).app = bundleId;
+  }
+
+  async recover(udid: string): Promise<ControlState> {
+    this.live(udid);
+    return 'ready';
   }
 
   subscribe(udid: string, onFrame: (f: Buffer) => void, want: StreamSettings) {

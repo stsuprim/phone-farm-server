@@ -1,4 +1,4 @@
-import { Backend, HttpError, PathPoint } from './types.js';
+import { Backend, ControlState, HttpError, PathPoint } from './types.js';
 
 const MAX_WAITING = 50; // actions queued per phone before new ones are refused
 const MAX_POINTS = 5000;
@@ -89,6 +89,14 @@ export class Control {
       default:
         throw new HttpError(400, `unknown action type ${JSON.stringify(msg.type ?? null)}`);
     }
+  }
+
+  /** Recover the phone's WDA, in the phone's queue so it never overlaps an action. */
+  recover(udid: string): Promise<ControlState> {
+    let state: ControlState = 'down';
+    return this.run(udid, async () => {
+      state = await this.backend.recover(udid);
+    }).then(() => state);
   }
 
   /** Forget unfinished live touches started by `owner` (its socket closed). */
