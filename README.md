@@ -74,6 +74,12 @@ launchctl list | grep phonefarm          # check it's running
 tail -f ~/phone-farm-server/server.log   # logs (the token is never logged)
 launchctl unload ~/Library/LaunchAgents/com.lotus.phonefarm.plist   # stop
 ```
+### Auto-update
+
+The server checks GitHub (outbound only) every `AUTO_UPDATE_MINUTES` (default 5, `0` disables; mock mode never updates). When `origin/main` is ahead it does `git merge --ff-only`, `npm install` (only if package files changed), `npm run build`, then exits so launchd (`KeepAlive`) starts the new build. If the working tree is dirty, local commits exist, or pull/build fails, it skips, keeps the old version running and logs the reason to `server.log` (`[updater]` lines). `.env` is never read or printed by it.
+
+It relies on the launchd service above, so install that first: `cp deploy/com.lotus.phonefarm.plist ~/Library/LaunchAgents/`, edit the paths, `launchctl load ~/Library/LaunchAgents/com.lotus.phonefarm.plist`. To update by hand anyway: `git pull && npm run build` and kickstart:
+
 After `git pull`/code changes run `npm run build` and `launchctl kickstart -k gui/$(id -u)/com.lotus.phonefarm`.
 
 ## Testing
@@ -84,7 +90,7 @@ Against a live server: `URL=http://<mac>:8787 API_TOKEN=<token> npm test` (needs
 ## Settings (.env)
 
 `API_TOKEN`, `HOST`, `PORT`, `MOCK`, `MOCK_PHONES`, `WDA_PROJECT`, `WDA_DERIVED_DATA` (default `~/wda-build`),
-`WDA_BASE_PORT` (8100), `MJPEG_BASE_PORT` (9100), `POLL_MS` (5000), `AUTOSTART_WDA` (true).
+`WDA_BASE_PORT` (8100), `MJPEG_BASE_PORT` (9100), `POLL_MS` (5000), `AUTOSTART_WDA` (true), `AUTO_UPDATE_MINUTES` (5, 0 = off).
 
 ## Notes / known limits
 

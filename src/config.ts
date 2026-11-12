@@ -13,6 +13,7 @@ export interface Config {
   mjpegBasePort: number;
   pollMs: number;
   autostartWda: boolean;
+  autoUpdateMinutes: number;
 }
 
 function loadDotEnv(file: string): void {
@@ -52,5 +53,6 @@ export function loadConfig(envFile = '.env'): Config {
     mjpegBasePort: num(e.MJPEG_BASE_PORT, 9100),
     pollMs: num(e.POLL_MS, 5000),
     autostartWda: bool(e.AUTOSTART_WDA, true),
+    autoUpdateMinutes: num(e.AUTO_UPDATE_MINUTES, 5),
   };
 }

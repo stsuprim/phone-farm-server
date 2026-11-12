@@ -2,6 +2,7 @@ import { loadConfig } from './config.js';
 import { MockBackend } from './mock.js';
 import { RealBackend } from './real.js';
 import { createServer } from './server.js';
+import { startUpdater } from './updater.js';
 
 const cfg = loadConfig();
 if (!cfg.mock && !cfg.wdaProject) {
@@ -19,5 +20,6 @@ const shutdown = () => {
   server.close();
   void backend.close().finally(() => process.exit(0));
 };
+if (!cfg.mock) startUpdater(cfg.autoUpdateMinutes, shutdown);
 process.on('SIGINT', shutdown);
 process.on('SIGTERM', shutdown);
