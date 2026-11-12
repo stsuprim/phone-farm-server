@@ -2,6 +2,7 @@ import crypto from 'node:crypto';
 import http from 'node:http';
 import { WebSocketServer } from 'ws';
 import { Backend, HttpError } from './types.js';
+import type { Updater } from './updater.js';
 
 function send(res: http.ServerResponse, status: number, body: unknown): void {
   const data = JSON.stringify(body);
@@ -35,7 +36,7 @@ function numbers(body: Record<string, unknown>, ...keys: string[]): number[] {
   });
 }
 
-export function createServer(backend: Backend, token: string): http.Server {
+export function createServer(backend: Backend, token: string, updater?: Updater): http.Server {
   const tokenHash = crypto.createHash('sha256').update(token).digest();
   const authorized = (candidate: string | null | undefined): boolean =>
     !!candidate && crypto.timingSafeEqual(crypto.createHash('sha256').update(candidate).digest(), tokenHash);
@@ -56,6 +57,15 @@ export function createServer(backend: Backend, token: string): http.Server {
         return send(res, 401, { error: 'missing or invalid bearer token' });
       }
       if (req.method === 'GET' && path === '/phones') return send(res, 200, await backend.list());
+      if (path === '/update/status' || path === '/update/now') {
+        if (!updater) return send(res, 503, { error: 'updater unavailable (mock mode)' });
+        if (path === '/update/status') {
+          if (req.method !== 'GET') throw new HttpError(405, 'use GET');
+          return send(res, 200, await updater.status());
+        }
+        if (req.method !== 'POST') throw new HttpError(405, 'use POST');
+        return send(res, 200, await updater.now());
+      }
 
       const m = /^\/phones\/([^/]+)\/(screenshot|tap|swipe|type|home|launch)$/.exec(path);
       if (!m) return send(res, 404, { error: 'not found' });

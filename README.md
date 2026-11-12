@@ -25,6 +25,8 @@ All endpoints except `/health` need `Authorization: Bearer <API_TOKEN>`. Errors:
 | GET | `/phones` | â€“ | `[{udid, name, model, ios, battery, online, ready}]` (`battery` 0-100 or null; `model` is the product type e.g. `iPhone14,5`; `ready` = controllable) |
 | GET | `/phones/:udid/screenshot` | `?format=png` (default) or `jpeg` | image bytes (`jpeg` = latest MJPEG frame; mock always returns PNG, check `Content-Type`) |
 | WS | `/phones/:udid/stream` | token via header or `?token=` | first a text message `{"type":"hello","contentType":"image/jpeg"}`, then one binary message per frame (JPEG in real mode, PNG in mock) |
+| GET | `/update/status` | – | `{current, remote, upToDate, lastCheck, lastError}` (runs `git fetch`, compares local HEAD with `origin/main`) |
+| POST | `/update/now` | – | runs the updater immediately: `{started:true}` (built; process exits and launchd restarts it) or `{started:false, reason}` (dirty tree, up to date, build failed...). 503 in mock mode |
 | POST | `/phones/:udid/tap` | `{x, y}` | `{ok:true}` |
 | POST | `/phones/:udid/swipe` | `{x1, y1, x2, y2, ms}` (`ms` default 300) | `{ok:true}` |
 | POST | `/phones/:udid/type` | `{text}` | `{ok:true}` |
