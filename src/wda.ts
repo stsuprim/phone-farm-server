@@ -89,7 +89,14 @@ export class WdaManager {
     const log = (m: string) => console.log(`[wda ${e.udid.slice(0, 8)}] ${m}`);
     const spawnLogged = (cmd: string, args: string[], env: NodeJS.ProcessEnv = {}) => {
       const p = spawn(cmd, args, { env: { ...process.env, ...env }, stdio: ['ignore', 'pipe', 'pipe'] });
-      p.stderr?.on('data', () => {}); // drain
+      const errTail: string[] = [];
+      p.stderr?.on('data', (d: Buffer) => {
+        errTail.push(...d.toString().split(/\r?\n/).filter(Boolean));
+        if (errTail.length > 5) errTail.splice(0, errTail.length - 5);
+      });
+      p.on('exit', (code) => {
+        if (code && errTail.length) log(`${cmd} exited with ${code}; last stderr: ${errTail.join(' | ')}`);
+      });
       p.stdout?.on('data', () => {});
       p.on('error', (err) => log(`${cmd} failed to start: ${err.message}`));
       return p;

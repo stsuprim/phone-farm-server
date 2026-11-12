@@ -88,6 +88,8 @@ Against a live server: `URL=http://<mac>:8787 API_TOKEN=<token> npm test` (needs
 
 ## Notes / known limits
 
+- Free Apple ID limits: on each phone, trust the developer under Settings > General > VPN & Device Management > Verify App. Free signing expires after 7 days (rebuild WDA), allows only about 3 devices, so a real farm needs the paid $99/year developer account.
+
 - Real mode could not be tested on Windows; the WDA and libimobiledevice calls follow their documented CLIs/endpoints.
   First on-Mac run: check `GET /phones`, then `/screenshot`, and read `server.log` (`[wda xxxxxxxx]` lines) if a phone stays `ready:false`.
 - `iproxy` syntax used is the libusbmuxd 2.x form (`iproxy -u UDID LOCAL:REMOTE`).
