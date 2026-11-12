@@ -17,23 +17,57 @@ as red rings/yellow lines on the next frame. Coordinates are iPhone points (390x
 
 ## API
 
-All endpoints except `/health` need `Authorization: Bearer <API_TOKEN>`. Errors: `{"error": "..."}` with 400/401/404/503/502.
+All endpoints except `/health` need `Authorization: Bearer <API_TOKEN>` (WebSockets also accept `?token=`).
+Errors are JSON `{"error": "..."}` with 400/401/404/405/503/502. When WebDriverAgent is at fault the status is 502 and the
+message names it: `WDA session for <name> is down: ...` (WDA unreachable, session gone, 5xx; already retried once after
+recovering) or `WDA refused the request on <name>: ...` (WDA answered but said no).
 
 | Method | Path | Body / query | Result |
 |---|---|---|---|
-| GET | `/health` | â€“ | `{ok, mock}` (no auth) |
-| GET | `/phones` | â€“ | `[{udid, name, model, ios, battery, online, ready}]` (`battery` 0-100 or null; `model` is the product type e.g. `iPhone14,5`; `ready` = controllable) |
+| GET | `/health` | - | `{ok, mock}` (no auth) |
+| GET | `/phones` | - | `[{udid, name, model, ios, battery, online, ready, control, scale, point_width, point_height, width, height}]`: `battery` 0-100 or null; `model` the product type (`iPhone14,5`); `ready` = WDA running; `control` = `"ready"` (session warm), `"recovering"` (WDA starting or session being remade) or `"down"`; `scale`, `point_width`, `point_height` from WDA (`/wda/screen`, window size), cached per WDA session, null until known; `width`/`height` the screen in pixels (points x scale) |
 | GET | `/phones/:udid/screenshot` | `?format=png` (default) or `jpeg` | image bytes (`jpeg` = latest MJPEG frame; mock always returns PNG, check `Content-Type`) |
-| WS | `/phones/:udid/stream` | token via header or `?token=` | first a text message `{"type":"hello","contentType":"image/jpeg"}`, then one binary message per frame (JPEG in real mode, PNG in mock) |
-| GET | `/update/status` | – | `{current, remote, upToDate, lastCheck, lastError}` (runs `git fetch`, compares local HEAD with `origin/main`) |
-| POST | `/update/now` | – | runs the updater immediately: `{started:true}` (built; process exits and launchd restarts it) or `{started:false, reason}` (dirty tree, up to date, build failed...). 503 in mock mode |
-| POST | `/phones/:udid/tap` | `{x, y}` | `{ok:true}` |
-| POST | `/phones/:udid/swipe` | `{x1, y1, x2, y2, ms}` (`ms` default 300) | `{ok:true}` |
+| WS | `/phones/:udid/stream` | `?fps=` (1-60, default 30), `?quality=` (5-100, default 50), `?scale=` (10-100 %, default 50) | first a text message `{"type":"hello", udid, contentType, fps, scale, quality}` with the settings actually used, then one binary message per frame (JPEG from WDA's MJPEG server in real mode, PNG in mock). Latest frame only: while the socket is backed up, older frames are dropped |
+| WS | `/phones/:udid/control` | JSON text messages, see below | low-latency control over one connection |
+| POST | `/phones/:udid/tap` | `{x, y}` | `{ok:true}` (WDA's fast tap) |
+| POST | `/phones/:udid/swipe` | `{x1, y1, x2, y2, ms}` (`ms` default 300, max 10000) | `{ok:true}`; a swipe from a point to itself is a long press |
+| POST | `/phones/:udid/path` | `{points: [[x, y, ms], ...]}` (`ms` since the gesture began; 1-5000 points, up to 60 s) | `{ok:true}`: one continuous touch with that timing |
+| POST | `/phones/:udid/hold` | `{x, y, ms}` (`ms` default 1000, max 30000) | `{ok:true}` |
+| POST | `/phones/:udid/touch` | `{phase, x, y, t}` | `{ok:true}`; same as a live `touch` message (fallback when the WebSocket can't open) |
 | POST | `/phones/:udid/type` | `{text}` | `{ok:true}` |
 | POST | `/phones/:udid/home` | `{}` | `{ok:true}` |
 | POST | `/phones/:udid/launch` | `{bundleId}` | `{ok:true}` |
+| GET | `/update/status` | - | `{current, remote, upToDate, lastCheck, lastError}` (runs `git fetch`, compares local HEAD with `origin/main`) |
+| POST | `/update/now` | - | runs the updater immediately: `{started:true}` (built; process exits and launchd restarts it) or `{started:false, reason}` (dirty tree, up to date, build failed...). 503 in mock mode |
 
-Coordinates are in points (WDA's coordinate space), not pixels.
+**Coordinates are points** (WDA's coordinate space), never pixels: they go to WDA unchanged, only clamped to the screen
+(0 to `point_width - 1` / `point_height - 1`). Extra fields such as `"unit":"pt"` are ignored.
+Swipe, path and hold are W3C pointer actions (`POST /session/:id/actions`) with their real durations; tap uses WDA's fast
+tap (`/wda/tap`, falling back to `/wda/tap/0` or a pointer tap on older WDA). Every action for a phone, from HTTP or the
+control socket, goes through one queue per phone, so they run in order and never overlap (at most 50 waiting, then 503).
+
+### Control WebSocket
+
+`WS /phones/:udid/control?token=...` (or the bearer header). The server first sends `{"type":"hello", udid}`. Messages in:
+
+- `{id, type:"tap", x, y}`, `{id, type:"swipe", x1, y1, x2, y2, ms}`, `{id, type:"path", points}`, `{id, type:"hold", x, y, ms}`,
+  `{id, type:"home"}`, `{id, type:"type", text}`, `{id, type:"launch", bundleId}`
+- live touch: `{type:"touch", phase:"down"|"move"|"up", x, y, t}` (`t` = ms since the press began; optional, server time otherwise).
+
+Replies: `{"type":"ack", id, ok:true}` once the action has run, or `{"type":"ack", id, ok:false, error}`. Messages without
+an `id` get no ack on success; a failure still answers, with `id: null`.
+
+Live touch: WDA can't keep a finger down between requests, so `down`, the `move`s and `up` are buffered and played as one
+pointer action when `up` arrives, with every point and its timing (a `down` sent late, e.g. after a hold, keeps that hold
+because its `t` is kept). A still touch lifted within 250 ms becomes a fast tap. A new `down` lifts any unfinished touch;
+a touch never lifted is dropped after 60 s or when its socket closes.
+
+### WDA health
+
+The server keeps one WDA session per phone warm (made as soon as WDA answers, with the quiescence/idle waits off so actions
+don't wait for animations, and the MJPEG settings applied). On a WDA failure (connection refused, invalid session, 5xx) it
+makes a new session, restarts the phone's WDA runner if `/status` doesn't answer, and retries the action once. Every ~10 s
+each idle phone gets a `/status` check that recovers the same way before anyone notices. `GET /phones` shows it in `control`.
 
 ## Mac setup (real mode)
 

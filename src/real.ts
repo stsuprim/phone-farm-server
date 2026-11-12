@@ -1,7 +1,7 @@
 import { execFile } from 'node:child_process';
 import { Config } from './config.js';
 import { MjpegSource } from './mjpeg.js';
-import { Backend, HttpError, Image, ImageFormat, PhoneInfo } from './types.js';
+import { Backend, HttpError, Image, ImageFormat, PathPoint, PhoneInfo, ScreenInfo, StreamSettings } from './types.js';
 import { WdaManager } from './wda.js';
 
 function run(cmd: string, args: string[]): Promise<string> {
@@ -23,11 +23,12 @@ export class RealBackend implements Backend {
   private phones = new Map<string, PhoneInfo>();
   private wda: WdaManager;
   private sources = new Map<string, MjpegSource>();
+  private streams = new Map<string, Set<StreamSettings>>(); // what each stream subscriber asked for
   private timer: NodeJS.Timeout;
   private polling = false;
 
   constructor(private cfg: Config) {
-    this.wda = new WdaManager(cfg);
+    this.wda = new WdaManager(cfg, (udid) => this.phones.get(udid)?.name ?? udid);
     void this.poll();
     this.timer = setInterval(() => void this.poll(), cfg.pollMs);
   }
@@ -56,6 +57,7 @@ export class RealBackend implements Backend {
         this.phones.set(udid, {
           udid, name: name || udid, model, ios,
           battery: Number.isFinite(b) ? b : null, online: true, ready: false,
+          control: 'down', scale: null, point_width: null, point_height: null, width: null, height: null,
         });
         if (paired && this.cfg.autostartWda) this.wda.start(udid);
       }
@@ -71,7 +73,24 @@ export class RealBackend implements Backend {
   }
 
   async list(): Promise<PhoneInfo[]> {
-    return [...this.phones.values()].map((p) => ({ ...p, ready: p.online && this.wda.status(p.udid) === 'ready' }));
+    return [...this.phones.values()].map((p) => {
+      const s = this.wda.screen(p.udid);
+      const px = (v: number | undefined) => (s?.scale && v ? Math.round(v * s.scale) : null);
+      return {
+        ...p,
+        ready: p.online && this.wda.status(p.udid) === 'ready',
+        control: p.online ? this.wda.state(p.udid) : 'down',
+        scale: s?.scale ?? null,
+        point_width: s?.width ?? null,
+        point_height: s?.height ?? null,
+        width: px(s?.width),
+        height: px(s?.height),
+      };
+    });
+  }
+
+  screen(udid: string): ScreenInfo | null {
+    return this.wda.screen(udid);
   }
 
   private known(udid: string): PhoneInfo {
@@ -106,11 +125,11 @@ export class RealBackend implements Backend {
 
   async tap(udid: string, x: number, y: number) {
     this.known(udid);
-    await this.wda.call(udid, 'POST', '/wda/tap/0', { x, y });
+    await this.wda.tap(udid, x, y);
   }
-  async swipe(udid: string, x1: number, y1: number, x2: number, y2: number, ms: number) {
+  async gesture(udid: string, points: PathPoint[]) {
     this.known(udid);
-    await this.wda.call(udid, 'POST', '/wda/dragfromtoforduration', { fromX: x1, fromY: y1, toX: x2, toY: y2, duration: ms / 1000 });
+    await this.wda.actions(udid, points);
   }
   async type(udid: string, text: string) {
     this.known(udid);
@@ -125,10 +144,32 @@ export class RealBackend implements Backend {
     await this.wda.call(udid, 'POST', '/wda/apps/launch', { bundleId });
   }
 
-  subscribe(udid: string, onFrame: (f: Buffer) => void) {
+  /** The MJPEG server is one per phone: it runs at the most any current subscriber asked for. */
+  private streamSettings(udid: string): StreamSettings {
+    const set = this.streams.get(udid);
+    const all = set?.size ? [...set] : [];
+    const most = (k: keyof StreamSettings) => Math.max(...all.map((s) => s[k]));
+    return all.length ? { fps: most('fps'), quality: most('quality'), scale: most('scale') } : { fps: 30, quality: 50, scale: 50 };
+  }
+
+  subscribe(udid: string, onFrame: (f: Buffer) => void, want: StreamSettings) {
     this.known(udid);
     if (this.wda.status(udid) !== 'ready') throw new HttpError(503, 'WebDriverAgent is not ready');
-    return { contentType: 'image/jpeg', unsubscribe: this.source(udid).add(onFrame) };
+    let set = this.streams.get(udid);
+    if (!set) this.streams.set(udid, (set = new Set()));
+    const mine = { ...want };
+    set.add(mine);
+    const eff = this.streamSettings(udid);
+    void this.wda.setMjpeg(udid, eff);
+    const off = this.source(udid).add(onFrame);
+    return {
+      contentType: 'image/jpeg',
+      ...eff,
+      unsubscribe: () => {
+        off();
+        if (set!.delete(mine) && set!.size) void this.wda.setMjpeg(udid, this.streamSettings(udid));
+      },
+    };
   }
 
   async close() {

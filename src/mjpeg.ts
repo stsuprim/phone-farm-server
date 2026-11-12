@@ -1,26 +1,48 @@
 import http from 'node:http';
 
-/** Incremental parser for a multipart MJPEG stream (WDA sends Content-Length per part). */
+/**
+ * Incremental parser for a multipart MJPEG stream (WDA sends Content-Length per part).
+ * Chunks are only joined once a whole frame can be there, so big frames don't cost a copy per TCP chunk.
+ */
 export class MjpegParser {
-  private buf: Buffer = Buffer.alloc(0);
+  private chunks: Buffer[] = [];
+  private len = 0;
+  private need = 0; // bytes required before it's worth looking again
   constructor(private onFrame: (jpeg: Buffer) => void) {}
+
   push(chunk: Buffer): void {
-    this.buf = this.buf.length ? Buffer.concat([this.buf, chunk]) : chunk;
+    this.chunks.push(chunk);
+    this.len += chunk.length;
+    if (this.len < this.need) return;
+    this.need = 0;
+    const buf = this.chunks.length === 1 ? this.chunks[0]! : Buffer.concat(this.chunks, this.len);
+    let off = 0;
     for (;;) {
-      const he = this.buf.indexOf('\r\n\r\n');
+      const he = buf.indexOf('\r\n\r\n', off);
       if (he < 0) break;
-      const m = /content-length:\s*(\d+)/i.exec(this.buf.subarray(0, he).toString('latin1'));
+      const m = /content-length:\s*(\d+)/i.exec(buf.toString('latin1', off, he));
       if (!m) {
-        this.buf = this.buf.subarray(he + 4);
+        off = he + 4;
         continue;
       }
       const start = he + 4;
       const end = start + Number(m[1]);
-      if (this.buf.length < end) break;
-      this.onFrame(Buffer.from(this.buf.subarray(start, end)));
-      this.buf = this.buf.subarray(end);
+      if (buf.length < end) {
+        this.need = end - off;
+        break;
+      }
+      this.onFrame(buf.subarray(start, end));
+      off = end;
     }
-    if (this.buf.length > 20_000_000) this.buf = Buffer.alloc(0); // runaway guard
+    const rest = buf.subarray(off);
+    this.chunks = rest.length ? [Buffer.from(rest)] : [];
+    this.len = rest.length;
+    if (this.len > 20_000_000) {
+      // runaway guard
+      this.chunks = [];
+      this.len = 0;
+      this.need = 0;
+    }
   }
 }
 
@@ -42,14 +64,21 @@ export class MjpegSource {
 
   private connect(): void {
     if (!this.subs.size) return;
+    let port: number;
+    try {
+      port = this.port();
+    } catch {
+      return this.reconnect();
+    }
     const parser = new MjpegParser((f) => {
       for (const cb of this.subs) cb(f);
     });
-    const req = http.get({ host: '127.0.0.1', port: this.port(), path: '/' }, (res) => {
+    const req = http.get({ host: '127.0.0.1', port, path: '/', agent: false }, (res) => {
       res.on('data', (c: Buffer) => parser.push(c));
       res.on('end', () => this.reconnect());
       res.on('error', () => this.reconnect());
     });
+    req.on('socket', (s) => s.setNoDelay(true));
     req.on('error', () => this.reconnect());
     this.req = req;
   }
@@ -61,7 +90,7 @@ export class MjpegSource {
       this.retry = setTimeout(() => {
         this.retry = undefined;
         this.connect();
-      }, 1000);
+      }, 500);
     }
   }
 

@@ -1,7 +1,8 @@
 import crypto from 'node:crypto';
 import http from 'node:http';
-import { WebSocketServer } from 'ws';
-import { Backend, HttpError } from './types.js';
+import { WebSocket, WebSocketServer } from 'ws';
+import { Control } from './control.js';
+import { Backend, HttpError, StreamSettings } from './types.js';
 import type { Updater } from './updater.js';
 
 function send(res: http.ServerResponse, status: number, body: unknown): void {
@@ -28,12 +29,19 @@ async function readJson(req: http.IncomingMessage): Promise<Record<string, unkno
   throw new HttpError(400, 'body must be a JSON object');
 }
 
-function numbers(body: Record<string, unknown>, ...keys: string[]): number[] {
-  return keys.map((k) => {
-    const v = body[k];
-    if (typeof v !== 'number' || !Number.isFinite(v)) throw new HttpError(400, `"${k}" must be a number`);
-    return v;
-  });
+/** Stream settings from the query: `?fps=&quality=&scale=`, clamped, with defaults 30 / 50 / 50. */
+function streamSettings(q: URLSearchParams): StreamSettings {
+  const pick = (k: string, dflt: number, lo: number, hi: number) => {
+    const v = Number(q.get(k));
+    return q.has(k) && q.get(k) !== '' && Number.isFinite(v) ? Math.round(Math.min(hi, Math.max(lo, v))) : dflt;
+  };
+  return { fps: pick('fps', 30, 1, 60), quality: pick('quality', 50, 5, 100), scale: pick('scale', 50, 10, 100) };
+}
+
+function errorText(err: unknown): string {
+  if (err instanceof HttpError) return err.message;
+  console.error(err);
+  return 'internal error';
 }
 
 export function createServer(backend: Backend, token: string, updater?: Updater): http.Server {
@@ -45,7 +53,8 @@ export function createServer(backend: Backend, token: string, updater?: Updater)
     return m ? m[1]!.trim() : null;
   };
 
-  const wss = new WebSocketServer({ noServer: true });
+  const wss = new WebSocketServer({ noServer: true, maxPayload: 1_000_000 });
+  const control = new Control(backend);
 
   const server = http.createServer(async (req, res) => {
     try {
@@ -67,7 +76,7 @@ export function createServer(backend: Backend, token: string, updater?: Updater)
         return send(res, 200, await updater.now());
       }
 
-      const m = /^\/phones\/([^/]+)\/(screenshot|tap|swipe|type|home|launch)$/.exec(path);
+      const m = /^\/phones\/([^/]+)\/(screenshot|tap|swipe|path|hold|touch|type|home|launch)$/.exec(path);
       if (!m) return send(res, 404, { error: 'not found' });
       const udid = decodeURIComponent(m[1]!);
       const action = m[2]!;
@@ -83,30 +92,7 @@ export function createServer(backend: Backend, token: string, updater?: Updater)
 
       if (req.method !== 'POST') throw new HttpError(405, 'use POST');
       const body = await readJson(req);
-      switch (action) {
-        case 'tap': {
-          const [x, y] = numbers(body, 'x', 'y');
-          await backend.tap(udid, x!, y!);
-          break;
-        }
-        case 'swipe': {
-          const [x1, y1, x2, y2] = numbers(body, 'x1', 'y1', 'x2', 'y2');
-          const ms = typeof body.ms === 'number' && body.ms > 0 ? Math.min(body.ms, 10000) : 300;
-          await backend.swipe(udid, x1!, y1!, x2!, y2!, ms);
-          break;
-        }
-        case 'type':
-          if (typeof body.text !== 'string') throw new HttpError(400, '"text" must be a string');
-          await backend.type(udid, body.text);
-          break;
-        case 'home':
-          await backend.home(udid);
-          break;
-        case 'launch':
-          if (typeof body.bundleId !== 'string' || !body.bundleId) throw new HttpError(400, '"bundleId" must be a string');
-          await backend.launch(udid, body.bundleId);
-          break;
-      }
+      await control.handle(udid, { ...body, type: action });
       send(res, 200, { ok: true });
     } catch (err) {
       if (err instanceof HttpError) return send(res, err.status, { error: err.message });
@@ -117,28 +103,75 @@ export function createServer(backend: Backend, token: string, updater?: Updater)
 
   server.on('upgrade', (req, socket, head) => {
     const url = new URL(req.url ?? '/', 'http://x');
-    const m = /^\/phones\/([^/]+)\/stream\/?$/.exec(url.pathname);
+    const m = /^\/phones\/([^/]+)\/(stream|control)\/?$/.exec(url.pathname);
     // browsers can't set headers on WebSocket, so ?token= is accepted as well
     if (!m || !authorized(bearer(req) ?? url.searchParams.get('token'))) {
-      socket.write(`HTTP/1.1 ${m ? 401 : 404} Unauthorized\r\nConnection: close\r\n\r\n`);
+      socket.write(`HTTP/1.1 ${m ? '401 Unauthorized' : '404 Not Found'}\r\nConnection: close\r\n\r\n`);
       return void socket.destroy();
     }
     const udid = decodeURIComponent(m[1]!);
+    if (m[2] === 'control') return void wss.handleUpgrade(req, socket, head, (ws) => controlSocket(ws, udid));
+    const want = streamSettings(url.searchParams);
     wss.handleUpgrade(req, socket, head, (ws) => {
+      // Latest frame only: while one frame is being written, newer ones replace the waiting one.
+      let writing = false;
+      let waiting: Buffer | null = null;
+      const push = (frame: Buffer): void => {
+        if (ws.readyState !== WebSocket.OPEN) return;
+        if (writing) {
+          waiting = frame;
+          return;
+        }
+        writing = true;
+        ws.send(frame, { binary: true }, () => {
+          writing = false;
+          const next = waiting;
+          waiting = null;
+          if (next) push(next);
+        });
+      };
       let sub: ReturnType<Backend['subscribe']>;
       try {
-        sub = backend.subscribe(udid, (frame) => {
-          if (ws.readyState === ws.OPEN && ws.bufferedAmount < 2_000_000) ws.send(frame, { binary: true });
-        });
+        sub = backend.subscribe(udid, push, want);
       } catch (err) {
         ws.close(1011, err instanceof HttpError ? err.message.slice(0, 100) : 'error');
         return;
       }
-      ws.send(JSON.stringify({ type: 'hello', udid, contentType: sub.contentType }));
+      ws.send(JSON.stringify({ type: 'hello', udid, contentType: sub.contentType, fps: sub.fps, scale: sub.scale, quality: sub.quality }));
       ws.on('close', sub.unsubscribe);
       ws.on('error', sub.unsubscribe);
     });
   });
+
+  /** WS /phones/:udid/control: JSON actions in, `{type:"ack", id, ok[, error]}` out (for messages with an id). */
+  function controlSocket(ws: WebSocket, udid: string): void {
+    const reply = (msg: unknown) => {
+      if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(msg));
+    };
+    reply({ type: 'hello', udid });
+    ws.on('message', (data, isBinary) => {
+      if (isBinary) return;
+      let msg: Record<string, unknown>;
+      try {
+        const v = JSON.parse(data.toString());
+        if (!v || typeof v !== 'object' || Array.isArray(v)) throw new Error();
+        msg = v;
+      } catch {
+        return reply({ type: 'ack', id: null, ok: false, error: 'message must be a JSON object' });
+      }
+      const id = msg.id ?? null;
+      control.handle(udid, msg, ws).then(
+        () => {
+          if (id !== null) reply({ type: 'ack', id, ok: true });
+        },
+        // touches without an id still hear about a failed gesture
+        (err) => reply({ type: 'ack', id, ok: false, error: errorText(err) }),
+      );
+    });
+    const done = () => control.release(ws);
+    ws.on('close', done);
+    ws.on('error', done);
+  }
 
   return server;
 }

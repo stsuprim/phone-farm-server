@@ -38,7 +38,10 @@ try {
 
   const phones: any[] = await (await fetch(`${base}/phones`, { headers: auth })).json();
   assert.ok(phones.length > 0);
-  for (const k of ['udid', 'name', 'model', 'ios', 'battery', 'online']) assert.ok(k in phones[0], `phone has ${k}`);
+  for (const k of ['udid', 'name', 'model', 'ios', 'battery', 'online', 'control', 'scale', 'point_width', 'point_height']) {
+    assert.ok(k in phones[0], `phone has ${k}`);
+  }
+  assert.ok(['ready', 'recovering', 'down'].includes(phones[0].control));
   ok(`GET /phones (${phones.length})`);
 
   const udid = phones.find((p) => p.online).udid;
@@ -58,6 +61,63 @@ try {
   assert.equal((await post(`/phones/nope/home`, {})).status, 404);
   ok('tap/swipe/type/home/launch');
 
+  assert.equal((await post(`/phones/${udid}/path`, { points: [[50, 600, 0], [80, 500, 40], [120, 300, 120]], unit: 'pt' })).status, 200);
+  assert.equal((await post(`/phones/${udid}/path`, { points: [] })).status, 400);
+  assert.equal((await post(`/phones/${udid}/path`, { points: [[1, 'b', 0]] })).status, 400);
+  assert.equal((await post(`/phones/${udid}/hold`, { x: 200, y: 400, ms: 600 })).status, 200);
+  assert.equal((await post(`/phones/${udid}/hold`, { x: 200 })).status, 400);
+  assert.equal((await post(`/phones/${udid}/tap`, { x: -50, y: 99999 })).status, 200); // clamped, not refused
+  assert.equal((await post(`/phones/${udid}/touch`, { phase: 'down', x: 10, y: 10, t: 0 })).status, 200);
+  assert.equal((await post(`/phones/${udid}/touch`, { phase: 'up', x: 100, y: 100, t: 200 })).status, 200);
+  assert.equal((await post(`/phones/${udid}/touch`, { phase: 'sideways', x: 1, y: 1 })).status, 400);
+  ok('path/hold/touch (HTTP)');
+
+  // control socket: acks per id, in order
+  const acks = await new Promise<any[]>((resolve, reject) => {
+    const ws = new WebSocket(base.replace(/^http/, 'ws') + `/phones/${udid}/control?token=${token}`);
+    const got: any[] = [];
+    const t = setTimeout(() => reject(new Error(`control acks missing (${JSON.stringify(got)})`)), 5000);
+    ws.on('open', () => {
+      const msgs = [
+        { id: 1, type: 'tap', x: 100, y: 200 },
+        { id: 2, type: 'swipe', x1: 10, y1: 400, x2: 10, y2: 100, ms: 200 },
+        { id: 3, type: 'path', points: [[10, 10, 0], [20, 30, 50]] },
+        { id: 4, type: 'hold', x: 50, y: 50, ms: 300 },
+        { id: 5, type: 'home' },
+        { id: 6, type: 'type', text: 'hi' },
+        { type: 'touch', phase: 'down', x: 30, y: 600, t: 0 },
+        { type: 'touch', phase: 'move', x: 40, y: 500, t: 30 },
+        { id: 7, type: 'touch', phase: 'up', x: 50, y: 300, t: 90 },
+        { id: 8, type: 'tap', x: 'no' },
+        { id: 9, type: 'fly' },
+      ];
+      for (const m of msgs) ws.send(JSON.stringify(m));
+    });
+    ws.on('message', (d) => {
+      const m = JSON.parse(d.toString());
+      if (m.type !== 'ack') return;
+      got.push(m);
+      if (got.length === 9) {
+        clearTimeout(t);
+        ws.close();
+        resolve(got);
+      }
+    });
+    ws.on('error', reject);
+  });
+  assert.deepEqual(acks.filter((a) => a.ok).map((a) => a.id), [1, 2, 3, 4, 5, 6, 7]);
+  assert.deepEqual(acks.filter((a) => !a.ok).map((a) => a.id).sort(), [8, 9]);
+  assert.ok(acks.filter((a) => !a.ok).every((a) => typeof a.error === 'string' && a.error));
+  ok('control socket acks');
+
+  await new Promise<void>((resolve, reject) => {
+    const ws = new WebSocket(base.replace(/^http/, 'ws') + `/phones/${udid}/control?token=bad`);
+    ws.on('unexpected-response', () => resolve());
+    ws.on('open', () => reject(new Error('bad token accepted on control')));
+    ws.on('error', () => resolve());
+  });
+  ok('control rejects bad token');
+
   const wsUrl = base.replace(/^http/, 'ws') + `/phones/${udid}/stream?token=${token}`;
   const frames = await new Promise<number>((resolve, reject) => {
     const ws = new WebSocket(wsUrl);
@@ -70,6 +130,19 @@ try {
   });
   assert.ok(frames >= 3);
   ok('stream delivers frames');
+
+  const hello = await new Promise<any>((resolve, reject) => {
+    const ws = new WebSocket(base.replace(/^http/, 'ws') + `/phones/${udid}/stream?token=${token}&fps=10&quality=40&scale=999`);
+    const t = setTimeout(() => reject(new Error('no hello')), 5000);
+    ws.on('message', (d, isBinary) => {
+      if (!isBinary) { clearTimeout(t); ws.close(); resolve(JSON.parse(d.toString())); }
+    });
+    ws.on('error', reject);
+  });
+  assert.equal(hello.type, 'hello');
+  assert.ok(typeof hello.fps === 'number' && hello.fps >= 1 && hello.fps <= 10);
+  assert.ok(typeof hello.scale === 'number' && hello.scale <= 100);
+  ok(`stream hello reports fps ${hello.fps}, scale ${hello.scale}`);
 
   await new Promise<void>((resolve, reject) => {
     const ws = new WebSocket(base.replace(/^http/, 'ws') + `/phones/${udid}/stream?token=bad`);

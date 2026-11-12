@@ -1,9 +1,11 @@
 import { encodePng } from './png.js';
-import { Backend, HttpError, Image, ImageFormat, PhoneInfo } from './types.js';
+import { Backend, HttpError, Image, ImageFormat, PathPoint, PhoneInfo, ScreenInfo, StreamSettings } from './types.js';
 
 const W = 270;
 const H = 585;
 const SCREEN_W = 390; // logical points, like a real iPhone
+const SCREEN_H = 844;
+const PIXEL_SCALE = 3; // reported like an @3x phone
 const SCALE = W / SCREEN_W;
 
 type RGB = [number, number, number];
@@ -23,8 +25,6 @@ interface MockPhone {
   app: string;
   typed: string;
   frame: number;
-  subs: Set<(f: Buffer) => void>;
-  timer?: NodeJS.Timeout;
 }
 
 function hsv(h: number, s: number, v: number): RGB {
@@ -45,6 +45,7 @@ export class MockBackend implements Backend {
   readonly mock = true;
   private phones = new Map<string, MockPhone>();
   private battTimer: NodeJS.Timeout;
+  private streams = new Set<NodeJS.Timeout>();
 
   constructor(count: number) {
     const models = ['iPhone14,5', 'iPhone13,2', 'iPhone15,2', 'iPhone12,1'];
@@ -54,9 +55,11 @@ export class MockBackend implements Backend {
       this.phones.set(udid, {
         info: {
           udid, name: `Mock iPhone ${i + 1}`, model: models[i % models.length]!, ios: i % 2 ? '17.5.1' : '18.1',
-          battery: 90 - i * 7, online, ready: online,
+          battery: 90 - i * 7, online, ready: online, control: online ? 'ready' : 'down',
+          scale: PIXEL_SCALE, point_width: SCREEN_W, point_height: SCREEN_H,
+          width: SCREEN_W * PIXEL_SCALE, height: SCREEN_H * PIXEL_SCALE,
         },
-        hue: hash(udid) % 360, marks: [], app: 'com.apple.springboard', typed: '', frame: 0, subs: new Set(),
+        hue: hash(udid) % 360, marks: [], app: 'com.apple.springboard', typed: '', frame: 0,
       });
     }
     // slowly drain the batteries so the UI has something moving
@@ -75,6 +78,10 @@ export class MockBackend implements Backend {
 
   async list(): Promise<PhoneInfo[]> {
     return [...this.phones.values()].map((p) => ({ ...p.info }));
+  }
+
+  screen(udid: string): ScreenInfo | null {
+    return this.phones.has(udid) ? { width: SCREEN_W, height: SCREEN_H, scale: PIXEL_SCALE } : null;
   }
 
   private render(p: MockPhone): Buffer {
@@ -135,8 +142,11 @@ export class MockBackend implements Backend {
   async tap(udid: string, x: number, y: number) {
     this.live(udid).marks.push({ x, y, at: Date.now() });
   }
-  async swipe(udid: string, x1: number, y1: number, x2: number, y2: number, _ms: number) {
-    this.live(udid).marks.push({ x: x1, y: y1, x2, y2, at: Date.now() });
+  async gesture(udid: string, points: PathPoint[]) {
+    const p = this.live(udid);
+    const a = points[0]!;
+    const b = points[points.length - 1]!;
+    p.marks.push({ x: a[0], y: a[1], x2: b[0], y2: b[1], at: Date.now() });
   }
   async type(udid: string, text: string) {
     const p = this.live(udid);
@@ -149,29 +159,28 @@ export class MockBackend implements Backend {
     this.live(udid).app = bundleId;
   }
 
-  subscribe(udid: string, onFrame: (f: Buffer) => void) {
+  subscribe(udid: string, onFrame: (f: Buffer) => void, want: StreamSettings) {
     const p = this.live(udid);
-    p.subs.add(onFrame);
-    p.timer ??= setInterval(() => {
-      const f = this.render(p);
-      for (const cb of p.subs) cb(f);
-    }, 200);
+    const fps = Math.min(want.fps, 30); // PNG encoding caps the mock
+    const timer = setInterval(() => onFrame(this.render(p)), Math.round(1000 / fps));
+    this.streams.add(timer);
     return {
       contentType: 'image/png',
+      fps,
+      quality: want.quality,
+      scale: 100, // the mock always renders the same size
       unsubscribe: () => {
-        p.subs.delete(onFrame);
-        if (!p.subs.size && p.timer) {
-          clearInterval(p.timer);
-          p.timer = undefined;
-        }
+        clearInterval(timer);
+        this.streams.delete(timer);
       },
     };
   }
 
   async close() {
     clearInterval(this.battTimer);
-    for (const p of this.phones.values()) if (p.timer) clearInterval(p.timer);
+    for (const t of this.streams) clearInterval(t);
+    this.streams.clear();
   }
 }
 
-export const MOCK_SCREEN = { width: SCREEN_W, height: 844 };
+export const MOCK_SCREEN = { width: SCREEN_W, height: SCREEN_H };
