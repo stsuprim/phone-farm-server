@@ -161,7 +161,7 @@ export class RtcSession {
     if (typeof src === 'string') throw new Error(src);
     this.src = src;
 
-    const pc = new ndc.PeerConnection(`phone-${this.udid.slice(0, 8)}`, { iceServers: [] }); // host candidates only
+    const pc = new ndc.PeerConnection(`phone-${this.udid.slice(-8)}`, { iceServers: [] }); // host candidates only
     this.pc = pc;
     // handlers first: libdatachannel may emit as soon as the description is set
     pc.onLocalDescription((answer, type) => {

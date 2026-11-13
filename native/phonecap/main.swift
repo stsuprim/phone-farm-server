@@ -668,9 +668,9 @@ final class Encoder {
         guard let session = s else { return nil }
         self.session = session
 
-        func set(_ key: CFString, _ value: CFTypeRef) {
+        func set(_ key: CFString, _ value: CFTypeRef, optional: Bool = false) {
             let st = VTSessionSetProperty(session, key: key, value: value)
-            if st != noErr { log("encoder property \(key) not set (\(st))") }
+            if st != noErr && !optional { log("encoder property \(key) not set (\(st))") } // optional: unsupported is expected, stay quiet
         }
         set(kVTCompressionPropertyKey_RealTime, kCFBooleanTrue)
         set(kVTCompressionPropertyKey_AllowFrameReordering, kCFBooleanFalse) // no B-frames
@@ -690,7 +690,7 @@ final class Encoder {
         set(kVTCompressionPropertyKey_MaxKeyFrameInterval, Int(Double(o.fps) * o.keySeconds) as CFNumber)
         set(kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration, o.keySeconds as CFNumber)
         if #available(macOS 13.0, *) {
-            set(kVTCompressionPropertyKey_PrioritizeEncodingSpeedOverQuality, kCFBooleanTrue)
+            set(kVTCompressionPropertyKey_PrioritizeEncodingSpeedOverQuality, kCFBooleanTrue, optional: true)
         }
         VTCompressionSessionPrepareToEncodeFrames(session)
         log("encoder \(width)x\(height) @\(o.fps) fps, \(o.bitrate / 1000) kbps, low-latency rate control \(lowLatency ? "on" : "off")")
