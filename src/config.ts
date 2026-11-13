@@ -13,7 +13,8 @@ export interface Config {
   mjpegBasePort: number;
   pollMs: number;
   autostartWda: boolean;
-  autoUpdateMinutes: number;
+  autoUpdateSeconds: number; // GitHub poll for the force-updater; 0 = off
+  autoUpdateMinutes: number; // same interval in minutes (what index.ts passes to updater.start)
   h264: boolean; // H.264 live view through native/phonecap (macOS)
   h264BitrateMbps: number;
 }
@@ -43,6 +44,8 @@ export function loadConfig(envFile = '.env'): Config {
   if (token.length < 16 || token === 'change-me-to-a-long-random-string') {
     throw new Error('API_TOKEN is missing or too short. Run `npm run init-env` and restart.');
   }
+  // AUTO_UPDATE_SECONDS (default 10). The old AUTO_UPDATE_MINUTES is ignored except `0`, which still turns it off.
+  const autoUpdateSeconds = e.AUTO_UPDATE_MINUTES?.trim() === '0' ? 0 : Math.max(0, num(e.AUTO_UPDATE_SECONDS, 10));
   return {
     host: e.HOST || '0.0.0.0',
     port: num(e.PORT, 8787),
@@ -55,7 +58,8 @@ export function loadConfig(envFile = '.env'): Config {
     mjpegBasePort: num(e.MJPEG_BASE_PORT, 9100),
     pollMs: num(e.POLL_MS, 5000),
     autostartWda: bool(e.AUTOSTART_WDA, true),
-    autoUpdateMinutes: num(e.AUTO_UPDATE_MINUTES, 5),
+    autoUpdateSeconds,
+    autoUpdateMinutes: autoUpdateSeconds / 60,
     h264: bool(e.H264, true),
     h264BitrateMbps: Math.min(50, Math.max(1, num(e.H264_BITRATE_MBPS, 8))),
   };

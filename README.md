@@ -39,7 +39,7 @@ recovering) or `WDA refused the request on <name>: ...` (WDA answered but said n
 | POST | `/phones/:udid/launch` | `{bundleId}` | `{ok:true}` |
 | POST | `/phones/:udid/recover` | `{}` | drops the WDA session, restarts the runner if `/status` fails, makes a new warm session (in the phone's queue, after any waiting actions): `{ok:true, control}`, or 502 `{error}` naming WDA |
 | GET | `/update/status` | - | `{current, remote, upToDate, lastCheck, lastError}` (runs `git fetch`, compares local HEAD with `origin/main`) |
-| POST | `/update/now` | - | runs the updater immediately: `{started:true}` (built; process exits and launchd restarts it) or `{started:false, reason}` (dirty tree, up to date, build failed...). 503 in mock mode |
+| POST | `/update/now` | - | force-updates to GitHub main now: `{started:true}` (built; process exits and launchd restarts it) or `{started:false, reason}` (up to date, GitHub unreachable, build failed and rolled back...). 503 in mock mode |
 
 **Coordinates are points** (WDA's coordinate space), never pixels: they go to WDA unchanged, only clamped to the screen
 (0 to `point_width - 1` / `point_height - 1`). Extra fields such as `"unit":"pt"` are ignored.
@@ -232,7 +232,9 @@ launchctl unload ~/Library/LaunchAgents/com.lotus.phonefarm.plist   # stop
 ```
 ### Auto-update
 
-The server checks GitHub (outbound only) every `AUTO_UPDATE_MINUTES` (default 5, `0` disables; mock mode never updates). When `origin/main` is ahead it does `git merge --ff-only`, `npm install` (only if package files changed), `npm run build`, then exits so launchd (`KeepAlive`) starts the new build. If the working tree is dirty, local commits exist, or pull/build fails, it skips, keeps the old version running and logs the reason to `server.log` (`[updater]` lines). `.env` is never read or printed by it.
+The Mac sits behind a home router, so nothing outside can trigger an update: the server checks GitHub itself (outbound only) every `AUTO_UPDATE_SECONDS` (default 10, `0` disables; mock mode never updates) with a tiny `git ls-remote origin refs/heads/main`. As soon as main's commit differs from `HEAD` it force-updates: `git fetch`, `git checkout -f -B main origin/main` (a hard reset: local edits and local commits on the Mac are dropped; untracked/ignored files like `.env` stay), `npm install` (only if package files changed), `npm run build`, then exits so launchd (`KeepAlive`) starts the new build. If install or build fails it resets back to the previous commit and rebuilds it, so the running server and `dist/` stay on the working version; the failure goes to `server.log` (`[updater]` lines) and `GET /update/status` (`lastError`, `failedCommit`), and the poller won't retry that commit until a newer one is pushed. `.env` is never read or printed by it. The old `AUTO_UPDATE_MINUTES` is ignored (only `AUTO_UPDATE_MINUTES=0` still turns updates off).
+
+**Update now (manual):** `curl -X POST -H "Authorization: Bearer $API_TOKEN" http://localhost:8787/update/now` runs the same force-update immediately (and retries a commit whose build failed before).
 
 It relies on the launchd service above, so install that first: `cp deploy/com.lotus.phonefarm.plist ~/Library/LaunchAgents/`, edit the paths, `launchctl load ~/Library/LaunchAgents/com.lotus.phonefarm.plist`. To update by hand anyway: `git pull && npm run build` and kickstart:
 
@@ -250,7 +252,7 @@ Against a live server: `URL=http://<mac>:8787 API_TOKEN=<token> npm test` (needs
 ## Settings (.env)
 
 `API_TOKEN`, `HOST`, `PORT`, `MOCK`, `MOCK_PHONES`, `WDA_PROJECT`, `WDA_DERIVED_DATA` (default `~/wda-build`),
-`WDA_BASE_PORT` (8100), `MJPEG_BASE_PORT` (9100), `POLL_MS` (5000), `AUTOSTART_WDA` (true), `AUTO_UPDATE_MINUTES` (5, 0 = off),
+`WDA_BASE_PORT` (8100), `MJPEG_BASE_PORT` (9100), `POLL_MS` (5000), `AUTOSTART_WDA` (true), `AUTO_UPDATE_SECONDS` (10, 0 = off),
 `H264` (true), `H264_BITRATE_MBPS` (8), `PHONECAP_PATH` (default `native/phonecap/build/phonecap`).
 
 ## Notes / known limits
