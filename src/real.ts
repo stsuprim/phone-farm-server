@@ -1,7 +1,15 @@
 import { execFile } from 'node:child_process';
+import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { Config } from './config.js';
+import { bitrateFor, H264Source, helperProducer, phoneStats } from './h264.js';
 import { MjpegSource } from './mjpeg.js';
-import { Backend, ControlState, HttpError, Image, ImageFormat, PathPoint, PhoneInfo, ScreenInfo, StreamSettings } from './types.js';
+import { Backend, ControlState, H264Want, HttpError, Image, ImageFormat, PathPoint, PhoneInfo, ScreenInfo, StreamSettings } from './types.js';
+
+const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..'); // src/ or dist/ -> project root
+const HELPER = process.env.PHONECAP_PATH || path.join(ROOT, 'native', 'phonecap', 'build', 'phonecap');
+const HELPER_ERROR = path.join(ROOT, 'native', 'phonecap', 'build', 'phonecap.error');
 import { WdaManager } from './wda.js';
 
 function run(cmd: string, args: string[]): Promise<string> {
@@ -23,6 +31,7 @@ export class RealBackend implements Backend {
   private phones = new Map<string, PhoneInfo>();
   private wda: WdaManager;
   private sources = new Map<string, MjpegSource>();
+  private h264Sources = new Map<string, H264Source>();
   private streams = new Map<string, Set<StreamSettings>>(); // what each stream subscriber asked for
   private timer: NodeJS.Timeout;
   private polling = false;
@@ -65,6 +74,8 @@ export class RealBackend implements Backend {
         if (!ids.includes(udid)) {
           p.online = false;
           this.wda.stop(udid);
+          this.h264Sources.get(udid)?.close('phone unplugged');
+          this.h264Sources.delete(udid);
         }
       }
     } finally {
@@ -85,8 +96,48 @@ export class RealBackend implements Backend {
         point_height: s?.height ?? null,
         width: px(s?.width),
         height: px(s?.height),
+        stats: this.stats(p.udid),
       };
     });
+  }
+
+  private stats(udid: string) {
+    const m = this.sources.get(udid);
+    const src = this.h264Sources.get(udid);
+    const reason = this.helperProblem() ?? src?.unavailable() ?? null;
+    return phoneStats(src, { fps: m?.viewers ? m.meter.rate() : 0, viewers: m?.viewers ?? 0 }, reason);
+  }
+
+  /** Why the native H.264 helper can't be used on this Mac, or null. */
+  private helperProblem(): string | null {
+    if (!this.cfg.h264) return 'H.264 is turned off (H264=false in .env)';
+    if (process.platform !== 'darwin') return 'H.264 capture needs macOS';
+    if (fs.existsSync(HELPER)) return null;
+    try {
+      const why = fs.readFileSync(HELPER_ERROR, "utf8").split(String.fromCharCode(10))[0]!;
+      return `the phonecap helper failed to build: ${why.trim()}`;
+    } catch {
+      return 'the phonecap helper is not built (run npm run build on the Mac)';
+    }
+  }
+
+  h264(udid: string, want: H264Want): H264Source | string {
+    const p = this.known(udid);
+    const problem = this.helperProblem();
+    if (problem) return problem;
+    const settings = { fps: want.fps, scale: want.scale, bitrate: bitrateFor(want.quality, this.cfg.h264BitrateMbps * 1_000_000) };
+    let src = this.h264Sources.get(udid);
+    if (!src) {
+      const online = [...this.phones.values()].filter((x) => x.online).length;
+      const args = ['--udid', udid, '--name', p.name];
+      if (online === 1) args.push('--any-if-single');
+      src = new H264Source(udid.slice(0, 8), helperProducer(HELPER, args, udid.slice(0, 8)), settings);
+      this.h264Sources.set(udid, src);
+    }
+    const down = src.unavailable();
+    if (down) return down;
+    src.setWant(settings);
+    return src;
   }
 
   screen(udid: string): ScreenInfo | null {
@@ -154,7 +205,7 @@ export class RealBackend implements Backend {
     const set = this.streams.get(udid);
     const all = set?.size ? [...set] : [];
     const most = (k: keyof StreamSettings) => Math.max(...all.map((s) => s[k]));
-    return all.length ? { fps: most('fps'), quality: most('quality'), scale: most('scale') } : { fps: 30, quality: 50, scale: 50 };
+    return all.length ? { fps: most('fps'), quality: most('quality'), scale: most('scale') } : { fps: 60, quality: 50, scale: 50 };
   }
 
   subscribe(udid: string, onFrame: (f: Buffer) => void, want: StreamSettings) {
@@ -179,6 +230,7 @@ export class RealBackend implements Backend {
 
   async close() {
     clearInterval(this.timer);
+    for (const s of this.h264Sources.values()) s.close();
     this.wda.shutdown();
   }
 }

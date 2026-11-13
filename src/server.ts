@@ -1,9 +1,42 @@
 import crypto from 'node:crypto';
 import http from 'node:http';
+import os from 'node:os';
 import { WebSocket, WebSocketServer } from 'ws';
 import { Control } from './control.js';
-import { Backend, HttpError, StreamSettings } from './types.js';
+import { H264Viewer, Transport, wsMessage } from './h264.js';
+import { rtcSignaling } from './rtc.js';
+import { Backend, H264Want, HttpError, StreamSettings } from './types.js';
 import type { Updater } from './updater.js';
+
+/** The Mac's own base URLs (LAN and Tailscale IPv4 addresses), so a client on the LAN can go direct. */
+function lanUrls(port: number): string[] {
+  const out: string[] = [];
+  for (const list of Object.values(os.networkInterfaces())) {
+    for (const a of list ?? []) {
+      if (a.family === 'IPv4' && !a.internal && !a.address.startsWith('169.254.')) out.push(`http://${a.address}:${port}`);
+    }
+  }
+  return out;
+}
+
+/** H.264 settings from the stream query: fps 1-60 (default 60), scale 10-100 % (default 100), quality 1-100 or none. */
+function h264Want(q: URLSearchParams): H264Want {
+  const pick = (k: string, dflt: number, lo: number, hi: number) => {
+    const v = Number(q.get(k));
+    return q.has(k) && q.get(k) !== '' && Number.isFinite(v) ? Math.round(Math.min(hi, Math.max(lo, v))) : dflt;
+  };
+  return { fps: pick('fps', 60, 1, 60), scale: pick('scale', 100, 10, 100), quality: q.has('quality') && q.get('quality') !== '' ? pick('quality', 50, 1, 100) : null };
+}
+
+/** Client text messages on a stream or control socket, or null if not a JSON object. */
+function parseObject(data: unknown): Record<string, unknown> | null {
+  try {
+    const v = JSON.parse(String(data));
+    return v && typeof v === 'object' && !Array.isArray(v) ? v : null;
+  } catch {
+    return null;
+  }
+}
 
 function send(res: http.ServerResponse, status: number, body: unknown): void {
   const data = JSON.stringify(body);
@@ -65,7 +98,11 @@ export function createServer(backend: Backend, token: string, updater?: Updater)
         res.setHeader('www-authenticate', 'Bearer');
         return send(res, 401, { error: 'missing or invalid bearer token' });
       }
-      if (req.method === 'GET' && path === '/phones') return send(res, 200, await backend.list());
+      if (req.method === 'GET' && path === '/phones') {
+        const addr = server.address();
+        const lan = lanUrls(addr && typeof addr === 'object' ? addr.port : 8787);
+        return send(res, 200, (await backend.list()).map((p) => ({ ...p, lan })));
+      }
       if (path === '/update/status' || path === '/update/now') {
         if (!updater) return send(res, 503, { error: 'updater unavailable (mock mode)' });
         if (path === '/update/status') {
@@ -112,54 +149,114 @@ export function createServer(backend: Backend, token: string, updater?: Updater)
     }
     const udid = decodeURIComponent(m[1]!);
     if (m[2] === 'control') return void wss.handleUpgrade(req, socket, head, (ws) => controlSocket(ws, udid));
-    const want = streamSettings(url.searchParams);
+    const codec = url.searchParams.get('codec');
+    if (codec !== null && codec !== 'h264' && codec !== 'mjpeg') {
+      socket.write('HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n');
+      return void socket.destroy();
+    }
     wss.handleUpgrade(req, socket, head, (ws) => {
-      // Latest frame only: while one frame is being written, newer ones replace the waiting one.
-      let writing = false;
-      let waiting: Buffer | null = null;
-      const push = (frame: Buffer): void => {
-        if (ws.readyState !== WebSocket.OPEN) return;
-        if (writing) {
-          waiting = frame;
-          return;
-        }
-        writing = true;
-        ws.send(frame, { binary: true }, () => {
-          writing = false;
-          const next = waiting;
-          waiting = null;
-          if (next) push(next);
-        });
-      };
-      let sub: ReturnType<Backend['subscribe']>;
-      try {
-        sub = backend.subscribe(udid, push, want);
-      } catch (err) {
-        ws.close(1011, err instanceof HttpError ? err.message.slice(0, 100) : 'error');
-        return;
-      }
-      ws.send(JSON.stringify({ type: 'hello', udid, contentType: sub.contentType, fps: sub.fps, scale: sub.scale, quality: sub.quality }));
-      ws.on('close', sub.unsubscribe);
-      ws.on('error', sub.unsubscribe);
+      if (codec === 'h264') void h264Socket(ws, udid, url.searchParams);
+      else mjpegSocket(ws, udid, streamSettings(url.searchParams), codec === 'mjpeg' ? { codec: 'mjpeg' } : {});
     });
   });
 
-  /** WS /phones/:udid/control: JSON actions in, `{type:"ack", id, ok[, error]}` out (for messages with an id). */
+  /** Old behaviour (no `codec`), `codec=mjpeg`, and the fallback when H.264 isn't available (`extra` has the reason). */
+  function mjpegSocket(ws: WebSocket, udid: string, want: StreamSettings, extra: Record<string, unknown>): void {
+    // Latest frame only: while one frame is being written, newer ones replace the waiting one.
+    let writing = false;
+    let waiting: Buffer | null = null;
+    const push = (frame: Buffer): void => {
+      if (ws.readyState !== WebSocket.OPEN) return;
+      if (writing) {
+        waiting = frame;
+        return;
+      }
+      writing = true;
+      ws.send(frame, { binary: true }, () => {
+        writing = false;
+        const next = waiting;
+        waiting = null;
+        if (next) push(next);
+      });
+    };
+    let sub: ReturnType<Backend['subscribe']>;
+    try {
+      sub = backend.subscribe(udid, push, want);
+    } catch (err) {
+      ws.close(1011, err instanceof HttpError ? err.message.slice(0, 100) : 'error');
+      return;
+    }
+    ws.send(JSON.stringify({ type: 'hello', ...extra, udid, contentType: sub.contentType, fps: sub.fps, scale: sub.scale, quality: sub.quality }));
+    ws.on('message', (data, isBinary) => {
+      const msg = isBinary ? null : parseObject(data);
+      if (msg?.type === 'ping') ws.send(JSON.stringify({ type: 'pong', t: msg.t ?? null, server_time: Date.now() }));
+    });
+    ws.on('close', sub.unsubscribe);
+    ws.on('error', sub.unsubscribe);
+  }
+
+  /**
+   * `codec=h264`: hello {type:"hello", codec:"h264", width, height, fps, scale, server_time}, then binary
+   * [kind 1 config | 2 key | 3 delta][float64 BE capture ms][Annex B]. Falls back to MJPEG with a reason.
+   */
+  async function h264Socket(ws: WebSocket, udid: string, q: URLSearchParams): Promise<void> {
+    let reason: string;
+    let src: ReturnType<Backend['h264']>;
+    try {
+      src = backend.h264(udid, h264Want(q));
+    } catch (err) {
+      ws.close(1011, err instanceof HttpError ? err.message.slice(0, 100) : 'error');
+      return;
+    }
+    if (typeof src === 'string') reason = src;
+    else {
+      try {
+        const info = await src.open();
+        if (ws.readyState !== WebSocket.OPEN) return;
+        const transport: Transport = {
+          kind: 'ws',
+          buffered: () => ws.bufferedAmount,
+          open: () => ws.readyState === WebSocket.OPEN,
+          send: (r) => ws.send(wsMessage(r)),
+          fail: (why) => ws.close(1011, why.slice(0, 120)),
+        };
+        const viewer = new H264Viewer(transport, src);
+        ws.send(JSON.stringify({ type: 'hello', codec: 'h264', udid, width: info.width, height: info.height, fps: info.fps, scale: info.scale, server_time: Date.now() }));
+        const h = src;
+        h.add(viewer);
+        ws.on('message', (data, isBinary) => {
+          const msg = isBinary ? null : parseObject(data);
+          if (msg?.type === 'key') viewer.forceKey();
+          else if (msg?.type === 'ping') ws.send(JSON.stringify({ type: 'pong', t: msg.t ?? null, server_time: Date.now() }));
+        });
+        const done = () => h.remove(viewer);
+        ws.on('close', done);
+        ws.on('error', done);
+        return;
+      } catch (err) {
+        reason = (err as Error).message;
+      }
+    }
+    if (ws.readyState !== WebSocket.OPEN) return;
+    mjpegSocket(ws, udid, streamSettings(q), { codec: 'mjpeg', reason });
+  }
+
+  /**
+   * WS /phones/:udid/control: JSON actions in, `{type:"ack", id, ok[, error]}` out (for messages with an id);
+   * `{type:"ping", t}` -> `{type:"pong", t, server_time}`; rtc-offer / rtc-ice / rtc-close for the WebRTC view.
+   */
   function controlSocket(ws: WebSocket, udid: string): void {
     const reply = (msg: unknown) => {
       if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(msg));
     };
+    const rtc = rtcSignaling(backend, control, udid, reply);
     reply({ type: 'hello', udid });
     ws.on('message', (data, isBinary) => {
       if (isBinary) return;
-      let msg: Record<string, unknown>;
-      try {
-        const v = JSON.parse(data.toString());
-        if (!v || typeof v !== 'object' || Array.isArray(v)) throw new Error();
-        msg = v;
-      } catch {
-        return reply({ type: 'ack', id: null, ok: false, error: 'message must be a JSON object' });
-      }
+      const msg = parseObject(data);
+      if (!msg) return reply({ type: 'ack', id: null, ok: false, error: 'message must be a JSON object' });
+      if (msg.type === 'ping') return reply({ type: 'pong', t: msg.t ?? null, server_time: Date.now() });
+      if (rtc.handle(msg)) return;
       const id = msg.id ?? null;
       control.handle(udid, msg, ws).then(
         () => {
@@ -169,10 +266,14 @@ export function createServer(backend: Backend, token: string, updater?: Updater)
         (err) => reply({ type: 'ack', id, ok: false, error: errorText(err) }),
       );
     });
-    const done = () => control.release(ws);
+    const done = () => {
+      control.release(ws);
+      rtc.close();
+    };
     ws.on('close', done);
     ws.on('error', done);
   }
+
 
   return server;
 }

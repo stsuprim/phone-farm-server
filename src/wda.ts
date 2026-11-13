@@ -1,5 +1,6 @@
 import { ChildProcess, spawn } from 'node:child_process';
 import fs from 'node:fs';
+import http from 'node:http';
 import path from 'node:path';
 import { Config } from './config.js';
 import { ControlState, HttpError, PathPoint, ScreenInfo, StreamSettings } from './types.js';
@@ -41,11 +42,15 @@ interface Entry {
   tapRoute: 0 | 1 | 2; // 0: /wda/tap, 1: /wda/tap/0 (older WDA), 2: W3C actions
   mjpeg: StreamSettings; // wanted MJPEG settings
   mjpegApplied?: string; // JSON of the settings last applied to the current session
+  agent: http.Agent; // keep-alive connections to WDA (through iproxy): no new usbmux connection per touch
 }
+
+const newAgent = () => new http.Agent({ keepAlive: true, maxSockets: 6 });
+type HttpErr = Error & { code?: string };
 
 const PORTS_FILE = path.join('data', 'ports.json');
 const HEALTH_MS = 10000;
-const DEFAULT_MJPEG: StreamSettings = { fps: 30, quality: 50, scale: 50 };
+const DEFAULT_MJPEG: StreamSettings = { fps: 60, quality: 50, scale: 50 };
 // No waiting for the app to be idle/animations to finish before each action: that's what made taps slow.
 const CAPS = { shouldWaitForQuiescence: false, waitForIdleTimeout: 0, shouldUseCompactResponses: true, maxTypingFrequency: 60 };
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -137,7 +142,7 @@ export class WdaManager {
     const n = this.slot(udid);
     e ??= {
       udid, wdaPort: this.cfg.wdaBasePort + n, mjpegPort: this.cfg.mjpegBasePort + n, status: 'starting', control: 'recovering',
-      wanted: true, procs: [], restarts: 0, checking: false, lastOk: 0, tapRoute: 0, mjpeg: { ...DEFAULT_MJPEG },
+      wanted: true, procs: [], restarts: 0, checking: false, lastOk: 0, tapRoute: 0, mjpeg: { ...DEFAULT_MJPEG }, agent: newAgent(),
     };
     e.wanted = true;
     this.entries.set(udid, e);
@@ -161,6 +166,8 @@ export class WdaManager {
     e.sessionId = undefined;
     e.sessionP = undefined;
     e.mjpegApplied = undefined;
+    e.agent.destroy(); // the forwards are gone: so are their connections
+    e.agent = newAgent();
   }
 
   /** Kill and relaunch the WDA runner and its forwards right away. */
@@ -253,21 +260,57 @@ export class WdaManager {
   }
 
   // ---- WDA HTTP client ----
-  private async raw(e: Entry, method: string, p: string, body?: unknown, timeout = 30000): Promise<any> {
-    let res: Response;
-    try {
-      res = await fetch(`http://127.0.0.1:${e.wdaPort}${p}`, {
-        method,
-        headers: { 'content-type': 'application/json' },
-        body: body === undefined ? undefined : JSON.stringify(body),
-        signal: AbortSignal.timeout(timeout),
+  /**
+   * One HTTP request to WDA over the entry's keep-alive agent (Nagle off). A request that fails on a reused idle
+   * connection the other side had already closed is retried once on a fresh one, so a stale socket never looks
+   * like WDA being down (which would trigger a session recovery).
+   */
+  private request(e: Entry, method: string, p: string, body: string | undefined, timeout: number, retried = false): Promise<{ status: number; text: string }> {
+    return new Promise((resolve, reject) => {
+      let settled = false;
+      const headers: Record<string, string | number> = {};
+      if (body !== undefined) {
+        headers['content-type'] = 'application/json';
+        headers['content-length'] = Buffer.byteLength(body);
+      }
+      const req = http.request({ host: '127.0.0.1', port: e.wdaPort, path: p, method, agent: e.agent, headers }, (res) => {
+        const chunks: Buffer[] = [];
+        res.on('data', (c: Buffer) => chunks.push(c));
+        res.on('end', () => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          resolve({ status: res.statusCode ?? 0, text: Buffer.concat(chunks).toString('utf8') });
+        });
+        res.on('error', fail);
       });
+      const timer = setTimeout(() => req.destroy(Object.assign(new Error('timeout'), { code: 'TIMEOUT' })), timeout);
+      function fail(err: HttpErr) {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        const stale = req.reusedSocket && (err.code === 'ECONNRESET' || err.code === 'EPIPE' || /socket hang up/i.test(err.message));
+        if (stale && !retried) resolve(thisRef.request(e, method, p, body, timeout, true));
+        else reject(err);
+      }
+      const thisRef = this;
+      req.on('error', fail);
+      req.on('socket', (s) => s.setNoDelay(true));
+      req.end(body);
+    });
+  }
+
+  private async raw(e: Entry, method: string, p: string, body?: unknown, timeout = 30000): Promise<any> {
+    let res: { status: number; text: string; ok?: boolean };
+    try {
+      res = await this.request(e, method, p, body === undefined ? undefined : JSON.stringify(body), timeout);
     } catch (err) {
-      const x = err as Error & { cause?: { code?: string; message?: string } };
-      const why = x.name === 'TimeoutError' ? `no answer within ${Math.round(timeout / 1000)}s` : `unreachable (${x.cause?.code ?? x.cause?.message ?? x.message})`;
+      const x = err as HttpErr;
+      const why = x.code === 'TIMEOUT' ? `no answer within ${Math.round(timeout / 1000)}s` : `unreachable (${x.code ?? x.message})`;
       throw new WdaError('unreachable', why);
     }
-    const text = await res.text().catch(() => '');
+    res.ok = res.status >= 200 && res.status < 300;
+    const text = res.text;
     let json: any = {};
     try {
       json = text ? JSON.parse(text) : {};
@@ -289,10 +332,15 @@ export class WdaManager {
 
   private async ping(e: Entry, timeout: number): Promise<{ ok: boolean; sessionId?: string }> {
     try {
-      const r = await fetch(`http://127.0.0.1:${e.wdaPort}/status`, { signal: AbortSignal.timeout(timeout) });
-      const j: any = await r.json().catch(() => ({}));
+      const r = await this.request(e, 'GET', '/status', undefined, timeout);
+      let j: any = {};
+      try {
+        j = JSON.parse(r.text);
+      } catch {
+        /* not JSON */
+      }
       const sid = j?.sessionId ?? j?.value?.sessionId;
-      return { ok: r.ok, sessionId: typeof sid === 'string' && sid ? sid : undefined };
+      return { ok: r.status >= 200 && r.status < 300, sessionId: typeof sid === 'string' && sid ? sid : undefined };
     } catch {
       return { ok: false };
     }

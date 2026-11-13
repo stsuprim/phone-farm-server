@@ -1,4 +1,6 @@
 import { execFile } from 'node:child_process';
+import fs from 'node:fs';
+import path from 'node:path';
 import { promisify } from 'node:util';
 
 const run = promisify(execFile);
@@ -79,6 +81,11 @@ export function createUpdater(onRestart: () => void, cwd = process.cwd()): Updat
         throw e;
       }
       lastError = null;
+      const nativeErr = path.join(cwd, 'native', 'phonecap', 'build', 'phonecap.error');
+      if (fs.existsSync(nativeErr)) {
+        const first = fs.readFileSync(nativeErr, 'utf8').split('\n')[0];
+        log(`phonecap (H.264 helper) did not build, the live view will use MJPEG: ${first}`);
+      }
       log(`build ok, restarting on ${remote.slice(0, 7)}`);
       // Give an HTTP response time to flush before the process exits.
       setTimeout(onRestart, 500);

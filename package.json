@@ -3,16 +3,22 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "engines": { "node": ">=20" },
+  "engines": {
+    "node": ">=20"
+  },
   "scripts": {
-    "build": "tsc -p tsconfig.build.json",
+    "build": "tsc -p tsconfig.build.json && node scripts/build-native.mjs",
     "check": "tsc --noEmit",
     "start": "node dist/index.js",
     "dev:mock": "MOCK=true tsx src/index.ts",
     "init-env": "node scripts/init-env.mjs",
-    "test": "tsx test/smoke.ts"
+    "test": "tsx test/h264.ts && tsx test/rtc.ts && tsx test/smoke.ts",
+    "build:native": "node scripts/build-native.mjs"
   },
-  "dependencies": { "ws": "^8.18.0" },
+  "dependencies": {
+    "node-datachannel": "0.33.6",
+    "ws": "^8.18.0"
+  },
   "devDependencies": {
     "@types/node": "^22.0.0",
     "@types/ws": "^8.5.12",

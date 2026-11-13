@@ -1,4 +1,5 @@
 import http from 'node:http';
+import { RateMeter } from './h264.js';
 
 /**
  * Incremental parser for a multipart MJPEG stream (WDA sends Content-Length per part).
@@ -51,7 +52,12 @@ export class MjpegSource {
   private subs = new Set<(f: Buffer) => void>();
   private req?: http.ClientRequest;
   private retry?: NodeJS.Timeout;
+  readonly meter = new RateMeter();
   constructor(private port: () => number) {}
+
+  get viewers(): number {
+    return this.subs.size;
+  }
 
   add(cb: (f: Buffer) => void): () => void {
     this.subs.add(cb);
@@ -71,6 +77,7 @@ export class MjpegSource {
       return this.reconnect();
     }
     const parser = new MjpegParser((f) => {
+      this.meter.tick();
       for (const cb of this.subs) cb(f);
     });
     const req = http.get({ host: '127.0.0.1', port, path: '/', agent: false }, (res) => {

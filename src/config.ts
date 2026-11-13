@@ -14,6 +14,8 @@ export interface Config {
   pollMs: number;
   autostartWda: boolean;
   autoUpdateMinutes: number;
+  h264: boolean; // H.264 live view through native/phonecap (macOS)
+  h264BitrateMbps: number;
 }
 
 function loadDotEnv(file: string): void {
@@ -54,5 +56,7 @@ export function loadConfig(envFile = '.env'): Config {
     pollMs: num(e.POLL_MS, 5000),
     autostartWda: bool(e.AUTOSTART_WDA, true),
     autoUpdateMinutes: num(e.AUTO_UPDATE_MINUTES, 5),
+    h264: bool(e.H264, true),
+    h264BitrateMbps: Math.min(50, Math.max(1, num(e.H264_BITRATE_MBPS, 8))),
   };
 }

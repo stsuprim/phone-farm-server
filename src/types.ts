@@ -1,3 +1,5 @@
+import type { H264Source } from './h264.js';
+
 /** Whether a phone can be driven right now: WDA session warm, being recovered, or unavailable. */
 export type ControlState = 'ready' | 'recovering' | 'down';
 
@@ -18,6 +20,34 @@ export interface PhoneInfo {
   /** Screen size in pixels (points x scale); null until known. */
   width: number | null;
   height: number | null;
+  /** Live view numbers for this phone (see README). */
+  stats?: StreamStats;
+  /** The Mac's own base URLs on its LAN/Tailscale addresses, e.g. "http://192.168.1.20:8787". */
+  lan?: string[];
+}
+
+/** Per-phone live view stats in GET /phones. Timings are averages in ms; null when unknown. */
+export interface StreamStats {
+  codec: 'h264' | 'mjpeg' | null; // what viewers get now (h264 if any WebRTC/H.264 viewer)
+  fps: number | null;
+  encode_ms: number | null;
+  capture_to_encoded_ms: number | null;
+  encoded_to_sent_ms: number | null;
+  viewers: number;
+  viewers_webrtc: number;
+  viewers_h264_ws: number;
+  viewers_mjpeg: number;
+  path: string | null; // WebRTC path of a viewer: "lan", "tailscale", "loopback" or "direct" (always host, never relayed)
+  dropped: number; // frames dropped by latest-only since the viewers joined
+  h264_available: boolean;
+  h264_reason: string | null; // why H.264 isn't available (helper not built, capture failing...)
+}
+
+/** What a client asked of the H.264 stream. */
+export interface H264Want {
+  fps: number;
+  scale: number;
+  quality: number | null;
 }
 
 /** Screen size in points plus the scale, as WDA reports it. */
@@ -70,5 +100,7 @@ export interface Backend {
     onFrame: (frame: Buffer) => void,
     want: StreamSettings,
   ): { contentType: string; unsubscribe: () => void } & StreamSettings;
+  /** The phone's shared H.264 capture, or the reason H.264 isn't available (then clients get MJPEG). */
+  h264(udid: string, want: H264Want): H264Source | string;
   close(): Promise<void>;
 }

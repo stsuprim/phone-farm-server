@@ -1,6 +1,7 @@
 import { loadConfig } from './config.js';
 import { MockBackend } from './mock.js';
 import { RealBackend } from './real.js';
+import { rtcCleanup } from './rtc.js';
 import { createServer } from './server.js';
 import { createUpdater } from './updater.js';
 
@@ -19,7 +20,10 @@ server.listen(cfg.port, cfg.host, () => {
 
 const shutdown = () => {
   server.close();
-  void backend.close().finally(() => process.exit(0));
+  void backend.close().finally(() => {
+    rtcCleanup();
+    process.exit(0);
+  });
 };
 updater?.start(cfg.autoUpdateMinutes);
 process.on('SIGINT', shutdown);

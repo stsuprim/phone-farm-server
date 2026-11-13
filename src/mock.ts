@@ -1,5 +1,14 @@
+import { H264Source, phoneStats, RateMeter } from './h264.js';
+import { mockProducer } from './h264mock.js';
 import { encodePng } from './png.js';
-import { Backend, ControlState, HttpError, Image, ImageFormat, PathPoint, PhoneInfo, ScreenInfo, StreamSettings } from './types.js';
+import { Backend, ControlState, H264Want, HttpError, Image, ImageFormat, PathPoint, PhoneInfo, ScreenInfo, StreamSettings } from './types.js';
+
+export interface MockOptions {
+  /** false = no H.264 (clients asking for it get the MJPEG fallback), to test the fallback. Default true. */
+  h264?: boolean;
+  /** Stop an unused mock H.264 source after this long (default 10 s, like the real one). */
+  h264IdleMs?: number;
+}
 
 const W = 270;
 const H = 585;
@@ -46,8 +55,10 @@ export class MockBackend implements Backend {
   private phones = new Map<string, MockPhone>();
   private battTimer: NodeJS.Timeout;
   private streams = new Set<NodeJS.Timeout>();
+  private h264Sources = new Map<string, H264Source>();
+  private mjpeg = new Map<string, { viewers: number; meter: RateMeter }>();
 
-  constructor(count: number) {
+  constructor(count: number, private opts: MockOptions = {}) {
     const models = ['iPhone14,5', 'iPhone13,2', 'iPhone15,2', 'iPhone12,1'];
     for (let i = 0; i < count; i++) {
       const udid = `00008110-MOCK${String(i + 1).padStart(4, '0')}A1B2C3D4`;
@@ -77,7 +88,26 @@ export class MockBackend implements Backend {
   }
 
   async list(): Promise<PhoneInfo[]> {
-    return [...this.phones.values()].map((p) => ({ ...p.info }));
+    return [...this.phones.values()].map((p) => {
+      const m = this.mjpeg.get(p.info.udid);
+      const src = this.h264Sources.get(p.info.udid);
+      const reason = this.opts.h264 === false ? 'H.264 is turned off in this mock' : src?.unavailable() ?? null;
+      return { ...p.info, stats: phoneStats(src, { fps: m?.viewers ? m.meter.rate() : 0, viewers: m?.viewers ?? 0 }, reason) };
+    });
+  }
+
+  h264(udid: string, want: H264Want): H264Source | string {
+    const p = this.live(udid);
+    if (this.opts.h264 === false) return 'H.264 is turned off in this mock';
+    let src = this.h264Sources.get(udid);
+    if (!src) {
+      src = new H264Source(udid.slice(0, 12), mockProducer(() => p), { fps: want.fps, scale: want.scale, bitrate: 0 }, {
+        idleMs: this.opts.h264IdleMs ?? 10_000,
+        log: () => {},
+      });
+      this.h264Sources.set(udid, src);
+    }
+    return src;
   }
 
   screen(udid: string): ScreenInfo | null {
@@ -167,8 +197,16 @@ export class MockBackend implements Backend {
   subscribe(udid: string, onFrame: (f: Buffer) => void, want: StreamSettings) {
     const p = this.live(udid);
     const fps = Math.min(want.fps, 30); // PNG encoding caps the mock
-    const timer = setInterval(() => onFrame(this.render(p)), Math.round(1000 / fps));
+    let m = this.mjpeg.get(udid);
+    if (!m) this.mjpeg.set(udid, (m = { viewers: 0, meter: new RateMeter() }));
+    const mine = m;
+    mine.viewers++;
+    const timer = setInterval(() => {
+      mine.meter.tick();
+      onFrame(this.render(p));
+    }, Math.round(1000 / fps));
     this.streams.add(timer);
+    let gone = false;
     return {
       contentType: 'image/png',
       fps,
@@ -177,6 +215,8 @@ export class MockBackend implements Backend {
       unsubscribe: () => {
         clearInterval(timer);
         this.streams.delete(timer);
+        if (!gone) mine.viewers--;
+        gone = true;
       },
     };
   }
@@ -185,6 +225,7 @@ export class MockBackend implements Backend {
     clearInterval(this.battTimer);
     for (const t of this.streams) clearInterval(t);
     this.streams.clear();
+    for (const s of this.h264Sources.values()) s.close();
   }
 }
 
