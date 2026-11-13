@@ -17,6 +17,12 @@ export interface Config {
   autoUpdateMinutes: number; // same interval in minutes (what index.ts passes to updater.start)
   h264: boolean; // H.264 live view through native/phonecap (macOS)
   h264BitrateMbps: number;
+  /** CoreDevice HID live touch (docs/BEST_METHOD.md): auto = on iOS 27+ phones, on = try on every phone, off. */
+  hidInput: 'auto' | 'on' | 'off';
+  /** The Python that has pymobiledevice3 (native/hid/hid_input.py runs with it). */
+  hidPython: string;
+  /** Seconds without a viewer or input before a phone's touch session closes (frees its camera/mic). */
+  hidIdleSeconds: number;
 }
 
 function loadDotEnv(file: string): void {
@@ -62,5 +68,8 @@ export function loadConfig(envFile = '.env'): Config {
     autoUpdateMinutes: autoUpdateSeconds / 60,
     h264: bool(e.H264, true),
     h264BitrateMbps: Math.min(50, Math.max(1, num(e.H264_BITRATE_MBPS, 8))),
+    hidInput: /^(on|off)$/i.test(e.HID_INPUT ?? '') ? (e.HID_INPUT!.toLowerCase() as 'on' | 'off') : 'auto',
+    hidPython: expand(e.HID_PYTHON || 'python3'),
+    hidIdleSeconds: Math.max(10, num(e.HID_IDLE_SECONDS, 120)),
   };
 }

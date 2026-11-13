@@ -29,7 +29,8 @@ recovering) or `WDA refused the request on <name>: ...` (WDA answered but said n
 | GET | `/phones/:udid/screenshot` | `?format=png` (default) or `jpeg` | image bytes (`jpeg` = latest MJPEG frame; mock always returns PNG, check `Content-Type`) |
 | WS | `/phones/:udid/stream` | `?codec=` (`h264` or `mjpeg`; absent = MJPEG as before), `?fps=` (1-60, default 60), `?quality=`, `?scale=` (10-100 %; MJPEG default 50, H.264 default 100) | MJPEG: first a text message `{"type":"hello", udid, contentType, fps, scale, quality}` with the settings actually used, then one binary message per frame (JPEG from WDA's MJPEG server in real mode, PNG in mock); latest frame only. H.264: see [Live view](#live-view-webrtc-h264-mjpeg) |
 | WS | `/phones/:udid/control` | JSON text messages, see below | low-latency control over one connection |
-| POST | `/phones/:udid/tap` | `{x, y}` | `{ok:true}` (WDA's fast tap) |
+| POST | `/phones/:udid/tap` | `{x, y}` | `{ok:true, via, ms}`: `via` how it reached the phone (`hid`, `wda-fast`, `wda`; see [Input](#input-taps-swipes-typing)), `ms` the server's receive -> injected time. Every action answers with these two |
+| GET | `/phones/:udid/input` | - | input latency on the server: `{udid, via, tap_avg_ms, tap_p90_ms, last, samples, methods: {hid, hid_reason, wda_fast}, recent: [{at, type, via, ok, wait_ms, inject_ms, total_ms, error?}]}` (the last 50 actions) |
 | POST | `/phones/:udid/swipe` | `{x1, y1, x2, y2, ms}` (`ms` default 300, max 10000) | `{ok:true}`; a swipe from a point to itself is a long press |
 | POST | `/phones/:udid/path` | `{points: [[x, y, ms], ...]}` (`ms` since the gesture began; 1-5000 points, up to 60 s) | `{ok:true}`: one continuous touch with that timing |
 | POST | `/phones/:udid/hold` | `{x, y, ms}` (`ms` default 1000, max 30000) | `{ok:true}` |
@@ -43,9 +44,8 @@ recovering) or `WDA refused the request on <name>: ...` (WDA answered but said n
 
 **Coordinates are points** (WDA's coordinate space), never pixels: they go to WDA unchanged, only clamped to the screen
 (0 to `point_width - 1` / `point_height - 1`). Extra fields such as `"unit":"pt"` are ignored.
-Swipe, path and hold are W3C pointer actions (`POST /session/:id/actions`) with their real durations; tap uses WDA's fast
-tap (`/wda/tap`, falling back to `/wda/tap/0` or a pointer tap on older WDA). Every action for a phone, from HTTP or the
-control socket, goes through one queue per phone, so they run in order and never overlap (at most 50 waiting, then 503).
+How taps, swipes and typing reach the phone: see [Input](#input-taps-swipes-typing). Every action for a phone, from HTTP or
+the control socket, goes through one queue per phone, so they run in order and never overlap (at most 50 waiting, then 503).
 
 ### Control WebSocket
 
@@ -60,21 +60,43 @@ control socket, goes through one queue per phone, so they run in order and never
   shows glass-to-glass latency.
 - WebRTC signaling: `rtc-offer`, `rtc-ice`, `rtc-close` (see [Live view](#live-view-webrtc-h264-mjpeg)).
 
-Replies: `{"type":"ack", id, ok:true}` once the action has run, or `{"type":"ack", id, ok:false, error}`. Messages without
-an `id` get no ack on success; a failure still answers, with `id: null`.
+Replies: `{"type":"ack", id, ok:true, via, ms}` once the action is injected on the phone (with HID or the fast WDA route
+that's a few ms after it arrives: the phone plays it from its own queue; with the old WDA route, once XCTest finished it),
+or `{"type":"ack", id, ok:false, error}`. Messages without an `id` get no ack on success; a failure still answers, with
+`id: null`.
 
-Live touch: WDA can't keep a finger down between requests, so `down`, the `move`s and `up` are buffered and played as one
-pointer action when `up` arrives, with every point and its timing (a `down` sent late, e.g. after a hold, keeps that hold
-because its `t` is kept). A still touch lifted within 250 ms becomes a fast tap. A new `down` lifts any unfinished touch;
-a touch never lifted is dropped after 60 s or when its socket closes.
+Live touch: with CoreDevice HID (below) `down`, each `move` and `up` reach the phone as they come, like a real finger (a
+drag follows live, a hold is a hold; moves arriving while one is still being sent fold into it). Without it (WDA can't keep
+a finger down between requests) they're buffered and played as one gesture when `up` arrives, with every point and its
+timing (a `down` sent late, e.g. after a hold, keeps that hold because its `t` is kept); a still touch lifted within 250 ms
+becomes a tap. If a live event fails mid-drag, the rest is buffered and the whole gesture replays through WDA on `up`. A new
+`down` lifts any unfinished touch; a touch never lifted is dropped (and its finger lifted) after 60 s or when its socket
+closes.
 
-**Live drags replay on release, by design of iOS automation.** There is no streaming touch input for iOS from a Mac:
-XCTest (which WDA runs on) only synthesizes a *complete* event record (`XCSynthesizedEventRecord`: down, path, up) and
-plays it in one go, and WDA's endpoints (`/actions`, the legacy `/wda/touch/perform`) both take the whole gesture up front.
-Nothing else can inject touches into an un-jailbroken iPhone (no HID over USB for touch, no public API). So a drag shows on
-the phone only after the finger lifts, with its real path and timing; taps go straight through WDA's fast tap. What *is*
-done for latency: one warm WDA session per phone, no session/status call before an action, and keep-alive HTTP connections
-to WDA (so a touch never pays for a new usbmux connection).
+## Input: taps, swipes, typing
+
+Research and ranking: [docs/BEST_METHOD.md](docs/BEST_METHOD.md). WDA's own `/wda/tap` costs ~0.9 s *on the phone* (it looks
+up the active app through accessibility on every call, then XCTest waits for the daemon to confirm the event), which was
+the ~1.2 s tap on the LAN. It was replaced, not tuned. Each action takes the first of these that the phone has now:
+
+1. **`hid`: CoreDevice HID** (the path Xcode 27's Device Hub uses; iOS 27+ only). `native/hid/hid_input.py` (one per phone,
+   pymobiledevice3) holds a touch session open while someone views the phone (the media-stream auth gate, ~0.5-2 s to
+   open once, not per tap) and writes 58-byte touchscreen reports to it: a tap is a few ms on the Mac, live drags, typing
+   through a virtual HID keyboard (printable ASCII; other text goes through WDA). The session closes after
+   `HID_IDLE_SECONDS` (120) with no viewer and no input: while it's open the phone's camera/mic apps get black/silence, and
+   it can't start while one is in the foreground. Portrait only (landscape uses WDA). Any failure falls back to WDA at
+   once and HID is retried a minute later.
+2. **`wda-fast`: the patched WDA route** `POST /wda/lotus/touch` (`scripts/patch-wda.mjs`, applied by
+   `scripts/build-wda.sh`): builds the touch at absolute coordinates with no active-app lookup and answers as soon as it's
+   queued on the phone (a small queue there keeps the order). Taps, swipes, paths and holds. Needs WDA rebuilt once with
+   the patch; an unpatched WDA answers 404 and the server uses 3 for that runner.
+3. **`wda`: the old routes**: `/wda/tap` (or `/wda/tap/0`, or a pointer tap), W3C actions for gestures, `/wda/keys` for
+   text. Also `home` and `launch` always.
+
+`GET /phones/:udid/input` and the server log (`[input xxxxxxxx] tap via hid: wait 0 ms + inject 3 ms = 3 ms`, one line
+per action, `INPUT_LOG=0` turns them off) give receive -> injected per action. `methods` says what each phone has:
+`hid` (`ready`, `starting`, `off`, `failed` with `hid_reason`, or `unsupported` with why) and `wda_fast` (`yes`, `no` =
+this WDA build has no fast route, `unknown` = not tried yet).
 
 ## Live view: WebRTC, H.264, MJPEG
 
@@ -172,7 +194,8 @@ bitrate (`src/lanes.ts`, `native/phonecap/main.swift`). Viewers with the same se
 `GET /phones` -> each phone's `stats`:
 `{codec, fps, encode_ms, capture_to_encoded_ms, encoded_to_sent_ms, viewers, viewers_webrtc, viewers_h264_ws,
 viewers_mjpeg, path, dropped, bitrate_kbps, h264_available, h264_reason, lanes, helper_build_error}` (`lanes`: each
-running lane `{kind: "lan"|"remote", fps, fps_target, scale, width, height, bitrate_kbps, viewers, dropped}`). `codec` is what viewers get now (`h264` if any WebRTC/H.264
+running lane `{kind: "lan"|"remote", fps, fps_target, scale, width, height, bitrate_kbps, viewers, dropped}`; `input`
+`{via, tap_avg_ms, tap_p90_ms, last, samples, methods}`, see [Input](#input-taps-swipes-typing)). `codec` is what viewers get now (`h264` if any WebRTC/H.264
 viewer, else `mjpeg`, null when nobody watches); timings are running averages in ms (capture -> encoded measured in the
 helper from the capture timestamp, encoded -> sent in the server); `path` is the WebRTC path (`lan`, `tailscale`,
 `loopback`, `direct`; candidates are always host, never relayed); `h264_reason` says why H.264 can't be used (helper not
@@ -235,6 +258,10 @@ each idle phone gets a `/status` check that recovers the same way before anyone 
    `scripts/build-wda.sh <TEAM_ID> <UDID> [<UDID> ...]`
    The first time, Xcode may ask to allow keychain access; click Always Allow. On each phone, if the runner is untrusted:
    Settings > General > VPN & Device Management > trust your developer certificate.
+   The script first adds the fast touch route to the WDA checkout (`scripts/patch-wda.mjs`, see
+   [Input](#input-taps-swipes-typing)); after a rebuild, restart the service so the runners pick up the new build.
+   **iOS 27+ phones (live HID touch):** `python3 -m venv ~/.phonefarm-hid && ~/.phonefarm-hid/bin/pip install -U pymobiledevice3`
+   (no root needed; the server finds that Python by itself, `HID_PYTHON` overrides it).
 7. **Run**: `npm start`. Within ~10-30 s of plugging a phone in, `GET /phones` shows `online:true, ready:true`.
    Per phone the server runs `xcodebuild test-without-building` (WDA) plus two `iproxy` forwards (WDA port 8100+n, MJPEG 9100+n;
    the slot `n` per UDID is remembered in `data/ports.json`), restarts WDA with backoff if it dies, and stops it when the phone is unplugged.
@@ -268,7 +295,8 @@ After `git pull`/code changes run `npm run build` and `launchctl kickstart -k gu
 ## Testing
 
 `npm run check` type-checks. `npm test` runs `test/h264.ts` (helper framing, config-before-key, latest-only drop to keyframe,
-helper restarts, offer/RTCP parsing), `test/rtc.ts` (WebRTC in mock mode with a node-datachannel client: signaling, ICE,
+helper restarts, offer/RTCP parsing), `test/input.ts` (live touch straight to the phone and its fallbacks, the HID sidecar's
+protocol, the WDA patch, latency metering, acks' `via`/`ms`), `test/rtc.ts` (WebRTC in mock mode with a node-datachannel client: signaling, ICE,
 RTP, PLI -> IDR, data channels and acks, stats, rtc-error) and `test/smoke.ts` (a mock server: auth, every endpoint, MJPEG,
 H.264 WebSocket, the MJPEG fallback, ping/pong). Mock mode's H.264 is a real, decodable stream (a tiny built-in encoder:
 Constrained Baseline 208x448, I_PCM keyframes and skip-coded deltas), so clients can test decoding against it.
@@ -279,6 +307,11 @@ Against a live server: `URL=http://<mac>:8787 API_TOKEN=<token> npm test` (needs
 `API_TOKEN`, `HOST`, `PORT`, `MOCK`, `MOCK_PHONES`, `WDA_PROJECT`, `WDA_DERIVED_DATA` (default `~/wda-build`),
 `WDA_BASE_PORT` (8100), `MJPEG_BASE_PORT` (9100), `POLL_MS` (5000), `AUTOSTART_WDA` (true), `AUTO_UPDATE_SECONDS` (10, 0 = off),
 `H264` (true), `H264_BITRATE_MBPS` (8), `PHONECAP_PATH` (default `native/phonecap/build/phonecap`).
+Input: `HID_INPUT` (`auto` = iOS 27+ phones, `on` = try every phone, `off`), `HID_PYTHON` (the Python with pymobiledevice3;
+default `~/.phonefarm-hid/bin/python` if it exists, else `python3`), `HID_IDLE_SECONDS` (120), `HID_TUNNEL` (`auto`,
+`userspace`, `native`, `tunneld`), `WDA_FAST` (`0` = never try the fast route), `INPUT_LOG` (`0` = no per-action lines);
+`WDA_PATCH=0` makes `scripts/build-wda.sh` build WDA unpatched. Video: `RTC_PLAYOUT_ZERO=1` gives far viewers
+playout-delay 0/0 again.
 
 ## Notes / known limits
 

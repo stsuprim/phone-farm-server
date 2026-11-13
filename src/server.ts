@@ -5,6 +5,7 @@ import { WebSocket, WebSocketServer } from 'ws';
 import { bitrateAsk, DEFAULT_CEILING_BPS, RateControl, REMOTE_START_BPS, WsFlow } from './congestion.js';
 import { Control } from './control.js';
 import { H264Viewer, REMOTE_DROP_BYTES, Transport, wsMessage } from './h264.js';
+import type { InputResult } from './inputlog.js';
 import { isRemote, rtcSignaling } from './rtc.js';
 import { Backend, H264Want, HttpError, StreamSettings } from './types.js';
 import type { Updater } from './updater.js';
@@ -90,6 +91,14 @@ function streamSettings(q: URLSearchParams, remote = false): StreamSettings {
   return s;
 }
 
+/**
+ * The extra fields an ack carries about an injected action (old clients ignore them): how it reached the phone and
+ * the server's receive -> injected time.
+ */
+export function ackExtra(r: InputResult | void, t0: number): Record<string, unknown> {
+  return r ? { via: r.via, ms: Math.round((performance.now() - t0) * 10) / 10 } : {};
+}
+
 function errorText(err: unknown): string {
   if (err instanceof HttpError) return err.message;
   console.error(err);
@@ -107,6 +116,11 @@ export function createServer(backend: Backend, token: string, updater?: Updater)
 
   const wss = new WebSocketServer({ noServer: true, maxPayload: 1_000_000 });
   const control = new Control(backend);
+  /** A phone's stats with its input part (latency + methods). */
+  const withInput = <T extends object>(udid: string, stats: T | undefined) => ({
+    ...(stats ?? {}),
+    input: { ...control.meter.stats(udid), methods: backend.inputMethods?.(udid) },
+  });
 
   const server = http.createServer(async (req, res) => {
     try {
@@ -120,7 +134,7 @@ export function createServer(backend: Backend, token: string, updater?: Updater)
       if (req.method === 'GET' && path === '/phones') {
         const addr = server.address();
         const lan = lanUrls(addr && typeof addr === 'object' ? addr.port : 8787);
-        return send(res, 200, (await backend.list()).map((p) => ({ ...p, lan })));
+        return send(res, 200, (await backend.list()).map((p) => ({ ...p, lan, stats: withInput(p.udid, p.stats) })));
       }
       if (path === '/update/status' || path === '/update/now') {
         if (!updater) return send(res, 503, { error: 'updater unavailable (mock mode)' });
@@ -132,7 +146,7 @@ export function createServer(backend: Backend, token: string, updater?: Updater)
         return send(res, 200, await updater.now());
       }
 
-      const m = /^\/phones\/([^/]+)\/(screenshot|tap|swipe|path|hold|touch|type|home|launch|recover)$/.exec(path);
+      const m = /^\/phones\/([^/]+)\/(screenshot|tap|swipe|path|hold|touch|type|home|launch|recover|input)$/.exec(path);
       if (!m) return send(res, 404, { error: 'not found' });
       const udid = decodeURIComponent(m[1]!);
       const action = m[2]!;
@@ -146,11 +160,17 @@ export function createServer(backend: Backend, token: string, updater?: Updater)
         return void res.end(img.data);
       }
 
+      if (action === 'input') {
+        // input latency (receive -> injected) and the phone's input methods, for checking taps on the Mac
+        if (req.method !== 'GET') throw new HttpError(405, 'use GET');
+        return send(res, 200, { udid, ...withInput(udid, undefined)!.input, recent: control.meter.recent(udid).slice(-50) });
+      }
       if (req.method !== 'POST') throw new HttpError(405, 'use POST');
       if (action === 'recover') return send(res, 200, { ok: true, control: await control.recover(udid) });
       const body = await readJson(req);
-      await control.handle(udid, { ...body, type: action });
-      send(res, 200, { ok: true });
+      const t0 = performance.now();
+      const r = await control.handle(udid, { ...body, type: action });
+      send(res, 200, { ok: true, ...ackExtra(r, t0) });
     } catch (err) {
       if (err instanceof HttpError) return send(res, err.status, { error: err.message });
       console.error(err);
@@ -314,6 +334,8 @@ export function createServer(backend: Backend, token: string, updater?: Updater)
       if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(msg));
     };
     const rtc = rtcSignaling(backend, control, udid, reply, remote);
+    // an open live view: keep the phone's live touch channel (HID session) open so the first tap doesn't pay for it
+    const releaseInput = backend.warmInput?.(udid);
     reply({ type: 'hello', udid });
     ws.on('message', (data, isBinary) => {
       if (isBinary) return;
@@ -322,9 +344,10 @@ export function createServer(backend: Backend, token: string, updater?: Updater)
       if (msg.type === 'ping') return reply({ type: 'pong', t: msg.t ?? null, server_time: Date.now() });
       if (rtc.handle(msg)) return;
       const id = msg.id ?? null;
+      const t0 = performance.now();
       control.handle(udid, msg, ws).then(
-        () => {
-          if (id !== null) reply({ type: 'ack', id, ok: true });
+        (r) => {
+          if (id !== null) reply({ type: 'ack', id, ok: true, ...ackExtra(r, t0) });
         },
         // touches without an id still hear about a failed gesture
         (err) => reply({ type: 'ack', id, ok: false, error: errorText(err) }),
@@ -333,6 +356,7 @@ export function createServer(backend: Backend, token: string, updater?: Updater)
     const done = () => {
       control.release(ws);
       rtc.close();
+      releaseInput?.();
     };
     ws.on('close', done);
     ws.on('error', done);

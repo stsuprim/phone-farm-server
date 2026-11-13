@@ -1,5 +1,6 @@
 // Smoke test. Default: starts an in-process mock server on a free port.
 // Against a running server:  URL=http://mac:8787 API_TOKEN=... npm test
+process.env.INPUT_LOG = '0'; // quiet the per-action latency lines
 import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
 import { AddressInfo } from 'node:net';

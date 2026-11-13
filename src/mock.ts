@@ -1,7 +1,10 @@
 import { H264Source, phoneStats, RateMeter } from './h264.js';
 import { mockProducer } from './h264mock.js';
 import { encodePng } from './png.js';
-import { Backend, ControlState, H264Want, HttpError, Image, ImageFormat, PathPoint, PhoneInfo, ScreenInfo, StreamSettings } from './types.js';
+import type { InputResult } from './inputlog.js';
+import { Backend, ControlState, H264Want, HttpError, Image, ImageFormat, InputMethods, PathPoint, PhoneInfo, ScreenInfo, StreamSettings } from './types.js';
+
+const MOCK: InputResult = { via: 'mock' };
 
 export interface MockOptions {
   /** false = no H.264 (clients asking for it get the MJPEG fallback), to test the fallback. Default true. */
@@ -169,24 +172,32 @@ export class MockBackend implements Backend {
   async screenshot(udid: string, _format: ImageFormat): Promise<Image> {
     return { data: this.render(this.live(udid)), contentType: 'image/png' }; // mock always serves PNG
   }
-  async tap(udid: string, x: number, y: number) {
+  async tap(udid: string, x: number, y: number): Promise<InputResult> {
     this.live(udid).marks.push({ x, y, at: Date.now() });
+    return MOCK;
   }
-  async gesture(udid: string, points: PathPoint[]) {
+  async gesture(udid: string, points: PathPoint[]): Promise<InputResult> {
     const p = this.live(udid);
     const a = points[0]!;
     const b = points[points.length - 1]!;
     p.marks.push({ x: a[0], y: a[1], x2: b[0], y2: b[1], at: Date.now() });
+    return MOCK;
   }
-  async type(udid: string, text: string) {
+  async type(udid: string, text: string): Promise<InputResult> {
     const p = this.live(udid);
     p.typed = (p.typed + text).slice(-200);
+    return MOCK;
   }
-  async home(udid: string) {
+  async home(udid: string): Promise<InputResult> {
     this.live(udid).app = 'com.apple.springboard';
+    return MOCK;
   }
-  async launch(udid: string, bundleId: string) {
+  async launch(udid: string, bundleId: string): Promise<InputResult> {
     this.live(udid).app = bundleId;
+    return MOCK;
+  }
+  inputMethods(_udid: string): InputMethods {
+    return { hid: 'unsupported', hid_reason: 'mock phones', wda_fast: 'no' };
   }
 
   async recover(udid: string): Promise<ControlState> {

@@ -19,6 +19,12 @@ export const REMOTE_CEILING_BPS = 2_500_000;
 /** A far viewer's lane: at most this frame rate and about this many pixels on the long side (src/lanes.ts). */
 export const REMOTE_MAX_FPS = 30;
 export const REMOTE_LONG_SIDE = 1400;
+/**
+ * A far viewer's lane makes a keyframe only every this many seconds (phonecap's most), else when it's asked (PLI, a
+ * new viewer, a dropped frame): a periodic 100+ KB burst on a long link was loss, then a PLI, then another keyframe
+ * (docs/BEST_METHOD.md 2c). LAN lanes keep 2 s.
+ */
+export const REMOTE_KEY_SECONDS = 10;
 export const DEFAULT_CEILING_BPS = 8_000_000;
 
 const clamp = (v: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, v));

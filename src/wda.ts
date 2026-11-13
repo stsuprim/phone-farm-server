@@ -40,6 +40,9 @@ interface Entry {
   lastOk: number;
   screen?: ScreenInfo;
   tapRoute: 0 | 1 | 2; // 0: /wda/tap, 1: /wda/tap/0 (older WDA), 2: W3C actions
+  /** The patched WDA's /wda/lotus/touch (scripts/patch-wda.mjs): yes, no (an unpatched build), or not tried yet. */
+  fast: 'yes' | 'no' | 'unknown';
+  fastFails: number; // the fast route refused touches in a row (3: given up until WDA restarts)
   mjpeg: StreamSettings; // wanted MJPEG settings
   mjpegApplied?: string; // JSON of the settings last applied to the current session
   agent: http.Agent; // keep-alive connections to WDA (through iproxy): no new usbmux connection per touch
@@ -54,6 +57,10 @@ const DEFAULT_MJPEG: StreamSettings = { fps: 60, quality: 50, scale: 50 };
 // No waiting for the app to be idle/animations to finish before each action: that's what made taps slow.
 const CAPS = { shouldWaitForQuiescence: false, waitForIdleTimeout: 0, shouldUseCompactResponses: true, maxTypingFrequency: 60 };
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+/** The fast route's tap: press, then lift this long after (a finger's quick tap). */
+const FAST_TAP_HOLD_MS = 50;
+/** The route scripts/patch-wda.mjs adds to WebDriverAgent (keep the two in step). */
+export const FAST_TOUCH_ROUTE = '/wda/lotus/touch';
 
 /** W3C pointer actions for one finger through the points (x, y in points, t = ms since start). */
 export function pointerActions(pts: PathPoint[]): unknown[] {
@@ -90,7 +97,11 @@ export class WdaManager {
   private ports: Record<string, number> = {};
   private health: NodeJS.Timeout;
 
-  constructor(private cfg: Config, private nameOf: (udid: string) => string = (u) => u) {
+  constructor(
+    private cfg: Config,
+    private nameOf: (udid: string) => string = (u) => u,
+    private spawnFn: typeof spawn = spawn, // tests: no real iproxy/xcodebuild
+  ) {
     try {
       this.ports = JSON.parse(fs.readFileSync(PORTS_FILE, 'utf8'));
     } catch {
@@ -142,7 +153,7 @@ export class WdaManager {
     const n = this.slot(udid);
     e ??= {
       udid, wdaPort: this.cfg.wdaBasePort + n, mjpegPort: this.cfg.mjpegBasePort + n, status: 'starting', control: 'recovering',
-      wanted: true, procs: [], restarts: 0, checking: false, lastOk: 0, tapRoute: 0, mjpeg: { ...DEFAULT_MJPEG }, agent: newAgent(),
+      wanted: true, procs: [], restarts: 0, checking: false, lastOk: 0, tapRoute: 0, fast: 'unknown', fastFails: 0, mjpeg: { ...DEFAULT_MJPEG }, agent: newAgent(),
     };
     e.wanted = true;
     this.entries.set(udid, e);
@@ -193,13 +204,15 @@ export class WdaManager {
   }
 
   private launch(e: Entry): void {
+    e.fast = 'unknown'; // a rebuilt WDA may have (or lack) the fast route
+    e.fastFails = 0;
     e.status = 'starting';
     e.control = 'recovering';
     e.sessionId = undefined;
     e.sessionP = undefined;
     e.mjpegApplied = undefined;
     const spawnLogged = (cmd: string, args: string[], env: NodeJS.ProcessEnv = {}) => {
-      const p = spawn(cmd, args, { env: { ...process.env, ...env }, stdio: ['ignore', 'pipe', 'pipe'] });
+      const p = this.spawnFn(cmd, args, { env: { ...process.env, ...env }, stdio: ['ignore', 'pipe', 'pipe'] });
       const errTail: string[] = [];
       p.stderr?.on('data', (d: Buffer) => {
         errTail.push(...d.toString().split(/\r?\n/).filter(Boolean));
@@ -530,13 +543,52 @@ export class WdaManager {
     return this.withRecovery(udid, (e) => this.raw(e, method, p, body, timeout));
   }
 
-  /** Fast tap: /wda/tap, else the older /wda/tap/0, else a W3C pointer tap. */
-  async tap(udid: string, x: number, y: number): Promise<void> {
+  /** Whether this phone's WDA has the fast touch route (unknown until the first touch tries it). */
+  fastStatus(udid: string): 'yes' | 'no' | 'unknown' {
+    return this.entries.get(udid)?.fast ?? 'unknown';
+  }
+
+  /**
+   * The patched WDA's fast route (docs/BEST_METHOD.md, plan item 1b): one touch path built at absolute coordinates
+   * with no active-app lookup, queued on the phone and answered before XCTest plays it (the phone keeps the order).
+   * False when this WDA build hasn't got it, or the screen is landscape (the old route knows the orientation).
+   */
+  private async fast(udid: string, body: { points: PathPoint[]; hold?: number }): Promise<boolean> {
+    const e = this.entries.get(udid);
+    if (!e || e.fast === 'no' || process.env.WDA_FAST === '0') return false;
+    if (e.screen && e.screen.width > e.screen.height) return false;
+    try {
+      const points = body.points.map(([x, y, t]) => [Math.round(x * 10) / 10, Math.round(y * 10) / 10, Math.round(t)]);
+      await this.callNoSession(udid, 'POST', FAST_TOUCH_ROUTE, { ...body, points, orientation: 1 }, 5000);
+      if (e.fast !== 'yes') this.log(e, 'fast touch route answers (patched WDA)');
+      e.fast = 'yes';
+      e.fastFails = 0;
+      return true;
+    } catch (err) {
+      if (err instanceof WdaError && err.kind === 'unknown') {
+        e.fast = 'no';
+        this.log(e, 'this WDA build has no fast touch route (rebuild it with scripts/build-wda.sh); using the XCTest route');
+        return false;
+      }
+      if (err instanceof WdaError && !err.down) {
+        // the route refused it: this touch goes the old way; after 3 in a row, every touch does until WDA restarts
+        if (++e.fastFails >= 3) e.fast = 'no';
+        this.log(e, `fast touch route refused a touch (${err.message})${e.fast === 'no' ? '; using the XCTest route from now on' : ''}`);
+        return false;
+      }
+      throw err;
+    }
+  }
+
+  /** Tap: the fast route, else /wda/tap, else the older /wda/tap/0, else a W3C pointer tap. */
+  async tap(udid: string, x: number, y: number): Promise<'wda-fast' | 'wda'> {
+    if (await this.fast(udid, { points: [[x, y, 0]], hold: FAST_TAP_HOLD_MS })) return 'wda-fast';
     const e = this.entries.get(udid);
     const unknown = (err: unknown) => err instanceof WdaError && err.kind === 'unknown';
     if (!e || e.tapRoute === 0) {
       try {
-        return void (await this.call(udid, 'POST', '/wda/tap', { x, y }));
+        await this.call(udid, 'POST', '/wda/tap', { x, y });
+        return 'wda';
       } catch (err) {
         if (!unknown(err)) throw err;
         if (e) e.tapRoute = 1;
@@ -544,17 +596,25 @@ export class WdaManager {
     }
     if (!e || e.tapRoute <= 1) {
       try {
-        return void (await this.call(udid, 'POST', '/wda/tap/0', { x, y }));
+        await this.call(udid, 'POST', '/wda/tap/0', { x, y });
+        return 'wda';
       } catch (err) {
         if (!unknown(err)) throw err;
         if (e) e.tapRoute = 2;
       }
     }
-    await this.actions(udid, [[x, y, 0], [x, y, 50]]);
+    await this.w3c(udid, [[x, y, 0], [x, y, 50]]);
+    return 'wda';
   }
 
-  /** One finger through the points with their real timing (W3C actions). */
-  async actions(udid: string, pts: PathPoint[]): Promise<void> {
+  /** One finger through the points with their real timing: the fast route, else W3C actions. */
+  async actions(udid: string, pts: PathPoint[]): Promise<'wda-fast' | 'wda'> {
+    if (await this.fast(udid, { points: pts })) return 'wda-fast';
+    await this.w3c(udid, pts);
+    return 'wda';
+  }
+
+  private async w3c(udid: string, pts: PathPoint[]): Promise<void> {
     const ms = pts[pts.length - 1]![2];
     const actions = [{ type: 'pointer', id: 'finger1', parameters: { pointerType: 'touch' }, actions: pointerActions(pts) }];
     await this.call(udid, 'POST', '/actions', { actions }, 30000 + ms);

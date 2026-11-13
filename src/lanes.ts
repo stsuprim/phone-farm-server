@@ -1,5 +1,5 @@
 import { ChildProcess, spawn } from 'node:child_process';
-import { REMOTE_CEILING_BPS, REMOTE_LONG_SIDE, REMOTE_MAX_FPS, REMOTE_START_BPS } from './congestion.js';
+import { REMOTE_CEILING_BPS, REMOTE_KEY_SECONDS, REMOTE_LONG_SIDE, REMOTE_MAX_FPS, REMOTE_START_BPS } from './congestion.js';
 import { bitrateFor, H264Settings, helperArgs, Producer, ProducerHooks, RecordParser, StartProducer } from './h264.js';
 import type { H264Want } from './types.js';
 
@@ -42,7 +42,7 @@ export function profileFor(want: H264Want, dfltBps: number, longSidePx: number |
   return {
     key: `remote:${fps}:${scale}`,
     remote: true,
-    settings: { fps, scale, bitrate: Math.min(ceiling, REMOTE_START_BPS), maxBitrate: ceiling, adaptFps: true, keySeconds: 2 },
+    settings: { fps, scale, bitrate: Math.min(ceiling, REMOTE_START_BPS), maxBitrate: ceiling, adaptFps: true, keySeconds: REMOTE_KEY_SECONDS },
   };
 }
 

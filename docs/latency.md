@@ -38,12 +38,18 @@ ceiling.
 The H.264 WebSocket fallback is the same pipeline over TCP: about the same on a clean LAN, worse under loss (TCP
 retransmits stall every later frame; latest-only then drops to the next keyframe).
 
-Input, separately (unchanged by the video work):
+Input, separately. **The old estimate here (40-120 ms per tap) was wrong:** Rinor measured ~1200 ms on the LAN. WDA's
+`/wda/tap` costs ~0.9 s on the phone itself (an accessibility lookup of the active app on every call, then XCTest waits
+for the daemon to confirm the event; see [BEST_METHOD.md](BEST_METHOD.md) section 2). The method was replaced
+(README, "Input"); the server now measures receive -> injected per action (`GET /phones/:udid/input`).
 
-| Action | Path | Latency (est.) |
-|---|---|---|
-| Tap | data channel -> server -> WDA `/wda/tap` over a kept-alive connection -> XCTest synthesizes it | ~40-120 ms until the phone reacts (mostly XCTest's event synthesis); previously + a few ms of new usbmux connection whenever the last request was > 4 s ago |
-| Drag / swipe | buffered until `up`, then replayed as one W3C action with its real timing | the whole drag duration + ~50-120 ms after release |
+| Action | Path now | Server receive -> injected (est.) | Finger -> visible on the phone (est.) |
+|---|---|---|---|
+| Tap, iOS 27+ | data channel -> server -> HID sidecar's open session -> 58-byte touchscreen report -> backboardd | ~2-10 ms | LAN ~60-100 ms; Nepal ~250-350 ms (one-way network + capture/encode/decode) |
+| Drag, iOS 27+ | down/move/up live as they come | the same per event | follows the finger live |
+| Tap, iOS 18 (patched WDA) | data channel -> server -> `POST /wda/lotus/touch` (kept-alive, no app lookup, answered when queued) | ~10-40 ms (USB round trip) | ~250-350 ms on the LAN (XCTest still plays it; measured 263 ms for the same idea upstream); Nepal ~550-700 ms |
+| Drag, iOS 18 | buffered until `up`, then queued on the phone with its real timing | the same | the whole drag + ~250 ms after release |
+| Unpatched WDA (fallback) | `/wda/tap`, W3C actions | ~900-1200 ms | ~1.2 s LAN, ~1.3-2 s Nepal (the old numbers) |
 
 ## Targets that can't be reached, and why
 
@@ -53,8 +59,9 @@ Input, separately (unchanged by the video work):
   not reachable through AVFoundation).
 - **A still screen doesn't produce frames** (iOS only sends changes), so `fps` in the stats drops when nothing moves. That's
   not latency; a forced keyframe re-encodes the last frame immediately.
-- **Live drags can't be shown while the finger moves.** iOS automation (XCTest/WDA) only plays a complete gesture, so a drag
-  appears on the phone after release. Taps are immediate. There is no supported streaming-touch channel on a stock iPhone.
+- **Live drags need iOS 27.** XCTest/WDA only plays a complete gesture, so on iOS 18 a drag appears on the phone after
+  release. iOS 27's CoreDevice HID channel (Xcode's Device Hub) takes live down/move/up reports; the server uses it when
+  the phone has it (README, "Input").
 - **Over Tailscale or the Internet** add the network round trip; the path is still direct (host candidates only, no relay).
 - **< 100 ms glass-to-glass at 60 fps on the LAN is expected for video**, from these estimates; to be confirmed with the
   client's measurement (`ts` messages + ping/pong offset).

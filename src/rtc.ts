@@ -214,13 +214,17 @@ export class RtcSession {
     const video = new ndc.Video(offer.mid, 'SendOnly');
     video.addH264Codec(offer.pt, 'profile-level-id=42e01f;packetization-mode=1;level-asymmetry-allowed=1');
     video.addSSRC(ssrc, 'phone', 'lotus-phone', 'screen');
-    if (offer.playoutDelayId !== null) video.parseSdpLine(`a=extmap:${offer.playoutDelayId} ${PLAYOUT_DELAY_URI}`);
+    // playout-delay 0/0 makes the browser drop every late frame; on a far (jittery) link that starves the decoder and
+    // sends PLI after PLI (docs/BEST_METHOD.md 2a): far viewers don't get it (the client's jitterBufferTarget = 0 still
+    // asks for the least delay). LAN viewers keep it.
+    const playout = this.remote && process.env.RTC_PLAYOUT_ZERO !== '1' ? null : offer.playoutDelayId;
+    if (playout !== null) video.parseSdpLine(`a=extmap:${playout} ${PLAYOUT_DELAY_URI}`);
     const track = pc.addTrack(video);
     this.track = track;
     const rtp = new ndc.RtpPacketizationConfig(ssrc, 'phone', offer.pt, 90000);
-    if (offer.playoutDelayId !== null) {
+    if (playout !== null) {
       // ask the browser to render frames as soon as they're decoded (no jitter buffer delay)
-      rtp.playoutDelayId = offer.playoutDelayId;
+      rtp.playoutDelayId = playout;
       rtp.playoutDelayMin = 0;
       rtp.playoutDelayMax = 0;
     }
@@ -395,9 +399,10 @@ export class RtcSession {
       if (msg.type === 'touch' && msg.phase === 'down') this.lastMoveT = -1;
       this.flushMove(); // a down/up after moves keeps their order
       const id = msg.id ?? null;
+      const t0 = performance.now();
       this.control.handle(this.udid, msg, this).then(
-        () => {
-          if (id !== null) reply({ type: 'ack', id, ok: true });
+        (r) => {
+          if (id !== null) reply({ type: 'ack', id, ok: true, ...(r ? { via: r.via, ms: Math.round((performance.now() - t0) * 10) / 10 } : {}) });
         },
         (err) => reply({ type: 'ack', id, ok: false, error: err instanceof HttpError ? err.message : 'internal error' }),
       );

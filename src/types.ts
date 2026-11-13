@@ -1,4 +1,5 @@
 import type { H264Source } from './h264.js';
+import type { InputResult, InputStats } from './inputlog.js';
 
 /** Whether a phone can be driven right now: WDA session warm, being recovered, or unavailable. */
 export type ControlState = 'ready' | 'recovering' | 'down';
@@ -46,6 +47,18 @@ export interface StreamStats {
   lanes?: LaneStats[];
   /** The last phonecap build failed; the previous helper still runs (null when the build is fine). */
   helper_build_error?: string | null;
+  /** Touch/tap latency on the server (receive -> injected) and the input methods the phone has now. */
+  input?: InputStats & { methods?: InputMethods };
+}
+
+/**
+ * The phone's input methods now (docs/BEST_METHOD.md): hid = CoreDevice HID live touch (iOS 27+), wda_fast = the
+ * patched WDA route that answers before XCTest plays the event, else the old WDA route.
+ */
+export interface InputMethods {
+  hid: 'off' | 'starting' | 'ready' | 'failed' | 'unsupported';
+  hid_reason: string | null;
+  wda_fast: 'yes' | 'no' | 'unknown';
 }
 
 export interface LaneStats {
@@ -107,13 +120,21 @@ export interface Backend {
   /** Cached screen size in points (for clamping); null when not known yet. */
   screen(udid: string): ScreenInfo | null;
   screenshot(udid: string, format: ImageFormat): Promise<Image>;
-  /** Quick tap at a point. */
-  tap(udid: string, x: number, y: number): Promise<void>;
+  /** Quick tap at a point. Resolves once it's injected (or queued on the phone), saying how it went. */
+  tap(udid: string, x: number, y: number): Promise<InputResult | void>;
   /** One continuous touch through the points (>= 2), with their timing; used for swipe, path and hold. */
-  gesture(udid: string, points: PathPoint[]): Promise<void>;
-  type(udid: string, text: string): Promise<void>;
-  home(udid: string): Promise<void>;
-  launch(udid: string, bundleId: string): Promise<void>;
+  gesture(udid: string, points: PathPoint[]): Promise<InputResult | void>;
+  type(udid: string, text: string): Promise<InputResult | void>;
+  home(udid: string): Promise<InputResult | void>;
+  launch(udid: string, bundleId: string): Promise<InputResult | void>;
+  /** The phone takes live touch (down/move/up injected as they come) right now. */
+  liveTouchReady?(udid: string): boolean;
+  /** One live touch event straight to the phone (only after liveTouchReady said yes). */
+  liveTouch?(udid: string, phase: 'down' | 'move' | 'up', x: number, y: number): Promise<InputResult | void>;
+  /** A live view opened: keep the phone's fast input channel open until the returned release is called. */
+  warmInput?(udid: string): () => void;
+  /** The phone's input methods now. */
+  inputMethods?(udid: string): InputMethods;
   /** Drop the WDA session, restart the runner if WDA doesn't answer, make a new warm session. */
   recover(udid: string): Promise<ControlState>;
   /** Subscribe to image frames. Returns unsubscribe and the settings actually used. Throws HttpError if unknown/not ready. */
