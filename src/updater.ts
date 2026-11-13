@@ -83,7 +83,8 @@ export function createUpdater(onRestart: () => void, cwd = process.cwd()): Updat
       lastError = null;
       const nativeErr = path.join(cwd, 'native', 'phonecap', 'build', 'phonecap.error');
       if (fs.existsSync(nativeErr)) {
-        const first = fs.readFileSync(nativeErr, 'utf8').split('\n')[0];
+        const text = fs.readFileSync(nativeErr, 'utf8');
+        const first = text.split('\n').find((l) => /\berror:/i.test(l)) ?? text.split('\n')[0];
         log(`phonecap (H.264 helper) did not build, the live view will use MJPEG: ${first}`);
       }
       log(`build ok, restarting on ${remote.slice(0, 7)}`);

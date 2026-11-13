@@ -113,7 +113,7 @@ export class WdaManager {
   }
 
   private log(e: Entry, m: string): void {
-    console.log(`[wda ${e.udid.slice(0, 8)}] ${m}`);
+    console.log(`[wda ${e.udid.slice(-8)}] ${m}`); // UDID end: the start (00008110...) is the chip, same on both phones
   }
 
   status(udid: string): WdaStatus {

@@ -15,6 +15,10 @@
     <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
     <key>DEVELOPER_DIR</key><string>/Applications/Xcode.app/Contents/Developer</string>
   </dict>
+  <!-- a user LaunchAgent in the logged-in GUI (Aqua) session: needed for the login keychain (WDA signing) and so the
+       capture helper's Camera (TCC) permission applies. Install in ~/Library/LaunchAgents, never /Library/LaunchDaemons. -->
+  <key>LimitLoadToSessionType</key><string>Aqua</string>
+  <key>ProcessType</key><string>Interactive</string>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
   <key>StandardOutPath</key><string>/Users/YOURUSER/phone-farm-server/server.log</string>

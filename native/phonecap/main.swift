@@ -1,6 +1,10 @@
 // phonecap: capture an iPhone's screen over USB the way QuickTime does (CoreMediaIO screen-capture devices),
 // encode it with VideoToolbox H.264 in real time, and write framed records to stdout for the phone-farm server.
 //
+// TCC: macOS counts iPhone screen capture as Camera. phonecap re-runs itself with "responsibility disclaimed" so it
+// gets its own Camera entry (com.lotus.phonecap, inside build/PhoneCap.app) instead of inheriting node's under launchd.
+// Grant it once at the Mac: `native/phonecap/build/PhoneCap.app/Contents/MacOS/phonecap --request-access` in Terminal, click Allow.
+//
 // stdout, one record after another (big-endian):
 //   1 byte kind | 8 bytes capture time (float64, ms since the epoch) | 4 bytes payload length | payload
 //   kinds: 0 info JSON {width,height,fps,scale}, 1 config (SPS+PPS, Annex B), 2 keyframe, 3 delta (Annex B),
@@ -9,7 +13,7 @@
 // stderr: human-readable log lines. Exit codes: 2 no device, 3 camera access denied, 4 capture failed,
 //          5 device disconnected, 6 encoder failed.
 //
-// Build: swiftc -O native/phonecap/main.swift -o native/phonecap/build/phonecap (scripts/build-native.mjs does it).
+// Build: scripts/build-native.mjs (npm run build): swiftc, then wraps it in build/PhoneCap.app and signs the bundle.
 
 import AVFoundation
 import CoreMedia
@@ -37,6 +41,7 @@ struct Options {
     var profile = "baseline"
     var keySeconds = 2.0
     var list = false
+    var requestAccess = false
     var anyIfSingle = false
     var waitSeconds = 12.0
 }
@@ -57,6 +62,7 @@ func parseOptions() -> Options {
         case "--wait": o.waitSeconds = max(1, Double(next()) ?? 12)
         case "--any-if-single": o.anyIfSingle = true
         case "--list": o.list = true
+        case "--request-access": o.requestAccess = true
         default: break
         }
     }
@@ -159,6 +165,9 @@ func spin(_ seconds: Double) {
     RunLoop.main.run(until: Date().addingTimeInterval(seconds))
 }
 
+let deniedHint = "grant Camera to phonecap (com.lotus.phonecap): at the Mac, in Terminal, run native/phonecap/build/PhoneCap.app/Contents/MacOS/phonecap --request-access and click Allow (or turn phonecap on in System Settings > Privacy & Security > Camera)"
+
+/// Exits 3 with a clear reason unless macOS allows this helper to use the camera (iPhone screen capture counts as one).
 func ensureCameraAccess() {
     switch AVCaptureDevice.authorizationStatus(for: .video) {
     case .authorized:
@@ -169,11 +178,102 @@ func ensureCameraAccess() {
         let until = Date().addingTimeInterval(60)
         while answer == nil && Date() < until { spin(0.1) }
         if answer == true { return }
-        log("camera access denied: allow it in System Settings > Privacy & Security > Camera")
+        log("camera access denied (no answer to the Camera prompt): \(deniedHint)")
+        exit(3)
+    case .denied:
+        log("camera access denied: run tccutil reset Camera com.lotus.phonecap, then \(deniedHint)")
         exit(3)
     default:
-        log("camera access denied: allow it in System Settings > Privacy & Security > Camera")
+        log("camera access denied (restricted by a profile or parental controls): \(deniedHint)")
         exit(3)
+    }
+}
+
+/// --request-access: run once from Terminal at the Mac to get the Camera prompt and say what happened.
+func requestAccessAndExit() {
+    let before = AVCaptureDevice.authorizationStatus(for: .video)
+    if before == .denied {
+        log("Camera was denied before for phonecap. Run: tccutil reset Camera com.lotus.phonecap   then run --request-access again")
+        exit(3)
+    }
+    if before == .notDetermined { log("asking macOS for Camera access: click Allow on the prompt (waits up to 2 minutes)") }
+    var answer: Bool? = before == .authorized ? true : nil
+    if answer == nil {
+        AVCaptureDevice.requestAccess(for: .video) { answer = $0 }
+        let until = Date().addingTimeInterval(120)
+        while answer == nil && Date() < until { spin(0.1) }
+    }
+    if answer == true {
+        log("camera access OK: the server can capture the iPhones now")
+        print("authorized")
+        exit(0)
+    }
+    log("camera access NOT granted: \(deniedHint)")
+    print("denied")
+    exit(3)
+}
+
+// MARK: - own TCC identity
+
+/// macOS asks the *responsible* process for Camera: under launchd that is node, which has no Camera usage string and
+/// can't be added to the Camera list, so access is silently denied. Re-run ourselves with responsibility disclaimed
+/// (as Chromium, LLDB and iTerm2 do): the child is then judged as phonecap itself (com.lotus.phonecap, with its own
+/// usage string and its own entry in System Settings > Camera). stdin/stdout/stderr are inherited, so nothing changes
+/// for the server. Set PHONECAP_NO_DISCLAIM=1 to skip.
+typealias DisclaimFn = @convention(c) (UnsafeMutablePointer<posix_spawnattr_t?>, Int32) -> Int32
+var disclaimedChild: pid_t = 0
+
+func runDisclaimedIfNeeded() {
+    let env = ProcessInfo.processInfo.environment
+    if env["PHONECAP_DISCLAIMED"] == "1" || env["PHONECAP_NO_DISCLAIM"] == "1" { return }
+    guard let sym = dlsym(UnsafeMutableRawPointer(bitPattern: -2), "responsibility_spawnattrs_setdisclaim") else { return }
+    let disclaim = unsafeBitCast(sym, to: DisclaimFn.self)
+    guard let exe = Bundle.main.executablePath ?? CommandLine.arguments.first else { return }
+
+    var attr: posix_spawnattr_t?
+    guard posix_spawnattr_init(&attr) == 0 else { return }
+    defer { posix_spawnattr_destroy(&attr) }
+    guard disclaim(&attr, 1) == 0 else { return }
+
+    var envList = env.filter { $0.key != "PHONECAP_DISCLAIMED" }.map { "\($0.key)=\($0.value)" }
+    envList.append("PHONECAP_DISCLAIMED=1")
+    var cenv: [UnsafeMutablePointer<CChar>?] = envList.map { strdup($0) }
+    cenv.append(nil)
+    var cargs: [UnsafeMutablePointer<CChar>?] = CommandLine.arguments.map { strdup($0) }
+    cargs[0] = strdup(exe)
+    cargs.append(nil)
+    var pid: pid_t = 0
+    let rc = posix_spawn(&pid, exe, nil, &attr, cargs, cenv)
+    for p in cargs { free(p) }
+    for p in cenv { free(p) }
+    if rc != 0 {
+        log("could not re-run with its own Camera identity (\(rc)); trying in-process")
+        return
+    }
+    disclaimedChild = pid
+    for s in [SIGTERM, SIGINT, SIGHUP, SIGQUIT] {
+        signal(s) { sig in
+            if disclaimedChild > 0 { kill(disclaimedChild, sig) }
+        }
+    }
+    var status: Int32 = 0
+    while waitpid(pid, &status, 0) < 0 {
+        if errno != EINTR { exit(4) }
+    }
+    let sig = status & 0x7f
+    if sig == 0 { exit((status >> 8) & 0xff) }
+    exit(128 + sig)
+}
+
+/// In the disclaimed child: exit if the wrapper (our parent) goes away, so a SIGKILLed wrapper never leaves us running.
+func watchParent() {
+    guard ProcessInfo.processInfo.environment["PHONECAP_DISCLAIMED"] == "1" else { return }
+    let parent = getppid()
+    Thread.detachNewThread {
+        while true {
+            Thread.sleep(forTimeInterval: 0.5)
+            if getppid() != parent { exit(0) }
+        }
     }
 }
 
@@ -370,12 +470,12 @@ final class Capturer: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate {
             log("frame rate not set: \(error.localizedDescription)")
         }
 
-        NotificationCenter.default.addObserver(forName: .AVCaptureSessionRuntimeError, object: session, queue: nil) { n in
+        NotificationCenter.default.addObserver(forName: AVCaptureSession.runtimeErrorNotification, object: session, queue: nil) { n in
             let err = n.userInfo?[AVCaptureSessionErrorKey] as? NSError
             log("capture error: \(err?.localizedDescription ?? "unknown")")
             exit(4)
         }
-        NotificationCenter.default.addObserver(forName: .AVCaptureDeviceWasDisconnected, object: device, queue: nil) { _ in
+        NotificationCenter.default.addObserver(forName: AVCaptureDevice.wasDisconnectedNotification, object: device, queue: nil) { _ in
             log("iPhone screen device disconnected")
             exit(5)
         }
@@ -400,7 +500,7 @@ final class Capturer: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate {
             scaledApplied = true
             let tw = max(16, Int(Double(w) * Double(o.scale) / 100) & ~1)
             let th = max(16, Int(Double(h) * Double(o.scale) / 100) & ~1)
-            output.videoSettings = [
+            self.output.videoSettings = [
                 kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
                 kCVPixelBufferWidthKey as String: tw,
                 kCVPixelBufferHeightKey as String: th,
@@ -440,6 +540,9 @@ final class Capturer: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate {
 // MARK: - main
 
 let opts = parseOptions()
+runDisclaimedIfNeeded()
+watchParent()
+if opts.requestAccess { requestAccessAndExit() }
 allowScreenCaptureDevices()
 ensureCameraAccess()
 

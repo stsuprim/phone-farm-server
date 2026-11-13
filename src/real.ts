@@ -8,7 +8,8 @@ import { MjpegSource } from './mjpeg.js';
 import { Backend, ControlState, H264Want, HttpError, Image, ImageFormat, PathPoint, PhoneInfo, ScreenInfo, StreamSettings } from './types.js';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..'); // src/ or dist/ -> project root
-const HELPER = process.env.PHONECAP_PATH || path.join(ROOT, 'native', 'phonecap', 'build', 'phonecap');
+// inside a minimal app bundle so macOS gives it its own Camera (TCC) entry (scripts/build-native.mjs)
+const HELPER = process.env.PHONECAP_PATH || path.join(ROOT, 'native', 'phonecap', 'build', 'PhoneCap.app', 'Contents', 'MacOS', 'phonecap');
 const HELPER_ERROR = path.join(ROOT, 'native', 'phonecap', 'build', 'phonecap.error');
 import { WdaManager } from './wda.js';
 
@@ -114,8 +115,7 @@ export class RealBackend implements Backend {
     if (process.platform !== 'darwin') return 'H.264 capture needs macOS';
     if (fs.existsSync(HELPER)) return null;
     try {
-      const why = fs.readFileSync(HELPER_ERROR, "utf8").split(String.fromCharCode(10))[0]!;
-      return `the phonecap helper failed to build: ${why.trim()}`;
+      return `the phonecap helper failed to build: ${firstErrorLine(fs.readFileSync(HELPER_ERROR, 'utf8'))}`;
     } catch {
       return 'the phonecap helper is not built (run npm run build on the Mac)';
     }
@@ -131,7 +131,7 @@ export class RealBackend implements Backend {
       const online = [...this.phones.values()].filter((x) => x.online).length;
       const args = ['--udid', udid, '--name', p.name];
       if (online === 1) args.push('--any-if-single');
-      src = new H264Source(udid.slice(0, 8), helperProducer(HELPER, args, udid.slice(0, 8)), settings);
+      src = new H264Source(udid.slice(-8), helperProducer(HELPER, args, udid.slice(-8)), settings);
       this.h264Sources.set(udid, src);
     }
     const down = src.unavailable();
@@ -233,4 +233,10 @@ export class RealBackend implements Backend {
     for (const s of this.h264Sources.values()) s.close();
     this.wda.shutdown();
   }
+}
+
+/** The first line of a build log that is a real compiler error ("error:"), else its first non-empty line. */
+export function firstErrorLine(text: string): string {
+  const lines = text.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+  return (lines.find((l) => /\berror:/i.test(l)) ?? lines[0] ?? 'unknown build error').slice(0, 300);
 }

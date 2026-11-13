@@ -161,12 +161,20 @@ built, build error, capture failing, `H264=false`).
   It only rebuilds when `main.swift`/`Info.plist` change. Needs Xcode or the Command Line Tools (already there for WDA).
   On other systems the step is skipped. If the build fails, the server keeps working on MJPEG: the reason goes to
   `native/phonecap/build/phonecap.error`, `server.log` (`[updater]`/`[native]`) and every phone's `stats.h264_reason`.
-- Try it by hand: `native/phonecap/build/phonecap --list` lists capture devices (iPhones show as `iphone-screen`);
-  `native/phonecap/build/phonecap --udid <UDID> > /dev/null` should log `capturing ...`.
-- **Permissions:** macOS treats this like a camera. The first run asks for Camera access (the helper embeds a usage string);
-  under launchd there may be no prompt, so run `--list` once from Terminal while logged in, then in System Settings >
-  Privacy & Security > Camera allow Terminal and/or `node` (the process that launches it). Denied = exit with
-  "camera access denied", and the viewer falls back to MJPEG with that reason.
+- It is built as a minimal app bundle, `native/phonecap/build/PhoneCap.app` (bundle id `com.lotus.phonecap`, ad-hoc
+  signed; set `PHONECAP_SIGN_IDENTITY` to sign with a real certificate instead), so macOS gives it its own Camera entry.
+- Try it by hand (`PC=native/phonecap/build/PhoneCap.app/Contents/MacOS/phonecap`): `$PC --list` lists capture devices
+  (iPhones show as `iphone-screen`); `$PC --udid <UDID> > /dev/null` should log `capturing ...`.
+- **Permissions (Camera / TCC):** macOS treats iPhone screen capture as a camera and asks the *responsible* process.
+  Under launchd that would be `node`, which has no camera usage string and can't be added to the Camera list, so access
+  is silently denied. So the helper re-runs itself with responsibility disclaimed (like Chromium/LLDB do): it is then
+  judged as `phonecap` (com.lotus.phonecap) itself, wherever it's started from. **Once, at the Mac** (or over Screen
+  Sharing), in Terminal: `native/phonecap/build/PhoneCap.app/Contents/MacOS/phonecap --request-access` and click
+  **Allow**; it prints `authorized`. If it was denied before: `tccutil reset Camera com.lotus.phonecap`, then again.
+  It then shows as `phonecap` in System Settings > Privacy & Security > Camera. With ad-hoc signing, a rebuild of the
+  helper (only when `main.swift`/`Info.plist` change) can need this step again. Denied = the helper exits 3 and
+  `h264_reason` says "camera access denied: ..." with these steps; the viewer falls back to MJPEG.
+  The server must run as a user LaunchAgent in the GUI (Aqua) session (see below), not a LaunchDaemon.
 - **The iPhone:** must be trusted (Trust This Computer) and **unlocked at least once after plugging in** before its screen
   capture device appears; it can take a couple of seconds after the helper starts. Only one app can capture a phone at a
   time: close QuickTime's movie recording of it. Enabling screen capture makes the phone add a USB configuration, which may

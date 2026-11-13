@@ -4,7 +4,14 @@
 <dict>
   <key>CFBundleIdentifier</key><string>com.lotus.phonecap</string>
   <key>CFBundleName</key><string>phonecap</string>
+  <key>CFBundleDisplayName</key><string>phonecap</string>
+  <key>CFBundleExecutable</key><string>phonecap</string>
+  <key>CFBundlePackageType</key><string>APPL</string>
+  <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
+  <key>CFBundleShortVersionString</key><string>1.0</string>
   <key>CFBundleVersion</key><string>1</string>
+  <key>LSMinimumSystemVersion</key><string>13.0</string>
+  <key>LSUIElement</key><true/>
   <key>NSCameraUsageDescription</key><string>Lotus phone farm captures connected iPhone screens over USB for the live view.</string>
 </dict>
 </plist>

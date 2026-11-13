@@ -3,6 +3,7 @@
 import assert from 'node:assert/strict';
 import { encodeRecord, H264Source, H264Viewer, KIND, ProducerHooks, Rec, RecordParser, Transport, wsMessage } from '../src/h264.js';
 import { mockSpsPps } from '../src/h264mock.js';
+import { firstErrorLine } from '../src/real.js';
 import { parseOffer, pathKind, rtcpWantsKey } from '../src/rtc.js';
 
 let passed = 0;
@@ -210,6 +211,17 @@ const info = Buffer.from(JSON.stringify({ width: 100, height: 200, fps: 60 }));
   assert.equal(pathKind('127.0.0.1'), 'loopback');
   assert.equal(pathKind('8.8.8.8'), 'direct');
   ok('offer parsing (H.264 pm=1, 42e01f preferred, playout-delay), RTCP PLI/FIR detection, path kinds');
+}
+
+// ---- build error line (h264_reason) ----
+{
+  const log = [
+    "main.swift:373:65: warning: 'AVCaptureSessionRuntimeError' was renamed",
+    "main.swift:403:20: error: value of type 'AVCaptureOutput' has no member 'videoSettings'",
+  ].join('\n');
+  assert.match(firstErrorLine(log), /403:20: error:/);
+  assert.equal(firstErrorLine('\nsomething failed\nmore'), 'something failed');
+  ok('build reason picks the first "error:" line, not a warning naming an *Error');
 }
 
 console.log(`\nall ${passed} H.264 checks passed`);
