@@ -6,10 +6,17 @@
 // Grant it once at the Mac: `native/phonecap/build/PhoneCap.app/Contents/MacOS/phonecap --request-access` in Terminal, click Allow.
 //
 // stdout, one record after another (big-endian):
-//   1 byte kind | 8 bytes capture time (float64, ms since the epoch) | 4 bytes payload length | payload
-//   kinds: 0 info JSON {width,height,fps,scale}, 1 config (SPS+PPS, Annex B), 2 keyframe, 3 delta (Annex B),
+//   1 byte lane << 4 | kind | 8 bytes capture time (float64, ms since the epoch) | 4 bytes payload length | payload
+//   kinds: 0 info JSON {width,height,fps,scale,lane}, 1 config (SPS+PPS, Annex B), 2 keyframe, 3 delta (Annex B),
 //          4 stats JSON {encode_ms, capture_to_encoded_ms, fps}
-// stdin: "key" forces an IDR now (re-encoding the current screen if nothing new arrived), "quit" exits.
+// Lanes: one capture feeds up to 8 encoders (lanes 0-7), each with its own size, fps and bitrate, so a far viewer gets a
+//   small 30 fps stream while the LAN keeps full size at 60 fps. Lane 0 starts from the command line (--fps --scale
+//   --bitrate --key-seconds); its records have the high nibble 0, exactly as before lanes.
+// stdin: "key [lane]" forces an IDR now (re-encoding the current screen if nothing new arrived), "bitrate [lane] <bit/s>"
+//   and "fps <lane> <fps>" change a running lane, "lane <id> <fps> <scale %> <bit/s> [<key seconds>]" adds or changes
+//   a lane, "unlane <id>" stops one, "quit" exits. A lane without the number is lane 0.
+// phonecap-caps: lanes
+//   (scripts/build-native.mjs copies the caps above to build/phonecap.caps, so the server knows what this build speaks)
 // stderr: human-readable log lines. Exit codes: 2 no device, 3 camera access denied, 4 capture failed,
 //          5 device disconnected, 6 encoder failed, 7 several iPhones share a name and can't be told apart.
 // --udid: macOS 27 gives iPhone screens random UUIDs, so phonecap links them to UDIDs itself (see "UDID -> screen
@@ -635,7 +642,7 @@ final class Encoder {
     let session: VTCompressionSession
     let width: Int
     let height: Int
-    private let fps: Int
+    private let tag: UInt8 // the lane in the record's high nibble
     private let lowLatency: Bool
     private let statsLock = NSLock()
     private var frames = 0
@@ -644,10 +651,10 @@ final class Encoder {
     private var lastStats = nowMs()
     private static let startCode = Data([0, 0, 0, 1])
 
-    init?(width: Int, height: Int, o: Options) {
+    init?(width: Int, height: Int, fps: Int, bitrate: Int, keySeconds: Double, profile profileName: String, lane: Int) {
         self.width = width
         self.height = height
-        self.fps = o.fps
+        self.tag = UInt8((lane & 0x0f) << 4)
         func make(_ spec: [CFString: Any]?) -> VTCompressionSession? {
             var s: VTCompressionSession?
             let st = VTCompressionSessionCreate(
@@ -677,25 +684,31 @@ final class Encoder {
         set(kVTCompressionPropertyKey_RealTime, kCFBooleanTrue)
         set(kVTCompressionPropertyKey_AllowFrameReordering, kCFBooleanFalse) // no B-frames
         var profile: CFString = kVTProfileLevel_H264_Baseline_AutoLevel
-        if o.profile == "main" {
+        if profileName == "main" {
             profile = kVTProfileLevel_H264_Main_AutoLevel
         } else if #available(macOS 12.0, *) {
             profile = kVTProfileLevel_H264_ConstrainedBaseline_AutoLevel
         }
         set(kVTCompressionPropertyKey_ProfileLevel, profile)
-        set(kVTCompressionPropertyKey_AverageBitRate, o.bitrate as CFNumber)
+        set(kVTCompressionPropertyKey_AverageBitRate, bitrate as CFNumber)
         if !lowLatency {
             // cap bursts: 1.5x the average over any second
-            set(kVTCompressionPropertyKey_DataRateLimits, [Double(o.bitrate) * 1.5 / 8, 1.0] as CFArray)
+            set(kVTCompressionPropertyKey_DataRateLimits, [Double(bitrate) * 1.5 / 8, 1.0] as CFArray)
         }
-        set(kVTCompressionPropertyKey_ExpectedFrameRate, o.fps as CFNumber)
-        set(kVTCompressionPropertyKey_MaxKeyFrameInterval, Int(Double(o.fps) * o.keySeconds) as CFNumber)
-        set(kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration, o.keySeconds as CFNumber)
+        set(kVTCompressionPropertyKey_ExpectedFrameRate, fps as CFNumber)
+        set(kVTCompressionPropertyKey_MaxKeyFrameInterval, max(1, Int(Double(fps) * keySeconds)) as CFNumber)
+        set(kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration, keySeconds as CFNumber)
         if #available(macOS 13.0, *) {
             set(kVTCompressionPropertyKey_PrioritizeEncodingSpeedOverQuality, kCFBooleanTrue, optional: true)
         }
         VTCompressionSessionPrepareToEncodeFrames(session)
-        log("encoder \(width)x\(height) @\(o.fps) fps, \(o.bitrate / 1000) kbps, low-latency rate control \(lowLatency ? "on" : "off")")
+        log("lane \(lane) encoder \(width)x\(height) @\(fps) fps, \(bitrate / 1000) kbps, low-latency rate control \(lowLatency ? "on" : "off")")
+    }
+
+    /// A new frame rate while running (the lane drops frames itself; this keeps the rate control's budget per frame right).
+    func setFps(_ fps: Int, keySeconds: Double) {
+        _ = VTSessionSetProperty(session, key: kVTCompressionPropertyKey_ExpectedFrameRate, value: fps as CFNumber)
+        _ = VTSessionSetProperty(session, key: kVTCompressionPropertyKey_MaxKeyFrameInterval, value: max(1, Int(Double(fps) * keySeconds)) as CFNumber)
     }
 
     func invalidate() {
@@ -751,7 +764,7 @@ final class Encoder {
                     cfg.append(p, count: size)
                 }
             }
-            emit(1, captureMs, cfg)
+            emit(tag | 1, captureMs, cfg)
         }
         let total = CMBlockBufferGetDataLength(block)
         var avcc = Data(count: total)
@@ -773,7 +786,8 @@ final class Encoder {
                 off += n
             }
         }
-        emit(isKey ? 2 : 3, captureMs, annexB)
+        let kind: UInt8 = isKey ? 2 : 3
+        emit(tag | kind, captureMs, annexB)
 
         statsLock.lock()
         frames += 1
@@ -788,7 +802,7 @@ final class Encoder {
             capSum = 0
             lastStats = now
             statsLock.unlock()
-            emitJSON(4, obj)
+            emitJSON(tag | 4, obj)
         } else {
             statsLock.unlock()
         }
@@ -797,18 +811,45 @@ final class Encoder {
 
 // MARK: - capture
 
+/// One encoder fed by the capture: its own size (scale of the native screen), frame rate and bitrate. Used on the
+/// capture queue only.
+final class EncodeLane {
+    let id: Int
+    var fps: Int
+    var scale: Int
+    var bitrate: Int
+    var keySeconds: Double
+    var encoder: Encoder?
+    var keyWanted = true
+    var lastEncodedAt = -1_000_000.0
+    var pending: CVPixelBuffer? // the newest frame skipped by the frame rate, sent at the lane's next slot
+    var pendingCaptured = 0.0
+    var trailScheduled = false
+
+    init(id: Int, fps: Int, scale: Int, bitrate: Int, keySeconds: Double) {
+        self.id = id
+        self.fps = max(1, min(60, fps))
+        self.scale = max(10, min(100, scale))
+        self.bitrate = max(200_000, min(50_000_000, bitrate))
+        self.keySeconds = max(0.5, min(10, keySeconds))
+    }
+}
+
 final class Capturer: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate {
     let session = AVCaptureSession()
     let queue = DispatchQueue(label: "phonecap.capture", qos: .userInteractive)
     let output = AVCaptureVideoDataOutput()
     var o: Options
-    private var encoder: Encoder?
-    private var keyWanted = true
+    private var lanes: [Int: EncodeLane] = [:]
+    private var transfer: VTPixelTransferSession?
     private var lastBuffer: CVPixelBuffer?
     private var lastFrameAt = 0.0
-    private var scaledApplied = false
 
-    init(_ o: Options) { self.o = o }
+    init(_ o: Options) {
+        self.o = o
+        super.init()
+        lanes[0] = EncodeLane(id: 0, fps: o.fps, scale: o.scale, bitrate: o.bitrate, keySeconds: o.keySeconds)
+    }
 
     func start(_ device: AVCaptureDevice) throws {
         let input = try AVCaptureDeviceInput(device: device)
@@ -824,9 +865,10 @@ final class Capturer: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate {
 
         do {
             try device.lockForConfiguration()
-            let want = Double(o.fps)
+            // the capture runs at 60 so any lane can; a slower lane drops frames itself
+            let want = 60.0
             if device.activeFormat.videoSupportedFrameRateRanges.contains(where: { $0.minFrameRate <= want && want <= $0.maxFrameRate }) {
-                device.activeVideoMinFrameDuration = CMTime(value: 1, timescale: CMTimeScale(o.fps))
+                device.activeVideoMinFrameDuration = CMTime(value: 1, timescale: 60)
             }
             device.unlockForConfiguration()
         } catch {
@@ -856,55 +898,150 @@ final class Capturer: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate {
             let age = CMTimeGetSeconds(CMTimeSubtract(CMClockGetTime(CMClockGetHostTimeClock()), pts)) * 1000
             if age >= 0 && age < 1000 { captured = wall - age }
         }
-        let w = CVPixelBufferGetWidth(pb)
-        let h = CVPixelBufferGetHeight(pb)
-        if o.scale < 100 && !scaledApplied {
-            // downscale in the capture output (done by the capture pipeline, cheap), once the native size is known
-            scaledApplied = true
-            let tw = max(16, Int(Double(w) * Double(o.scale) / 100) & ~1)
-            let th = max(16, Int(Double(h) * Double(o.scale) / 100) & ~1)
-            self.output.videoSettings = [
-                kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
-                kCVPixelBufferWidthKey as String: tw,
-                kCVPixelBufferHeightKey as String: th,
-            ]
-            if w != tw || h != th { return } // the next frames come scaled
+        lastBuffer = pb
+        lastFrameAt = nowMs()
+        for id in lanes.keys.sorted() {
+            if let lane = lanes[id] { offer(lane, pb, captured: captured) }
         }
-        encode(pb, captured: captured, width: w, height: h)
     }
 
-    private func encode(_ pb: CVPixelBuffer, captured: Double, width w: Int, height h: Int) {
-        if encoder == nil || encoder!.width != w || encoder!.height != h {
-            encoder?.invalidate()
-            guard let e = Encoder(width: w, height: h, o: o) else {
+    /// A captured frame for one lane: encoded now, or (faster than the lane's frame rate) kept as its newest and sent
+    /// at the lane's next slot unless a newer one comes first, so the last change of a still screen always shows.
+    private func offer(_ lane: EncodeLane, _ pb: CVPixelBuffer, captured: Double) {
+        let interval = 1000.0 / Double(lane.fps)
+        if lane.keyWanted || nowMs() - lane.lastEncodedAt >= interval * 0.8 {
+            encode(lane, pb, captured: captured)
+            return
+        }
+        lane.pending = pb
+        lane.pendingCaptured = captured
+        scheduleTrail(lane)
+    }
+
+    private func scheduleTrail(_ lane: EncodeLane) {
+        if lane.trailScheduled { return }
+        lane.trailScheduled = true
+        let interval = 1000.0 / Double(lane.fps)
+        let wait = max(1.0, interval - (nowMs() - lane.lastEncodedAt))
+        queue.asyncAfter(deadline: .now() + .milliseconds(Int(wait.rounded(.up)))) { [weak self] in
+            guard let self = self else { return }
+            lane.trailScheduled = false
+            guard self.lanes[lane.id] === lane, let p = lane.pending else { return }
+            if nowMs() - lane.lastEncodedAt < interval * 0.8 {
+                self.scheduleTrail(lane)
+                return
+            }
+            self.encode(lane, p, captured: lane.pendingCaptured)
+        }
+    }
+
+    /// The frame scaled to the lane encoder's size (VideoToolbox's pixel transfer: hardware, cheap), or nil.
+    private func scaled(_ pb: CVPixelBuffer, for enc: Encoder) -> CVPixelBuffer? {
+        if transfer == nil {
+            var t: VTPixelTransferSession?
+            guard VTPixelTransferSessionCreate(allocator: nil, pixelTransferSessionOut: &t) == noErr, let made = t else { return nil }
+            transfer = made
+        }
+        guard let t = transfer, let pool = VTCompressionSessionGetPixelBufferPool(enc.session) else { return nil }
+        var out: CVPixelBuffer?
+        guard CVPixelBufferPoolCreatePixelBuffer(nil, pool, &out) == kCVReturnSuccess, let dst = out else { return nil }
+        guard VTPixelTransferSessionTransferImage(t, from: pb, to: dst) == noErr else { return nil }
+        return dst
+    }
+
+    private func encode(_ lane: EncodeLane, _ pb: CVPixelBuffer, captured: Double) {
+        let w = CVPixelBufferGetWidth(pb)
+        let h = CVPixelBufferGetHeight(pb)
+        var tw = w
+        var th = h
+        if lane.scale < 100 {
+            tw = max(16, Int(Double(w) * Double(lane.scale) / 100) & ~1)
+            th = max(16, Int(Double(h) * Double(lane.scale) / 100) & ~1)
+        }
+        if lane.encoder == nil || lane.encoder!.width != tw || lane.encoder!.height != th {
+            lane.encoder?.invalidate()
+            guard let e = Encoder(width: tw, height: th, fps: lane.fps, bitrate: lane.bitrate, keySeconds: lane.keySeconds,
+                                  profile: o.profile, lane: lane.id) else {
                 log("could not create the H.264 encoder")
                 exit(6)
             }
-            encoder = e
-            emitJSON(0, ["width": w, "height": h, "fps": o.fps, "scale": o.scale])
-            keyWanted = true
+            lane.encoder = e
+            emitJSON(UInt8((lane.id & 0x0f) << 4), ["width": tw, "height": th, "fps": lane.fps, "scale": lane.scale, "lane": lane.id])
+            lane.keyWanted = true
         }
-        lastBuffer = pb
-        lastFrameAt = nowMs()
-        let force = keyWanted
-        keyWanted = false
-        encoder!.encode(pb, captureMs: captured, forceKey: force)
+        guard let enc = lane.encoder else { return }
+        var frame = pb
+        if tw != w || th != h, let small = scaled(pb, for: enc) {
+            frame = small
+        } // else VideoToolbox scales it itself
+        let force = lane.keyWanted
+        lane.keyWanted = false
+        lane.pending = nil
+        lane.lastEncodedAt = nowMs()
+        enc.encode(frame, captureMs: captured, forceKey: force)
     }
 
-    /// Called on `queue`. Force an IDR; if the screen is still (no new frames), re-encode the last one now.
-    func requestKey() {
-        keyWanted = true
+    /// Called on `queue`. Force an IDR on a lane; if the screen is still (no new frames), re-encode the last one now.
+    func requestKey(_ id: Int) {
+        guard let lane = lanes[id] else { return }
+        lane.keyWanted = true
         if let pb = lastBuffer, nowMs() - lastFrameAt > 30 {
-            encode(pb, captured: nowMs(), width: CVPixelBufferGetWidth(pb), height: CVPixelBufferGetHeight(pb))
+            encode(lane, pb, captured: nowMs())
         }
     }
 
-    /// Called on `queue`. A new target bitrate from the server; kept for an encoder made later (a new size) too.
-    func setBitrate(_ bps: Int) {
+    /// Called on `queue`. A new target bitrate for a lane (the server's congestion control); kept for a later encoder.
+    func setBitrate(_ id: Int, _ bps: Int) {
+        guard let lane = lanes[id] else { return }
         let b = max(200_000, min(50_000_000, bps))
-        if b == o.bitrate { return }
-        o.bitrate = b
-        encoder?.setBitrate(b)
+        if b == lane.bitrate { return }
+        lane.bitrate = b
+        lane.encoder?.setBitrate(b)
+    }
+
+    /// Called on `queue`. A new frame rate for a lane (the server lowers it for a slow link).
+    func setFps(_ id: Int, _ fps: Int) {
+        guard let lane = lanes[id] else { return }
+        let f = max(1, min(60, fps))
+        if f == lane.fps { return }
+        lane.fps = f
+        lane.encoder?.setFps(f, keySeconds: lane.keySeconds)
+    }
+
+    /// Called on `queue`. Adds a lane, or changes one (a new scale makes a new encoder, with a keyframe).
+    func setLane(_ id: Int, fps: Int, scale: Int, bitrate: Int, keySeconds: Double) {
+        guard id >= 0 && id <= 7 else { return }
+        let lane: EncodeLane
+        if let have = lanes[id] {
+            lane = have
+            let s = max(10, min(100, scale))
+            if s != lane.scale {
+                lane.scale = s
+                lane.encoder?.invalidate()
+                lane.encoder = nil
+                lane.keyWanted = true
+            }
+            lane.keySeconds = max(0.5, min(10, keySeconds))
+            setFps(id, fps)
+            setBitrate(id, bitrate)
+        } else {
+            lane = EncodeLane(id: id, fps: fps, scale: scale, bitrate: bitrate, keySeconds: keySeconds)
+            lanes[id] = lane
+        }
+        log("lane \(id): \(lane.fps) fps, \(lane.scale)%, \(lane.bitrate / 1000) kbps")
+        // a still screen sends no frames: the lane's first picture comes from the last one
+        if lane.encoder == nil, let pb = lastBuffer, nowMs() - lastFrameAt > 30 {
+            encode(lane, pb, captured: nowMs())
+        }
+    }
+
+    /// Called on `queue`. Stops a lane's encoder.
+    func removeLane(_ id: Int) {
+        guard let lane = lanes.removeValue(forKey: id) else { return }
+        lane.encoder?.invalidate()
+        lane.encoder = nil
+        lane.pending = nil
+        log("lane \(id) closed")
     }
 }
 
@@ -988,16 +1125,39 @@ do {
 
 Thread.detachNewThread {
     while let line = readLine() {
-        let cmd = line.trimmingCharacters(in: .whitespaces)
+        let parts = line.trimmingCharacters(in: .whitespacesAndNewlines).split(separator: " ").map { String($0) }
+        guard let cmd = parts.first else { continue }
+        let n = parts.count
         switch cmd {
-        case "key": capturer.queue.async { capturer.requestKey() }
-        case "quit": exit(0)
-        default:
-            // "bitrate <bit/s>": the server's congestion control
-            let parts = cmd.split(separator: " ")
-            if parts.count == 2, parts[0] == "bitrate", let bps = Int(String(parts[1])) {
-                capturer.queue.async { capturer.setBitrate(bps) }
+        case "quit":
+            exit(0)
+        case "key":
+            // "key" (lane 0) or "key <lane>"
+            let id = n >= 2 ? (Int(parts[1]) ?? 0) : 0
+            capturer.queue.async { capturer.requestKey(id) }
+        case "bitrate":
+            // "bitrate <bit/s>" (lane 0) or "bitrate <lane> <bit/s>": the server's congestion control
+            if n == 2, let bps = Int(parts[1]) {
+                capturer.queue.async { capturer.setBitrate(0, bps) }
+            } else if n >= 3, let id = Int(parts[1]), let bps = Int(parts[2]) {
+                capturer.queue.async { capturer.setBitrate(id, bps) }
             }
+        case "fps":
+            if n >= 3, let id = Int(parts[1]), let f = Int(parts[2]) {
+                capturer.queue.async { capturer.setFps(id, f) }
+            }
+        case "lane":
+            // "lane <id> <fps> <scale %> <bit/s> [<key seconds>]"
+            if n >= 5, let id = Int(parts[1]), let f = Int(parts[2]), let s = Int(parts[3]), let b = Int(parts[4]) {
+                let ks = n >= 6 ? (Double(parts[5]) ?? opts.keySeconds) : opts.keySeconds
+                capturer.queue.async { capturer.setLane(id, fps: f, scale: s, bitrate: b, keySeconds: ks) }
+            }
+        case "unlane":
+            if n >= 2, let id = Int(parts[1]) {
+                capturer.queue.async { capturer.removeLane(id) }
+            }
+        default:
+            break
         }
     }
     exit(0) // stdin closed: the server is gone

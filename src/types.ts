@@ -42,6 +42,22 @@ export interface StreamStats {
   bitrate_kbps: number | null; // the encoder's target now (congestion control lowers it for a slow viewer)
   h264_available: boolean;
   h264_reason: string | null; // why H.264 isn't available (helper not built, capture failing...)
+  /** Each running encoder lane: "lan" (as asked) or "remote" (a far viewer's: smaller, 30 fps, follows its link). */
+  lanes?: LaneStats[];
+  /** The last phonecap build failed; the previous helper still runs (null when the build is fine). */
+  helper_build_error?: string | null;
+}
+
+export interface LaneStats {
+  kind: 'lan' | 'remote' | null;
+  fps: number;
+  fps_target: number | null;
+  scale: number;
+  width: number | null;
+  height: number | null;
+  bitrate_kbps: number | null;
+  viewers: number;
+  dropped: number;
 }
 
 /** What a client asked of the H.264 stream. */
@@ -50,6 +66,10 @@ export interface H264Want {
   scale: number;
   quality: number | null;
   bitrate?: number | null; // bit/s the client asked for (its `bitrate` in kbit/s); wins over quality
+  /** The viewer isn't on the Mac's LAN (Tailscale, the Internet): it gets a far viewer's lane (src/lanes.ts). */
+  remote?: boolean;
+  /** `full=1`: a far viewer that wants exactly what it asked (no far caps). */
+  full?: boolean;
 }
 
 /** Screen size in points plus the scale, as WDA reports it. */

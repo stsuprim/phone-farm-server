@@ -127,15 +127,17 @@ prebuilt binary). If it can't load, the server still runs and answers offers wit
 
 ### H.264 over WebSocket (fallback)
 
-`WS /phones/:udid/stream?token=...&codec=h264&fps=&scale=&quality=` (`quality` 1-100 maps to 2-12 Mbps; default 8 Mbps).
+`WS /phones/:udid/stream?token=...&codec=h264&fps=&scale=&quality=&bitrate=` (`bitrate` in kbit/s wins; else `quality`
+1-100 maps to 2-12 Mbps; default 8 Mbps). A viewer that isn't on the LAN gets a far lane (see below); `full=1` opts out.
 
 1. Text: `{type:"hello", codec:"h264", udid, width, height, fps, scale, server_time}`. If H.264 isn't available the hello is
    `{type:"hello", codec:"mjpeg", reason, udid, contentType, fps, scale, quality}` and MJPEG frames follow instead.
 2. Binary, one per message: 1 byte kind (`1` config = SPS+PPS, `2` keyframe, `3` delta), 8 bytes capture time (float64
    big-endian, ms since the epoch on the server's clock), then the Annex B payload (start codes included).
    Config always comes right before a keyframe (and only when it changed); the first frames are config + keyframe.
-3. Latest-only: when the socket's `bufferedAmount` is high (over 256 KB or 1.5x a keyframe), deltas are dropped until the
-   next keyframe and one is requested from the helper. Nothing is ever queued.
+3. Latest-only: when the socket's `bufferedAmount` is high (over 256 KB, 64 KB for a far viewer, or 1.5x a keyframe) or
+   the ping after the frames shows a queue (see Far viewers), deltas are dropped until the next keyframe and one is
+   requested from the helper as soon as the link has room. Nothing is ever queued.
 4. Client text `{type:"key"}` forces a keyframe (deltas are skipped until it arrives); `{type:"ping", t}` answers a pong.
 
 The size can change mid-stream (the phone rotates): a new config + keyframe arrive; reconfigure the decoder from the SPS.
@@ -145,11 +147,32 @@ The size can change mid-stream (the phone rotates): a new config + keyframe arri
 WDA's MJPEG server (no `codec`, or `codec=mjpeg`, or the fallback): `mjpegServerFramerate` = the highest fps asked for
 (default now 60), `mjpegScalingFactor` from `scale`, `mjpegServerScreenshotQuality` from `quality`; latest frame only.
 
+### Far viewers: encoder lanes and congestion control
+
+The helper captures each phone once and feeds up to 8 H.264 encoders ("lanes"), each with its own size, frame rate and
+bitrate (`src/lanes.ts`, `native/phonecap/main.swift`). Viewers with the same settings share a lane.
+
+- **LAN** (and loopback): exactly what the client asked (Lotus Smooth: 60 fps, 50 %, 4 Mbps; Sharp: 60 fps, 100 %,
+  10 Mbps). Unchanged by anyone else watching.
+- **Far** (Tailscale 100.64/10 or a public address): at most 30 fps and about 1400 px on the long side, starting at
+  1.5 Mbps and climbing 8 %/s while the link keeps up, to the client's `bitrate` (2.5 Mbps when it asks none). Under
+  congestion the bitrate is cut toward what the link delivers and the frame rate follows it (30 -> 20 fps under 1 Mbps,
+  12 fps under 650 kbit/s). Keyframes every 2 s, and on request. `full=1` (query) / `want.full: true` (rtc-offer)
+  gives a far viewer exactly what it asked.
+- WebRTC: loss-based (receiver reports + NACKs: > 10 % lost cuts, < 2 % raises), PLI/FIR at most every 500 ms (only
+  the far lane re-keys), packets paced at 1.5x the ceiling (3-8 Mbit/s, `RTC_PACING=0` turns it off).
+- WebSockets: a ping follows the frames; its pong's round trip beyond the base is the queue. H.264: the bitrate is cut
+  past 150 ms of queue, deltas dropped (then a keyframe) past 300 ms. MJPEG: one frame may follow one still on its way,
+  never more; a far viewer asks WDA for at most 35 % / quality 40.
+- An older helper (no `lanes` in `native/phonecap/build/phonecap.caps`, e.g. a build that failed and kept the previous
+  one) gets one shared encoder per phone, as before.
+
 ### Stats
 
 `GET /phones` -> each phone's `stats`:
 `{codec, fps, encode_ms, capture_to_encoded_ms, encoded_to_sent_ms, viewers, viewers_webrtc, viewers_h264_ws,
-viewers_mjpeg, path, dropped, h264_available, h264_reason}`. `codec` is what viewers get now (`h264` if any WebRTC/H.264
+viewers_mjpeg, path, dropped, bitrate_kbps, h264_available, h264_reason, lanes, helper_build_error}` (`lanes`: each
+running lane `{kind: "lan"|"remote", fps, fps_target, scale, width, height, bitrate_kbps, viewers, dropped}`). `codec` is what viewers get now (`h264` if any WebRTC/H.264
 viewer, else `mjpeg`, null when nobody watches); timings are running averages in ms (capture -> encoded measured in the
 helper from the capture timestamp, encoded -> sent in the server); `path` is the WebRTC path (`lan`, `tailscale`,
 `loopback`, `direct`; candidates are always host, never relayed); `h264_reason` says why H.264 can't be used (helper not
@@ -159,10 +182,12 @@ built, build error, capture failing, `H264=false`).
 
 - Built by `npm run build` (`scripts/build-native.mjs`: `xcrun swiftc -O`), so the auto-updater rebuilds it after each pull.
   It only rebuilds when `main.swift`/`Info.plist` change. Needs Xcode or the Command Line Tools (already there for WDA).
-  On other systems the step is skipped. If the build fails, the server keeps working on MJPEG: the reason goes to
-  `native/phonecap/build/phonecap.error`, `server.log` (`[updater]`/`[native]`) and every phone's `stats.h264_reason`.
+  On other systems the step is skipped. If the build fails, the previous helper keeps running (only what it speaks is
+  used) and the reason goes to `native/phonecap/build/phonecap.error`, `server.log` (`[updater]`/`[native]`) and every
+  phone's `stats.helper_build_error`; with no previous helper the server streams MJPEG and says why in `h264_reason`.
 - It is built as a minimal app bundle, `native/phonecap/build/PhoneCap.app` (bundle id `com.lotus.phonecap`, ad-hoc
-  signed; set `PHONECAP_SIGN_IDENTITY` to sign with a real certificate instead), so macOS gives it its own Camera entry.
+  signed with a fixed designated requirement, `identifier "com.lotus.phonecap"`, so the Camera grant can survive
+  rebuilds; set `PHONECAP_SIGN_IDENTITY` to sign with a real certificate instead), so macOS gives it its own Camera entry.
 - Try it by hand (`PC=native/phonecap/build/PhoneCap.app/Contents/MacOS/phonecap`): `$PC --list` lists capture devices
   (iPhones show as `iphone-screen`); `$PC --udid <UDID> > /dev/null` should log `capturing ...`.
 - **Permissions (Camera / TCC):** macOS treats iPhone screen capture as a camera and asks the *responsible* process.

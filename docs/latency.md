@@ -75,3 +75,16 @@ link "dropped" and the client fell back); the H.264 WebSocket then queued second
 - WebRTC viewers: loss-based like GCC from the browser's receiver reports and NACKs (> 10 % lost -> cut, < 2 % -> raise);
   keyframe requests (PLI/FIR) are honoured at most every 500 ms.
 - `GET /phones` stats carry `bitrate_kbps` (the encoder's target now).
+
+### 2026-11-13, second pass: encoder lanes
+
+Still bad after the first pass (WebRTC dropped, the H.264 WebSocket fell to a few fps, MJPEG to ~1 fps): one shared
+encoder ran at the LAN's settings (60 fps, full or half size), so a far viewer's frames and keyframes were as big as the
+LAN's, its keyframe asks re-keyed everyone, and every congestion drop waited for one more large keyframe. Each MJPEG
+frame (~100 KB) waited for the previous one's acknowledgement, leaving the link idle a round trip per frame.
+
+Now (README, "Far viewers"): a far viewer gets its own encoder lane from the same capture (30 fps, about 1400 px on the
+long side, 1.5 Mbps climbing to its ask, frame rate following the bitrate), WebRTC packets are paced, and MJPEG keeps
+one frame in flight behind another. Expected over the Nepal -> UK link (~180 ms): WebRTC 25-30 fps at roughly
+250-400 ms glass to glass (one way ~90 ms + capture/encode/decode ~60 ms + pacing/jitter); the H.264 WebSocket
+20-30 fps at ~300-600 ms; taps keep their ~1 round trip plus WDA. To be confirmed with the client's numbers.

@@ -4,7 +4,7 @@ import os from 'node:os';
 import { WebSocket, WebSocketServer } from 'ws';
 import { bitrateAsk, DEFAULT_CEILING_BPS, RateControl, REMOTE_START_BPS, WsFlow } from './congestion.js';
 import { Control } from './control.js';
-import { H264Viewer, Transport, wsMessage } from './h264.js';
+import { H264Viewer, REMOTE_DROP_BYTES, Transport, wsMessage } from './h264.js';
 import { isRemote, rtcSignaling } from './rtc.js';
 import { Backend, H264Want, HttpError, StreamSettings } from './types.js';
 import type { Updater } from './updater.js';
@@ -22,9 +22,9 @@ function lanUrls(port: number): string[] {
 
 /**
  * H.264 settings from the stream query: fps 1-60 (default 60), scale 10-100 % (default 100), quality 1-100 or none,
- * bitrate (kbit/s, or `kbps`) or none; a bitrate wins over quality.
+ * bitrate (kbit/s, or `kbps`) or none; a bitrate wins over quality. `full=1`: a far viewer gets exactly that too.
  */
-function h264Want(q: URLSearchParams): H264Want {
+function h264Want(q: URLSearchParams, remote: boolean): H264Want {
   const pick = (k: string, dflt: number, lo: number, hi: number) => {
     const v = Number(q.get(k));
     return q.has(k) && q.get(k) !== '' && Number.isFinite(v) ? Math.round(Math.min(hi, Math.max(lo, v))) : dflt;
@@ -34,6 +34,8 @@ function h264Want(q: URLSearchParams): H264Want {
     scale: pick('scale', 100, 10, 100),
     quality: q.has('quality') && q.get('quality') !== '' ? pick('quality', 50, 1, 100) : null,
     bitrate: bitrateAsk(q.get('bitrate') ?? q.get('kbps')),
+    remote,
+    full: /^(1|true|yes)$/i.test(q.get('full') ?? ''),
   };
 }
 
@@ -71,13 +73,21 @@ async function readJson(req: http.IncomingMessage): Promise<Record<string, unkno
   throw new HttpError(400, 'body must be a JSON object');
 }
 
-/** Stream settings from the query: `?fps=&quality=&scale=`, clamped, with defaults 30 / 50 / 50. */
-function streamSettings(q: URLSearchParams): StreamSettings {
+/**
+ * Stream settings from the query: `?fps=&quality=&scale=`, clamped, with defaults 30 / 50 / 50. A far viewer (not on
+ * the LAN) asks WDA for at most 35 % / quality 40: a JPEG a far link carries several times a second.
+ */
+function streamSettings(q: URLSearchParams, remote = false): StreamSettings {
   const pick = (k: string, dflt: number, lo: number, hi: number) => {
     const v = Number(q.get(k));
     return q.has(k) && q.get(k) !== '' && Number.isFinite(v) ? Math.round(Math.min(hi, Math.max(lo, v))) : dflt;
   };
-  return { fps: pick('fps', 30, 1, 60), quality: pick('quality', 50, 5, 100), scale: pick('scale', 50, 10, 100) };
+  const s = { fps: pick('fps', 30, 1, 60), quality: pick('quality', 50, 5, 100), scale: pick('scale', 50, 10, 100) };
+  if (remote && !/^(1|true|yes)$/i.test(q.get('full') ?? '')) {
+    s.scale = Math.min(s.scale, 35);
+    s.quality = Math.min(s.quality, 40);
+  }
+  return s;
 }
 
 function errorText(err: unknown): string {
@@ -167,14 +177,15 @@ export function createServer(backend: Backend, token: string, updater?: Updater)
     }
     wss.handleUpgrade(req, socket, head, (ws) => {
       if (codec === 'h264') void h264Socket(ws, udid, url.searchParams, remote);
-      else mjpegSocket(ws, udid, streamSettings(url.searchParams), codec === 'mjpeg' ? { codec: 'mjpeg' } : {});
+      else mjpegSocket(ws, udid, streamSettings(url.searchParams, remote), codec === 'mjpeg' ? { codec: 'mjpeg' } : {}, remote);
     });
   });
 
   /** Old behaviour (no `codec`), `codec=mjpeg`, and the fallback when H.264 isn't available (`extra` has the reason). */
-  function mjpegSocket(ws: WebSocket, udid: string, want: StreamSettings, extra: Record<string, unknown>): void {
+  function mjpegSocket(ws: WebSocket, udid: string, want: StreamSettings, extra: Record<string, unknown>, remote = false): void {
     // Latest frame only: while one frame is being written, or earlier ones still wait on the way to the viewer
-    // (flow control: a slow link never builds a queue of old frames), newer ones replace the waiting one.
+    // (flow control: a slow link never builds a queue of old frames), newer ones replace the waiting one. One more frame
+    // may follow one still on its way, so a far link isn't idle for a round trip after every frame.
     let writing = false;
     let waiting: Buffer | null = null;
     const flush = () => {
@@ -183,9 +194,11 @@ export function createServer(backend: Backend, token: string, updater?: Updater)
       if (next) push(next);
     };
     const flow = WsFlow.of(ws, { onAck: () => !writing && flush() });
+    // a frame held back while the link was full goes once it has room, even if the next pong is slow to come
+    const retry = setInterval(() => !writing && waiting && flush(), 100);
     const push = (frame: Buffer): void => {
       if (ws.readyState !== WebSocket.OPEN) return;
-      if (writing || flow.congested()) {
+      if (writing || ws.bufferedAmount > (remote ? REMOTE_DROP_BYTES : 1024 * 1024) || !flow.canSend(frame.length)) {
         waiting = frame;
         return;
       }
@@ -200,6 +213,7 @@ export function createServer(backend: Backend, token: string, updater?: Updater)
     try {
       sub = backend.subscribe(udid, push, want);
     } catch (err) {
+      clearInterval(retry);
       ws.close(1011, err instanceof HttpError ? err.message.slice(0, 100) : 'error');
       return;
     }
@@ -208,8 +222,12 @@ export function createServer(backend: Backend, token: string, updater?: Updater)
       const msg = isBinary ? null : parseObject(data);
       if (msg?.type === 'ping') ws.send(JSON.stringify({ type: 'pong', t: msg.t ?? null, server_time: Date.now() }));
     });
-    ws.on('close', sub.unsubscribe);
-    ws.on('error', sub.unsubscribe);
+    const done = () => {
+      clearInterval(retry);
+      sub.unsubscribe();
+    };
+    ws.on('close', done);
+    ws.on('error', done);
   }
 
   /**
@@ -219,7 +237,7 @@ export function createServer(backend: Backend, token: string, updater?: Updater)
   async function h264Socket(ws: WebSocket, udid: string, q: URLSearchParams, remote: boolean): Promise<void> {
     let reason: string;
     let src: ReturnType<Backend['h264']>;
-    const want = h264Want(q);
+    const want = h264Want(q, remote);
     try {
       src = backend.h264(udid, want);
     } catch (err) {
@@ -233,7 +251,8 @@ export function createServer(backend: Backend, token: string, updater?: Updater)
         if (ws.readyState !== WebSocket.OPEN) return;
         const h = src;
         // Congestion control: a ping after the frames measures the queue in front of this viewer; frames are
-        // skipped while it's too long, and the encoder's bitrate follows what the link delivers.
+        // skipped while it's too long, and the encoder's bitrate (and a far lane's frame rate) follow what the link
+        // delivers. A far viewer starts low and climbs to its ask.
         const ceiling = want.bitrate ?? (h.ceiling || DEFAULT_CEILING_BPS);
         const rc = new RateControl(ceiling, remote ? Math.min(ceiling, REMOTE_START_BPS) : ceiling);
         let viewer: H264Viewer | undefined;
@@ -243,7 +262,7 @@ export function createServer(backend: Backend, token: string, updater?: Updater)
           const changed = q > 150 ? rc.down(q > 600 ? 0.6 : 0.85, flow.delivered, Math.max(500, flow.baseRtt() + 200)) : q < 50 ? rc.up() : false;
           if (changed) h.setTarget(viewer, rc.bps);
         };
-        const flow = WsFlow.of(ws, { onAck: adjust });
+        const flow = WsFlow.of(ws, { onAck: adjust, targetMs: remote ? 300 : 250 });
         const tick = setInterval(adjust, 500);
         const transport: Transport = {
           kind: 'ws',
@@ -256,9 +275,13 @@ export function createServer(backend: Backend, token: string, updater?: Updater)
           },
           fail: (why) => ws.close(1011, why.slice(0, 120)),
           congested: () => flow.congested(),
+          dropBytes: remote ? REMOTE_DROP_BYTES : undefined,
         };
         viewer = new H264Viewer(transport, src);
-        ws.send(JSON.stringify({ type: 'hello', codec: 'h264', udid, width: info.width, height: info.height, fps: info.fps, scale: info.scale, server_time: Date.now() }));
+        ws.send(JSON.stringify({
+          type: 'hello', codec: 'h264', udid, width: info.width, height: info.height, fps: info.fps, scale: info.scale,
+          lane: h.kind, bitrate_kbps: Math.round(rc.bps / 1000), max_kbps: Math.round(rc.max / 1000), server_time: Date.now(),
+        }));
         h.setTarget(viewer, rc.bps);
         h.add(viewer);
         const v = viewer;
@@ -279,7 +302,7 @@ export function createServer(backend: Backend, token: string, updater?: Updater)
       }
     }
     if (ws.readyState !== WebSocket.OPEN) return;
-    mjpegSocket(ws, udid, streamSettings(q), { codec: 'mjpeg', reason });
+    mjpegSocket(ws, udid, streamSettings(q, remote), { codec: 'mjpeg', reason }, remote);
   }
 
   /**

@@ -3,7 +3,8 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { Config } from './config.js';
-import { bitrateFor, H264Source, helperProducer, phoneStats } from './h264.js';
+import { H264Source, helperProducer, phoneStats, StartProducer } from './h264.js';
+import { PhonecapHost, profileFor } from './lanes.js';
 import { MjpegSource } from './mjpeg.js';
 import { Backend, ControlState, H264Want, HttpError, Image, ImageFormat, PathPoint, PhoneInfo, ScreenInfo, StreamSettings } from './types.js';
 
@@ -11,6 +12,18 @@ const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..'); /
 // inside a minimal app bundle so macOS gives it its own Camera (TCC) entry (scripts/build-native.mjs)
 const HELPER = process.env.PHONECAP_PATH || path.join(ROOT, 'native', 'phonecap', 'build', 'PhoneCap.app', 'Contents', 'MacOS', 'phonecap');
 const HELPER_ERROR = path.join(ROOT, 'native', 'phonecap', 'build', 'phonecap.error');
+// what the built helper speaks (scripts/build-native.mjs writes it from main.swift's "phonecap-caps:" line)
+const HELPER_CAPS = path.join(ROOT, 'native', 'phonecap', 'build', 'phonecap.caps');
+
+/** The built helper's capabilities ("lanes": several encoders from one capture); none for an older build. */
+function helperCaps(): string[] {
+  if (process.env.PHONECAP_LANES === '0') return [];
+  try {
+    return fs.readFileSync(HELPER_CAPS, 'utf8').split(/[\s,]+/).filter(Boolean);
+  } catch {
+    return [];
+  }
+}
 import { WdaManager } from './wda.js';
 
 function run(cmd: string, args: string[]): Promise<string> {
@@ -32,7 +45,8 @@ export class RealBackend implements Backend {
   private phones = new Map<string, PhoneInfo>();
   private wda: WdaManager;
   private sources = new Map<string, MjpegSource>();
-  private h264Sources = new Map<string, H264Source>();
+  private h264Sources = new Map<string, H264Source>(); // "udid" (an older helper) or "udid|lane key"
+  private hosts = new Map<string, PhonecapHost>(); // one phonecap process per phone, shared by its lanes
   private streams = new Map<string, Set<StreamSettings>>(); // what each stream subscriber asked for
   private timer: NodeJS.Timeout;
   private polling = false;
@@ -75,8 +89,7 @@ export class RealBackend implements Backend {
         if (!ids.includes(udid)) {
           p.online = false;
           this.wda.stop(udid);
-          this.h264Sources.get(udid)?.close('phone unplugged');
-          this.h264Sources.delete(udid);
+          this.closeH264(udid, 'phone unplugged');
         }
       }
     } finally {
@@ -102,11 +115,43 @@ export class RealBackend implements Backend {
     });
   }
 
+  /** The phone's H.264 sources: one per lane (or the one shared source of an older helper). */
+  private phoneSources(udid: string): H264Source[] {
+    return [...this.h264Sources].filter(([k]) => k === udid || k.startsWith(`${udid}|`)).map(([, s]) => s);
+  }
+
+  private closeH264(udid: string, why: string): void {
+    for (const [k, s] of [...this.h264Sources]) {
+      if (k === udid || k.startsWith(`${udid}|`)) {
+        s.close(why);
+        this.h264Sources.delete(k);
+      }
+    }
+    this.hosts.get(udid)?.close();
+    this.hosts.delete(udid);
+  }
+
   private stats(udid: string) {
     const m = this.sources.get(udid);
-    const src = this.h264Sources.get(udid);
-    const reason = this.helperProblem() ?? src?.unavailable() ?? null;
-    return phoneStats(src, { fps: m?.viewers ? m.meter.rate() : 0, viewers: m?.viewers ?? 0 }, reason);
+    const srcs = this.phoneSources(udid);
+    const reason = this.helperProblem() ?? srcs.map((s) => s.unavailable()).find((r) => r) ?? null;
+    return phoneStats(srcs, { fps: m?.viewers ? m.meter.rate() : 0, viewers: m?.viewers ?? 0 }, reason, this.buildError());
+  }
+
+  /** The last phonecap build's error while an older helper still runs, else null. */
+  private buildError(): string | null {
+    if (!fs.existsSync(HELPER) || !fs.existsSync(HELPER_ERROR)) return null;
+    try {
+      return firstErrorLine(fs.readFileSync(HELPER_ERROR, 'utf8'));
+    } catch {
+      return null;
+    }
+  }
+
+  /** The phone's screen, long side in pixels (WDA's points x scale), or null before WDA knows it. */
+  private longSide(udid: string): number | null {
+    const s = this.wda.screen(udid);
+    return s?.scale ? Math.round(Math.max(s.width, s.height) * s.scale) : null;
   }
 
   /** Why the native H.264 helper can't be used on this Mac, or null. */
@@ -121,22 +166,37 @@ export class RealBackend implements Backend {
     }
   }
 
+  /**
+   * The H.264 source for a viewer. With a lanes helper: one per lane (a LAN viewer's settings as asked; a far viewer's
+   * smaller, 30 fps and following its link), all fed by the phone's one phonecap. With an older helper: one shared
+   * source per phone, as before.
+   */
   h264(udid: string, want: H264Want): H264Source | string {
     const p = this.known(udid);
     const problem = this.helperProblem();
     if (problem) return problem;
-    const settings = { fps: want.fps, scale: want.scale, bitrate: want.bitrate ?? bitrateFor(want.quality, this.cfg.h264BitrateMbps * 1_000_000) };
-    let src = this.h264Sources.get(udid);
+    const lanes = helperCaps().includes('lanes');
+    const prof = profileFor(want, this.cfg.h264BitrateMbps * 1_000_000, this.longSide(udid));
+    const key = lanes ? `${udid}|${prof.key}` : udid;
+    let src = this.h264Sources.get(key);
     if (!src) {
       const online = [...this.phones.values()].filter((x) => x.online).length;
       const args = ['--udid', udid, '--name', p.name];
       if (online === 1) args.push('--any-if-single');
-      src = new H264Source(udid.slice(-8), helperProducer(HELPER, args, udid.slice(-8)), settings);
-      this.h264Sources.set(udid, src);
+      const tag = udid.slice(-8);
+      let start: StartProducer;
+      if (lanes) {
+        let host = this.hosts.get(udid);
+        if (!host) this.hosts.set(udid, (host = new PhonecapHost(HELPER, args, tag)));
+        start = host.start;
+      } else start = helperProducer(HELPER, args, tag);
+      const kind = prof.remote ? 'remote' : 'lan';
+      src = new H264Source(lanes ? `${tag} ${kind}` : tag, start, prof.settings, { kind });
+      this.h264Sources.set(key, src);
     }
     const down = src.unavailable();
     if (down) return down;
-    src.setWant(settings);
+    src.setWant(prof.settings);
     return src;
   }
 
@@ -231,6 +291,7 @@ export class RealBackend implements Backend {
   async close() {
     clearInterval(this.timer);
     for (const s of this.h264Sources.values()) s.close();
+    for (const h of this.hosts.values()) h.close();
     this.wda.shutdown();
   }
 }

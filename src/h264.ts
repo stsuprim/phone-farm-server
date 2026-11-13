@@ -4,11 +4,14 @@ import { ChildProcess, spawn } from 'node:child_process';
  * H.264 live view: one capture helper (native/phonecap, or the mock) per phone, shared by every viewer.
  *
  * Helper -> server framing (stdout), one record after another:
- *   1 byte kind | 8 bytes capture time (float64 BE, ms since the epoch) | 4 bytes payload length (uint32 BE) | payload
+ *   1 byte lane << 4 | kind | 8 bytes capture time (float64 BE, ms since the epoch) | 4 bytes length (uint32 BE) | payload
  * Kinds: 0 info (JSON {width, height, fps, scale?}), 1 config (SPS+PPS, Annex B), 2 keyframe (Annex B),
  *        3 delta (Annex B), 4 stats (JSON {encode_ms, capture_to_encoded_ms}).
- * Server -> helper (stdin): "key\n" forces an IDR now, "bitrate <bit/s>\n" changes the encoder's target (congestion
- * control; an older helper ignores it), "quit\n" exits.
+ * Lanes (a helper whose build/phonecap.caps says "lanes"): one capture, up to 8 encoders, each with its own size, fps
+ * and bitrate (src/lanes.ts). Lane 0 comes from the command line; an older helper only has lane 0 (high nibble 0).
+ * Server -> helper (stdin): "key [lane]\n" forces an IDR now, "bitrate [lane] <bit/s>\n" changes the encoder's target
+ * (congestion control; an older helper ignores it), "fps <lane> <fps>\n", "lane <id> <fps> <scale> <bit/s> <key s>\n",
+ * "unlane <id>\n", "quit\n" exits.
  *
  * Server -> WebSocket viewer: the same record minus the length: 1 byte kind (1/2/3) | 8 bytes time | payload.
  */
@@ -21,6 +24,7 @@ export interface Rec {
   time: number; // capture time, ms since the epoch (server clock)
   payload: Buffer;
   arrived: number; // Date.now() when the server got it
+  lane?: number; // the helper's encoder lane (0 for an older helper)
   msg?: Buffer; // cached WebSocket message
 }
 
@@ -57,12 +61,13 @@ export class RecordParser {
     for (;;) {
       if (this.len < HEADER) return;
       const head = this.peek(HEADER);
-      const kind = head[0]!;
+      const kind = head[0]! & 0x0f;
+      const lane = head[0]! >> 4;
       const size = head.readUInt32BE(9);
-      if (kind > 4 || size > MAX_PAYLOAD) throw new Error(`bad record from the capture helper (kind ${kind}, ${size} bytes)`);
+      if (kind > 4 || size > MAX_PAYLOAD) throw new Error(`bad record from the capture helper (kind ${head[0]}, ${size} bytes)`);
       if (this.len < HEADER + size) return;
       const all = this.take(HEADER + size);
-      this.onRecord({ kind, time: all.readDoubleBE(1), payload: all.subarray(HEADER), arrived: Date.now() });
+      this.onRecord({ kind, time: all.readDoubleBE(1), payload: all.subarray(HEADER), arrived: Date.now(), lane });
     }
   }
 
@@ -107,7 +112,22 @@ const round1 = (v: number | null) => (v === null ? null : Math.round(v * 10) / 1
 export interface H264Settings {
   fps: number; // 1-60
   scale: number; // 10-100 %
-  bitrate: number; // bits per second
+  bitrate: number; // bits per second the encoder starts at
+  /** The most the viewers' targets may raise it to (default: `bitrate`). A far viewer starts low and climbs to this. */
+  maxBitrate?: number;
+  /** Lower the frame rate with the bitrate (a far link): see fpsFor. */
+  adaptFps?: boolean;
+  /** Keyframe interval, seconds (default 2). */
+  keySeconds?: number;
+}
+
+/**
+ * The frame rate for a far viewer's lane at a bitrate: fewer, better frames when the link is thin (each frame keeps
+ * enough bits to stay sharp, and the encoder's budget isn't spent on frames that would only queue).
+ */
+export function fpsFor(bps: number, maxFps: number): number {
+  const f = bps >= 1_000_000 ? maxFps : bps >= 650_000 ? 20 : 12;
+  return Math.max(1, Math.min(maxFps, f));
 }
 export interface H264Info {
   width: number;
@@ -124,6 +144,8 @@ export interface Producer {
   stop(): void;
   /** A new target bitrate for the running encoder (absent: fixed bitrate). */
   bitrate?(bps: number): void;
+  /** A new frame rate for the running encoder (absent: fixed). */
+  fps?(fps: number): void;
 }
 export type StartProducer = (want: H264Settings, hooks: ProducerHooks) => Producer;
 
@@ -143,9 +165,13 @@ export interface Transport {
   path?(): string | null;
   /** True while frames sent earlier still wait on the way (flow control): frames are skipped, never queued. */
   congested?(): boolean;
+  /** Bytes waiting in the socket that count as backed up (default 256 KB; small for a far viewer). */
+  dropBytes?: number;
 }
 
 const DROP_FLOOR = 256 * 1024;
+/** A far viewer's socket: a few frames at its bitrate, not seconds of them. */
+export const REMOTE_DROP_BYTES = 64 * 1024;
 
 /**
  * One viewer. Latest-only: when the transport is backed up, deltas are dropped until the next keyframe
@@ -160,12 +186,12 @@ export class H264Viewer {
 
   private over(): boolean {
     const keySize = this.src.key?.payload.length ?? 0;
-    return this.t.buffered() > Math.max(DROP_FLOOR, keySize * 1.5) || !!this.t.congested?.();
+    return this.t.buffered() > Math.max(this.t.dropBytes ?? DROP_FLOOR, keySize * 1.5) || !!this.t.congested?.();
   }
 
   private ask(): void {
     const now = Date.now();
-    if (now - this.lastAsk < 1000) return;
+    if (now - this.lastAsk < 500) return;
     this.lastAsk = now;
     this.src.requestKey(true);
   }
@@ -226,6 +252,8 @@ export interface SourceOptions {
   idleMs?: number; // stop the helper this long after the last viewer leaves
   openTimeoutMs?: number; // give up on the first keyframe after this long
   log?: (m: string) => void;
+  /** Whose lane this is: "lan" (full settings) or "remote" (a far viewer's), for the stats. */
+  kind?: 'lan' | 'remote';
 }
 
 /** One capture helper per phone, started on demand, shared, restarted with backoff, stopped when idle. */
@@ -249,6 +277,8 @@ export class H264Source {
   private meter = new RateMeter();
   private targets = new Map<H264Viewer, number>(); // each viewer's link: the bitrate it carries
   private applied = 0; // the bitrate the running helper was last given
+  private appliedFps = 0; // the frame rate the running helper was last given
+  readonly kind: 'lan' | 'remote' | null;
   private encodeMs: number | null = null;
   private capToEnc: number | null = null;
   private capToSent: number | null = null;
@@ -260,6 +290,7 @@ export class H264Source {
     this.idleMs = opts.idleMs ?? 10_000;
     this.openTimeoutMs = opts.openTimeoutMs ?? 8_000;
     this.log = opts.log ?? ((m) => console.log(`[h264 ${label}] ${m}`));
+    this.kind = opts.kind ?? null;
   }
 
   get running(): boolean {
@@ -312,8 +343,13 @@ export class H264Source {
     if (this.sinks.delete(v)) this.maybeIdle();
   }
 
-  /** The bitrate the helper starts with (the ceiling). */
+  /** The most the encoder goes to (the viewers' targets climb to it). */
   get ceiling(): number {
+    return this.want.maxBitrate ?? this.want.bitrate;
+  }
+
+  /** The bitrate the helper starts with. */
+  get startBps(): number {
     return this.want.bitrate;
   }
 
@@ -324,20 +360,40 @@ export class H264Source {
     this.applyBitrate();
   }
 
-  /** The encoder's bitrate now: the start setting, lowered to what the slowest viewer's link carries. */
+  /**
+   * The encoder's bitrate now: what the slowest viewer's link carries, never above the ceiling; the start setting while
+   * no viewer has a target.
+   */
   bitrateNow(): number {
-    let b = this.want.bitrate;
-    for (const t of this.targets.values()) b = b > 0 ? Math.min(b, t) : t;
-    return Math.round(b);
+    if (!this.targets.size) return Math.round(this.want.bitrate);
+    const cap = this.ceiling;
+    let b = Infinity;
+    for (const t of this.targets.values()) b = Math.min(b, t);
+    return Math.round(cap > 0 ? Math.min(cap, b) : b);
+  }
+
+  /** The frame rate now (a far viewer's lane runs fewer frames on a thin link). */
+  fpsNow(): number {
+    return this.want.adaptFps ? fpsFor(this.bitrateNow(), this.want.fps) : this.want.fps;
   }
 
   private applyBitrate(): void {
-    if (!this.producer?.bitrate) return;
+    const p = this.producer;
+    if (!p) return;
+    if (p.fps && this.want.adaptFps) {
+      const f = this.fpsNow();
+      if (f !== this.appliedFps) {
+        this.log(`frame rate ${f} fps`);
+        this.appliedFps = f;
+        p.fps(f);
+      }
+    }
+    if (!p.bitrate) return;
     const b = this.bitrateNow();
     if (b <= 0 || (this.applied && Math.abs(b - this.applied) < this.applied * 0.03)) return;
     if (!this.applied || Math.abs(b - this.applied) >= this.applied * 0.3) this.log(`bitrate ${(b / 1e6).toFixed(2)} Mbps`);
     this.applied = b;
-    this.producer.bitrate(b);
+    p.bitrate(b);
   }
 
   requestKey(force = false): void {
@@ -370,6 +426,9 @@ export class H264Source {
       path: rtc.map((v) => v.t.path?.() ?? null).find((p) => p) ?? null,
       dropped: [...this.sinks].reduce((n, v) => n + v.dropped, 0),
       bitrate_kbps: this.running && this.applied ? Math.round(this.applied / 1000) : null,
+      fps_target: this.running ? this.appliedFps || this.want.fps : null,
+      scale: this.info?.scale ?? this.want.scale,
+      kind: this.kind,
       width: this.info?.width ?? null,
       height: this.info?.height ?? null,
     };
@@ -378,7 +437,7 @@ export class H264Source {
   private start(): void {
     const gen = ++this.gen;
     this.gotKey = false;
-    this.log(`starting capture (${this.want.fps} fps, ${this.want.scale}%, ${(this.want.bitrate / 1e6).toFixed(1)} Mbps)`);
+    this.log(`starting capture (${this.want.fps} fps, ${this.want.scale}%, ${(this.want.bitrate / 1e6).toFixed(1)} Mbps${this.want.maxBitrate ? ` up to ${(this.want.maxBitrate / 1e6).toFixed(1)}` : ''})`);
     try {
       this.producer = this.startFn(this.want, {
         record: (r) => {
@@ -393,6 +452,7 @@ export class H264Source {
       return;
     }
     this.applied = this.want.bitrate;
+    this.appliedFps = this.want.fps;
     if (this.targets.size) this.applyBitrate();
   }
 
@@ -529,10 +589,15 @@ export class H264Source {
   }
 }
 
-/** Runs the native helper (native/phonecap) and parses its stdout. */
+/** The helper's command line for its first lane (lane 0). */
+export function helperArgs(want: H264Settings): string[] {
+  return ['--fps', String(want.fps), '--scale', String(want.scale), '--bitrate', String(Math.round(want.bitrate)), '--key-seconds', String(want.keySeconds ?? 2)];
+}
+
+/** Runs the native helper (native/phonecap) and parses its stdout (lane 0 only: see src/lanes.ts for lanes). */
 export function helperProducer(bin: string, args: string[], label: string): StartProducer {
   return (want, hooks) => {
-    const full = [...args, '--fps', String(want.fps), '--scale', String(want.scale), '--bitrate', String(want.bitrate)];
+    const full = [...args, ...helperArgs(want)];
     const p: ChildProcess = spawn(bin, full, { stdio: ['pipe', 'pipe', 'pipe'] });
     let done = false;
     const exit = (why: string) => {
@@ -541,7 +606,8 @@ export function helperProducer(bin: string, args: string[], label: string): Star
       hooks.exit(why);
     };
     const tail: string[] = [];
-    const parser = new RecordParser(hooks.record);
+    // an older helper only has lane 0; a lanes helper run this way only gets lane 0 too
+    const parser = new RecordParser((r) => (r.lane ?? 0) === 0 && hooks.record(r));
     p.stdout!.on('data', (c: Buffer) => {
       try {
         parser.push(c);
@@ -577,14 +643,23 @@ export function helperProducer(bin: string, args: string[], label: string): Star
   };
 }
 
-/** GET /phones `stats` for one phone from its H.264 source (if any) and its MJPEG viewers. */
+/**
+ * GET /phones `stats` for one phone from its H.264 source(s) (one per lane) and its MJPEG viewers. The top-level H.264
+ * numbers are the busiest lane's (a far viewer's lane when only it runs); `lanes` has each running one.
+ */
 export function phoneStats(
-  src: H264Source | undefined,
+  src: H264Source | H264Source[] | undefined,
   mjpeg: { fps: number; viewers: number },
   h264Reason: string | null,
+  buildError: string | null = null,
 ): import('./types.js').StreamStats {
-  const h = src?.stats();
-  const h264Viewers = h ? h.viewers_ws + h.viewers_rtc : 0;
+  const all = (Array.isArray(src) ? src : src ? [src] : []).map((s) => s.stats());
+  const busy = all.filter((s) => s.viewers_ws + s.viewers_rtc > 0).sort((a, b) => b.viewers_ws + b.viewers_rtc - (a.viewers_ws + a.viewers_rtc));
+  const h = busy[0] ?? all[0];
+  const sum = (f: (s: (typeof all)[number]) => number) => busy.reduce((n, s) => n + f(s), 0);
+  const viewersWs = sum((s) => s.viewers_ws);
+  const viewersRtc = sum((s) => s.viewers_rtc);
+  const h264Viewers = viewersWs + viewersRtc;
   const codec = h264Viewers ? 'h264' : mjpeg.viewers ? 'mjpeg' : null;
   return {
     codec,
@@ -593,13 +668,25 @@ export function phoneStats(
     capture_to_encoded_ms: h?.capture_to_encoded_ms ?? null,
     encoded_to_sent_ms: h?.encoded_to_sent_ms ?? null,
     viewers: h264Viewers + mjpeg.viewers,
-    viewers_webrtc: h?.viewers_rtc ?? 0,
-    viewers_h264_ws: h?.viewers_ws ?? 0,
+    viewers_webrtc: viewersRtc,
+    viewers_h264_ws: viewersWs,
     viewers_mjpeg: mjpeg.viewers,
-    path: h?.path ?? null,
-    dropped: h?.dropped ?? 0,
+    path: busy.map((s) => s.path).find((p) => p) ?? null,
+    dropped: all.reduce((n, s) => n + s.dropped, 0),
     bitrate_kbps: h?.bitrate_kbps ?? null,
     h264_available: h264Reason === null,
     h264_reason: h264Reason,
+    lanes: busy.map((s) => ({
+      kind: s.kind,
+      fps: s.fps,
+      fps_target: s.fps_target,
+      scale: s.scale,
+      width: s.width,
+      height: s.height,
+      bitrate_kbps: s.bitrate_kbps,
+      viewers: s.viewers_ws + s.viewers_rtc,
+      dropped: s.dropped,
+    })),
+    helper_build_error: buildError,
   };
 }

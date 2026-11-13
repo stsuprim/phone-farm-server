@@ -118,15 +118,27 @@ export function isRemote(remoteAddress: string): boolean {
 const wantNum = (v: unknown, dflt: number, lo: number, hi: number) =>
   typeof v === 'number' && Number.isFinite(v) ? Math.round(Math.min(hi, Math.max(lo, v))) : dflt;
 
-/** The H.264 settings a client asked for (`want` of rtc-offer); `bitrate` (or `kbps`) in kbit/s. */
-export function rtcWant(want: unknown): { fps: number; scale: number; quality: number | null; bitrate: number | null } {
+/**
+ * The H.264 settings a client asked for (`want` of rtc-offer); `bitrate` (or `kbps`) in kbit/s; `full: true` keeps a
+ * far viewer's ask exactly (no far caps, src/lanes.ts).
+ */
+export function rtcWant(want: unknown): { fps: number; scale: number; quality: number | null; bitrate: number | null; full: boolean } {
   const w = (want && typeof want === 'object' ? want : {}) as Record<string, unknown>;
   return {
     fps: wantNum(w.fps, 60, 1, 60),
     scale: wantNum(w.scale, 100, 10, 100),
     quality: typeof w.quality === 'number' && Number.isFinite(w.quality) ? wantNum(w.quality, 50, 1, 100) : null,
     bitrate: bitrateAsk(w.bitrate ?? w.kbps),
+    full: w.full === true || w.full === 1,
   };
+}
+
+/**
+ * A far viewer's send pace (bit/s): keyframe bursts spread over tens of ms instead of leaving in one go, which a long
+ * path's router queues drop. Fixed per session (libdatachannel's PacingHandler); well above the encoder's target.
+ */
+export function paceFor(ceilingBps: number): number {
+  return Math.round(Math.min(8_000_000, Math.max(3_000_000, ceilingBps * 1.5)));
 }
 
 const errText = (err: unknown) => (err instanceof Error ? err.message : String(err));
@@ -174,7 +186,7 @@ export class RtcSession {
     if (this.closed) return;
     if (!ndc) throw new Error(`WebRTC is unavailable on this server (${libError})`);
     const offer = parseOffer(sdp);
-    const want = rtcWant(wantRaw);
+    const want = { ...rtcWant(wantRaw), remote: this.remote };
     this.want = want;
     const src = this.backend.h264(this.udid, want);
     if (typeof src === 'string') throw new Error(src);
@@ -216,6 +228,14 @@ export class RtcSession {
     const packetizer = new ndc.H264RtpPacketizer('StartSequence', rtp, 1200);
     packetizer.addToChain(new ndc.RtcpSrReporter(rtp));
     packetizer.addToChain(new ndc.RtcpNackResponder(512));
+    if (this.remote && process.env.RTC_PACING !== '0' && typeof ndc.PacingHandler === 'function') {
+      // a far viewer: packets paced (5 ms slots) rather than a keyframe's ~50 packets at once
+      try {
+        packetizer.addToChain(new ndc.PacingHandler(paceFor(want.bitrate ?? (src.ceiling || DEFAULT_CEILING_BPS)), 5));
+      } catch (err) {
+        console.error(`[rtc] pacing unavailable: ${errText(err)}`);
+      }
+    }
     track.setMediaHandler(packetizer);
     track.onMessage((m) => this.rtcp(m));
     track.onOpen(() => {
@@ -232,7 +252,7 @@ export class RtcSession {
       (info) => {
         if (this.closed) return;
         this.ready = true;
-        this.signal({ type: 'rtc-hello', codec: 'h264', width: info.width, height: info.height, fps: info.fps, scale: info.scale, server_time: Date.now() });
+        this.signal({ type: 'rtc-hello', codec: 'h264', width: info.width, height: info.height, fps: info.fps, scale: info.scale, lane: src.kind, server_time: Date.now() });
         this.attach();
       },
       (err) => this.fail(errText(err)),
@@ -267,6 +287,7 @@ export class RtcSession {
       path: () => self.path,
     };
     this.viewer = new H264Viewer(transport, this.src);
+    // a far viewer starts low and climbs to its ask (its lane's frame rate follows the bitrate)
     const ceiling = this.want?.bitrate ?? (this.src.ceiling || DEFAULT_CEILING_BPS);
     this.rc = new RateControl(ceiling, this.remote ? Math.min(ceiling, REMOTE_START_BPS) : ceiling);
     this.src.setTarget(this.viewer, this.rc.bps);

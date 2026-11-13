@@ -13,7 +13,12 @@
 
 export const MIN_BPS = 400_000;
 /** Where a viewer that isn't on the Mac's LAN starts; it climbs from here while the link keeps up. */
-export const REMOTE_START_BPS = 2_000_000;
+export const REMOTE_START_BPS = 1_500_000;
+/** A far viewer's ceiling when it asks for no bitrate (its `bitrate` ask is the ceiling otherwise). */
+export const REMOTE_CEILING_BPS = 2_500_000;
+/** A far viewer's lane: at most this frame rate and about this many pixels on the long side (src/lanes.ts). */
+export const REMOTE_MAX_FPS = 30;
+export const REMOTE_LONG_SIDE = 1400;
 export const DEFAULT_CEILING_BPS = 8_000_000;
 
 const clamp = (v: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, v));
@@ -89,6 +94,7 @@ export interface WsFlowOptions {
 /** Ping-based flow control for one WebSocket viewer (see the top of this file). */
 export class WsFlow {
   private sentBytes = 0;
+  private ackedBytes = 0;
   private seq = 0;
   private out: { id: number; bytes: number; t: number }[] = [];
   private lastPing = -Infinity;
@@ -135,6 +141,7 @@ export class WsFlow {
     this.out.splice(0, i + 1);
     const t = this.now();
     this.gotPong = true;
+    this.ackedBytes = Math.max(this.ackedBytes, p.bytes);
     this.rtt = t - p.t;
     this.rtts.push({ t, rtt: this.rtt });
     while (this.rtts.length && (t - this.rtts[0]!.t > 20_000 || this.rtts.length > 600)) this.rtts.shift();
@@ -182,6 +189,24 @@ export class WsFlow {
     if (this.waitingMs() <= this.targetMs) return false;
     if (this.now() - this.lastPing >= 250) this.probe();
     return true;
+  }
+
+  /** Bytes sent that no pong has acknowledged yet (on the way, or waiting in a buffer). */
+  inflight(): number {
+    return this.disabled ? 0 : this.sentBytes - this.ackedBytes;
+  }
+
+  /**
+   * Whether a message of `n` bytes may go now (frames that stand alone, like JPEGs): always when nothing is on the way;
+   * one more right behind a single frame still on its way (so a long link isn't left idle for a round trip after each
+   * frame); otherwise only while the oldest unanswered ping is within the target.
+   */
+  canSend(n: number): boolean {
+    if (this.disabled) return true;
+    const inflight = this.inflight();
+    if (inflight <= 0) return true;
+    if (!this.congested()) return true;
+    return inflight <= Math.max(n, 32 * 1024) && this.waitingMs() <= this.targetMs * 3;
   }
 
   private probe(): void {
