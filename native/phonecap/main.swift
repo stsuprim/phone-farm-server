@@ -636,6 +636,7 @@ final class Encoder {
     let width: Int
     let height: Int
     private let fps: Int
+    private let lowLatency: Bool
     private let statsLock = NSLock()
     private var frames = 0
     private var encSum = 0.0
@@ -667,6 +668,7 @@ final class Encoder {
         if s == nil { s = make(nil) }
         guard let session = s else { return nil }
         self.session = session
+        self.lowLatency = lowLatency
 
         func set(_ key: CFString, _ value: CFTypeRef, optional: Bool = false) {
             let st = VTSessionSetProperty(session, key: key, value: value)
@@ -698,6 +700,15 @@ final class Encoder {
 
     func invalidate() {
         VTCompressionSessionInvalidate(session)
+    }
+
+    /// A new target bitrate while running (the server's congestion control for a slow viewer's link).
+    func setBitrate(_ bps: Int) {
+        let st = VTSessionSetProperty(session, key: kVTCompressionPropertyKey_AverageBitRate, value: bps as CFNumber)
+        if st != noErr { log("bitrate \(bps / 1000) kbps not set (\(st))") }
+        if !lowLatency {
+            _ = VTSessionSetProperty(session, key: kVTCompressionPropertyKey_DataRateLimits, value: [Double(bps) * 1.5 / 8, 1.0] as CFArray)
+        }
     }
 
     func encode(_ pb: CVPixelBuffer, captureMs: Double, forceKey: Bool) {
@@ -790,7 +801,7 @@ final class Capturer: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate {
     let session = AVCaptureSession()
     let queue = DispatchQueue(label: "phonecap.capture", qos: .userInteractive)
     let output = AVCaptureVideoDataOutput()
-    let o: Options
+    var o: Options
     private var encoder: Encoder?
     private var keyWanted = true
     private var lastBuffer: CVPixelBuffer?
@@ -887,6 +898,14 @@ final class Capturer: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate {
             encode(pb, captured: nowMs(), width: CVPixelBufferGetWidth(pb), height: CVPixelBufferGetHeight(pb))
         }
     }
+
+    /// Called on `queue`. A new target bitrate from the server; kept for an encoder made later (a new size) too.
+    func setBitrate(_ bps: Int) {
+        let b = max(200_000, min(50_000_000, bps))
+        if b == o.bitrate { return }
+        o.bitrate = b
+        encoder?.setBitrate(b)
+    }
 }
 
 // MARK: - main
@@ -969,10 +988,16 @@ do {
 
 Thread.detachNewThread {
     while let line = readLine() {
-        switch line.trimmingCharacters(in: .whitespaces) {
+        let cmd = line.trimmingCharacters(in: .whitespaces)
+        switch cmd {
         case "key": capturer.queue.async { capturer.requestKey() }
         case "quit": exit(0)
-        default: break
+        default:
+            // "bitrate <bit/s>": the server's congestion control
+            let parts = cmd.split(separator: " ")
+            if parts.count == 2, parts[0] == "bitrate", let bps = Int(String(parts[1])) {
+                capturer.queue.async { capturer.setBitrate(bps) }
+            }
         }
     }
     exit(0) // stdin closed: the server is gone

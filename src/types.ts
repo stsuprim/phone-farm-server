@@ -39,6 +39,7 @@ export interface StreamStats {
   viewers_mjpeg: number;
   path: string | null; // WebRTC path of a viewer: "lan", "tailscale", "loopback" or "direct" (always host, never relayed)
   dropped: number; // frames dropped by latest-only since the viewers joined
+  bitrate_kbps: number | null; // the encoder's target now (congestion control lowers it for a slow viewer)
   h264_available: boolean;
   h264_reason: string | null; // why H.264 isn't available (helper not built, capture failing...)
 }
@@ -48,6 +49,7 @@ export interface H264Want {
   fps: number;
   scale: number;
   quality: number | null;
+  bitrate?: number | null; // bit/s the client asked for (its `bitrate` in kbit/s); wins over quality
 }
 
 /** Screen size in points plus the scale, as WDA reports it. */

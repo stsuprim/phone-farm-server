@@ -58,3 +58,20 @@ Input, separately (unchanged by the video work):
 - **Over Tailscale or the Internet** add the network round trip; the path is still direct (host candidates only, no relay).
 - **< 100 ms glass-to-glass at 60 fps on the LAN is expected for video**, from these estimates; to be confirmed with the
   client's measurement (`ts` messages + ping/pong offset).
+
+## Far links (Tailscale across countries): congestion control
+
+Measured 2026-11-13, owner's PC in Nepal -> Rinor's Mac mini in the UK over Tailscale (direct, ~178 ms round trip):
+WebRTC ran at the fixed 8 Mbps and the link couldn't carry it (NACKs, lost packets, frames dropped, ~4 fps, then the
+link "dropped" and the client fell back); the H.264 WebSocket then queued seconds of frames in the Mac's TCP send buffer
+(glass-to-glass 3.9-7.3 s at 4-21 fps), and MJPEG did the same. The server now adapts (src/congestion.ts):
+
+- The client's `bitrate` (kbit/s; Lotus sends 4000 for Smooth, 10000 for Sharp) is the ceiling; a viewer from Tailscale or
+  a public address starts at 2 Mbps and climbs 8 %/s while its link keeps up. The shared encoder runs at the lowest
+  viewer target (`phonecap` takes `bitrate <bit/s>` on stdin and changes VideoToolbox's AverageBitRate live).
+- WebSocket viewers (H.264 and MJPEG): a protocol ping follows the frames; the pong's round trip beyond the base is the
+  queue in front of the viewer. Frames are skipped (never queued) while the oldest unanswered ping waited > base + 250 ms,
+  and the bitrate is cut toward the delivered rate when the queue passes 150 ms.
+- WebRTC viewers: loss-based like GCC from the browser's receiver reports and NACKs (> 10 % lost -> cut, < 2 % -> raise);
+  keyframe requests (PLI/FIR) are honoured at most every 500 ms.
+- `GET /phones` stats carry `bitrate_kbps` (the encoder's target now).

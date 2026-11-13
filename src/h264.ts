@@ -7,7 +7,8 @@ import { ChildProcess, spawn } from 'node:child_process';
  *   1 byte kind | 8 bytes capture time (float64 BE, ms since the epoch) | 4 bytes payload length (uint32 BE) | payload
  * Kinds: 0 info (JSON {width, height, fps, scale?}), 1 config (SPS+PPS, Annex B), 2 keyframe (Annex B),
  *        3 delta (Annex B), 4 stats (JSON {encode_ms, capture_to_encoded_ms}).
- * Server -> helper (stdin): "key\n" forces an IDR now, "quit\n" exits.
+ * Server -> helper (stdin): "key\n" forces an IDR now, "bitrate <bit/s>\n" changes the encoder's target (congestion
+ * control; an older helper ignores it), "quit\n" exits.
  *
  * Server -> WebSocket viewer: the same record minus the length: 1 byte kind (1/2/3) | 8 bytes time | payload.
  */
@@ -121,6 +122,8 @@ export interface ProducerHooks {
 export interface Producer {
   key(): void;
   stop(): void;
+  /** A new target bitrate for the running encoder (absent: fixed bitrate). */
+  bitrate?(bps: number): void;
 }
 export type StartProducer = (want: H264Settings, hooks: ProducerHooks) => Producer;
 
@@ -138,6 +141,8 @@ export interface Transport {
   send(r: Rec): void;
   fail(reason: string): void;
   path?(): string | null;
+  /** True while frames sent earlier still wait on the way (flow control): frames are skipped, never queued. */
+  congested?(): boolean;
 }
 
 const DROP_FLOOR = 256 * 1024;
@@ -155,7 +160,7 @@ export class H264Viewer {
 
   private over(): boolean {
     const keySize = this.src.key?.payload.length ?? 0;
-    return this.t.buffered() > Math.max(DROP_FLOOR, keySize * 1.5);
+    return this.t.buffered() > Math.max(DROP_FLOOR, keySize * 1.5) || !!this.t.congested?.();
   }
 
   private ask(): void {
@@ -187,6 +192,7 @@ export class H264Viewer {
     } else if (r.kind === KIND.DELTA) {
       if (this.needKey) {
         this.dropped++;
+        if (!this.over()) this.ask(); // the link has room again: the keyframe now, not at the next interval
         return;
       }
       if (this.over()) {
@@ -241,6 +247,8 @@ export class H264Source {
   private keyPending = false;
   lastError: string | null = null;
   private meter = new RateMeter();
+  private targets = new Map<H264Viewer, number>(); // each viewer's link: the bitrate it carries
+  private applied = 0; // the bitrate the running helper was last given
   private encodeMs: number | null = null;
   private capToEnc: number | null = null;
   private capToSent: number | null = null;
@@ -300,7 +308,36 @@ export class H264Source {
   }
 
   remove(v: H264Viewer): void {
+    if (this.targets.delete(v)) this.applyBitrate();
     if (this.sinks.delete(v)) this.maybeIdle();
+  }
+
+  /** The bitrate the helper starts with (the ceiling). */
+  get ceiling(): number {
+    return this.want.bitrate;
+  }
+
+  /** One viewer's link estimate (null: none). The encoder runs at the lowest one, never above the ceiling. */
+  setTarget(v: H264Viewer, bps: number | null): void {
+    if (bps === null) this.targets.delete(v);
+    else this.targets.set(v, bps);
+    this.applyBitrate();
+  }
+
+  /** The encoder's bitrate now: the start setting, lowered to what the slowest viewer's link carries. */
+  bitrateNow(): number {
+    let b = this.want.bitrate;
+    for (const t of this.targets.values()) b = b > 0 ? Math.min(b, t) : t;
+    return Math.round(b);
+  }
+
+  private applyBitrate(): void {
+    if (!this.producer?.bitrate) return;
+    const b = this.bitrateNow();
+    if (b <= 0 || (this.applied && Math.abs(b - this.applied) < this.applied * 0.03)) return;
+    if (!this.applied || Math.abs(b - this.applied) >= this.applied * 0.3) this.log(`bitrate ${(b / 1e6).toFixed(2)} Mbps`);
+    this.applied = b;
+    this.producer.bitrate(b);
   }
 
   requestKey(force = false): void {
@@ -332,6 +369,7 @@ export class H264Source {
       viewers_rtc: rtc.length,
       path: rtc.map((v) => v.t.path?.() ?? null).find((p) => p) ?? null,
       dropped: [...this.sinks].reduce((n, v) => n + v.dropped, 0),
+      bitrate_kbps: this.running && this.applied ? Math.round(this.applied / 1000) : null,
       width: this.info?.width ?? null,
       height: this.info?.height ?? null,
     };
@@ -352,7 +390,10 @@ export class H264Source {
       });
     } catch (err) {
       this.onExit((err as Error).message);
+      return;
     }
+    this.applied = this.want.bitrate;
+    if (this.targets.size) this.applyBitrate();
   }
 
   private onRecord(r: Rec): void {
@@ -523,6 +564,9 @@ export function helperProducer(bin: string, args: string[], label: string): Star
       key: () => {
         if (p.stdin!.writable) p.stdin!.write('key\n');
       },
+      bitrate: (bps) => {
+        if (p.stdin!.writable) p.stdin!.write(`bitrate ${Math.round(bps)}\n`);
+      },
       stop: () => {
         done = true;
         if (p.stdin!.writable) p.stdin!.write('quit\n');
@@ -554,6 +598,7 @@ export function phoneStats(
     viewers_mjpeg: mjpeg.viewers,
     path: h?.path ?? null,
     dropped: h?.dropped ?? 0,
+    bitrate_kbps: h?.bitrate_kbps ?? null,
     h264_available: h264Reason === null,
     h264_reason: h264Reason,
   };

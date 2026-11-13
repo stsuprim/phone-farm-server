@@ -1,4 +1,5 @@
 import type NdcModule from 'node-datachannel';
+import { bitrateAsk, DEFAULT_CEILING_BPS, parseRtcp, RateControl, REMOTE_START_BPS } from './congestion.js';
 import type { Control } from './control.js';
 import { H264Settings, H264Source, H264Viewer, KIND, Rec, Transport } from './h264.js';
 import { Backend, HttpError } from './types.js';
@@ -107,16 +108,24 @@ export function pathKind(remoteAddress: string): string {
   return /^127\.|^::1$/.test(a) ? 'loopback' : isTailscale(a) ? 'tailscale' : isPrivate(a) ? 'lan' : 'direct';
 }
 
+/** True for a client that isn't on the Mac's LAN (Tailscale or the Internet): it starts at a lower bitrate. */
+export function isRemote(remoteAddress: string): boolean {
+  if (!remoteAddress) return false;
+  const k = pathKind(remoteAddress);
+  return k === 'tailscale' || k === 'direct';
+}
+
 const wantNum = (v: unknown, dflt: number, lo: number, hi: number) =>
   typeof v === 'number' && Number.isFinite(v) ? Math.round(Math.min(hi, Math.max(lo, v))) : dflt;
 
-/** The H.264 settings a client asked for (`want` of rtc-offer). */
-export function rtcWant(want: unknown): { fps: number; scale: number; quality: number | null } {
+/** The H.264 settings a client asked for (`want` of rtc-offer); `bitrate` (or `kbps`) in kbit/s. */
+export function rtcWant(want: unknown): { fps: number; scale: number; quality: number | null; bitrate: number | null } {
   const w = (want && typeof want === 'object' ? want : {}) as Record<string, unknown>;
   return {
     fps: wantNum(w.fps, 60, 1, 60),
     scale: wantNum(w.scale, 100, 10, 100),
     quality: typeof w.quality === 'number' && Number.isFinite(w.quality) ? wantNum(w.quality, 50, 1, 100) : null,
+    bitrate: bitrateAsk(w.bitrate ?? w.kbps),
   };
 }
 
@@ -143,12 +152,21 @@ export class RtcSession {
   private lastMoveT = -1;
   private inputR?: DataChannel;
   private lastTsMsg = 0;
+  // congestion control (libdatachannel has none): the browser's loss reports and NACKs set the bitrate
+  private rc?: RateControl;
+  private ccTimer?: NodeJS.Timeout;
+  private packets = 0; // RTP packets sent since the last tick (estimated from the frame sizes)
+  private nacked = 0; // packets the browser asked again since the last tick
+  private reportLoss: number | null = null; // the highest fraction lost in its receiver reports since the last tick
+  private lastKeyAsk = 0;
+  private want?: { bitrate: number | null };
 
   constructor(
     private backend: Backend,
     private control: Control,
     private udid: string,
     private signal: (msg: Record<string, unknown>) => void,
+    private remote = false,
   ) {}
 
   async start(sdp: string, wantRaw: unknown): Promise<void> {
@@ -157,6 +175,7 @@ export class RtcSession {
     if (!ndc) throw new Error(`WebRTC is unavailable on this server (${libError})`);
     const offer = parseOffer(sdp);
     const want = rtcWant(wantRaw);
+    this.want = want;
     const src = this.backend.h264(this.udid, want);
     if (typeof src === 'string') throw new Error(src);
     this.src = src;
@@ -198,9 +217,7 @@ export class RtcSession {
     packetizer.addToChain(new ndc.RtcpSrReporter(rtp));
     packetizer.addToChain(new ndc.RtcpNackResponder(512));
     track.setMediaHandler(packetizer);
-    track.onMessage((m) => {
-      if (rtcpWantsKey(m)) this.viewer?.forceKey();
-    });
+    track.onMessage((m) => this.rtcp(m));
     track.onOpen(() => {
       this.trackOpen = true;
       this.attach();
@@ -250,7 +267,47 @@ export class RtcSession {
       path: () => self.path,
     };
     this.viewer = new H264Viewer(transport, this.src);
+    const ceiling = this.want?.bitrate ?? (this.src.ceiling || DEFAULT_CEILING_BPS);
+    this.rc = new RateControl(ceiling, this.remote ? Math.min(ceiling, REMOTE_START_BPS) : ceiling);
+    this.src.setTarget(this.viewer, this.rc.bps);
     this.src.add(this.viewer);
+    this.ccTimer = setInterval(() => this.ccTick(), 1000);
+  }
+
+  /** RTCP from the browser: keyframe asks (at most one per 500 ms: a lossy link sends many), loss and NACKs. */
+  private rtcp(m: Buffer): void {
+    let info;
+    try {
+      info = parseRtcp(m);
+    } catch {
+      return;
+    }
+    if (info.wantsKey) {
+      const now = Date.now();
+      if (now - this.lastKeyAsk >= 500) {
+        this.lastKeyAsk = now;
+        this.viewer?.forceKey();
+      }
+    }
+    this.nacked += info.nacked;
+    if (info.fractionLost !== null) this.reportLoss = Math.max(this.reportLoss ?? 0, info.fractionLost);
+  }
+
+  /**
+   * Once a second, loss-based like WebRTC's own (GCC): more than 10 % lost -> bitrate x (1 - loss/2); under 2 % -> up
+   * slowly; between: hold. (REMB isn't used: a browser's receive-side estimate starts low and ramps.)
+   */
+  private ccTick(): void {
+    if (!this.rc || !this.viewer || !this.src || this.closed) return;
+    const byNack = this.packets > 0 ? Math.min(1, this.nacked / this.packets) : 0;
+    const loss = Math.max(byNack, this.reportLoss ?? 0);
+    const sent = this.packets;
+    this.packets = this.nacked = 0;
+    this.reportLoss = null;
+    let changed = false;
+    if (sent >= 10 && loss > 0.1) changed = this.rc.down(Math.max(0.5, 1 - loss / 2), null, 900);
+    else if (loss < 0.02) changed = this.rc.up();
+    if (changed) this.src.setTarget(this.viewer, this.rc.bps);
   }
 
   /** Config is held and sent with the next keyframe as one access unit (same RTP timestamp, marker on the last NAL). */
@@ -271,6 +328,7 @@ export class RtcSession {
     if (ts <= this.lastTs) ts = this.lastTs + 1;
     this.lastTs = ts;
     this.rtp.timestamp = (this.tsBase + ts) >>> 0;
+    this.packets += Math.ceil(data.length / 1188);
     try {
       this.track.sendMessageBinary(data);
     } catch (err) {
@@ -352,6 +410,7 @@ export class RtcSession {
   close(_why = 'closed'): void {
     if (this.closed) return;
     this.closed = true;
+    if (this.ccTimer) clearInterval(this.ccTimer);
     if (this.viewer) this.src?.remove(this.viewer);
     this.viewer = undefined;
     this.control.release(this);
@@ -369,7 +428,7 @@ export class RtcSession {
 }
 
 /** Handles the rtc-* messages of one control socket. Returns true if the message was a signaling message. */
-export function rtcSignaling(backend: Backend, control: Control, udid: string, send: (m: Record<string, unknown>) => void) {
+export function rtcSignaling(backend: Backend, control: Control, udid: string, send: (m: Record<string, unknown>) => void, remote = false) {
   let session: RtcSession | undefined;
   return {
     handle(msg: Record<string, unknown>): boolean {
@@ -380,7 +439,7 @@ export function rtcSignaling(backend: Backend, control: Control, udid: string, s
             send({ type: 'rtc-error', reason: '"sdp" must be a string' });
             return true;
           }
-          const s = new RtcSession(backend, control, udid, send);
+          const s = new RtcSession(backend, control, udid, send, remote);
           session = s;
           s.start(msg.sdp, msg.want).catch((err) => {
             send({ type: 'rtc-error', reason: errText(err) });

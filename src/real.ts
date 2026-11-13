@@ -125,7 +125,7 @@ export class RealBackend implements Backend {
     const p = this.known(udid);
     const problem = this.helperProblem();
     if (problem) return problem;
-    const settings = { fps: want.fps, scale: want.scale, bitrate: bitrateFor(want.quality, this.cfg.h264BitrateMbps * 1_000_000) };
+    const settings = { fps: want.fps, scale: want.scale, bitrate: want.bitrate ?? bitrateFor(want.quality, this.cfg.h264BitrateMbps * 1_000_000) };
     let src = this.h264Sources.get(udid);
     if (!src) {
       const online = [...this.phones.values()].filter((x) => x.online).length;
