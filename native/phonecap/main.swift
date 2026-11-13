@@ -11,7 +11,9 @@
 //          4 stats JSON {encode_ms, capture_to_encoded_ms, fps}
 // stdin: "key" forces an IDR now (re-encoding the current screen if nothing new arrived), "quit" exits.
 // stderr: human-readable log lines. Exit codes: 2 no device, 3 camera access denied, 4 capture failed,
-//          5 device disconnected, 6 encoder failed.
+//          5 device disconnected, 6 encoder failed, 7 several iPhones share a name and can't be told apart.
+// --udid: macOS 27 gives iPhone screens random UUIDs, so phonecap links them to UDIDs itself (see "UDID -> screen
+//          device mapping"); --list prints each capture device's uniqueID, name, UDID (or "unresolved") and how.
 //
 // Build: scripts/build-native.mjs (npm run build): swiftc, then wraps it in build/PhoneCap.app and signs the bundle.
 
@@ -20,6 +22,7 @@ import CoreMedia
 import CoreMediaIO
 import CoreVideo
 import Foundation
+import IOKit
 import VideoToolbox
 
 signal(SIGPIPE, SIG_IGN)
@@ -143,22 +146,371 @@ func isPhoneScreen(_ d: AVCaptureDevice) -> Bool {
 
 func hexOnly(_ s: String) -> String { s.lowercased().filter { $0.isHexDigit } }
 
-func pickDevice(_ o: Options) -> AVCaptureDevice? {
-    let all = captureDevices()
-    let want = hexOnly(o.udid)
-    if want.count >= 8 {
-        if let d = all.first(where: {
-            let u = hexOnly($0.uniqueID)
-            return u.count >= 8 && (u == want || u.contains(want) || want.contains(u))
-        }) { return d }
-    }
-    if !o.name.isEmpty, let d = all.first(where: { isPhoneScreen($0) && $0.localizedName == o.name }) { return d }
-    let phones = all.filter(isPhoneScreen)
-    if o.anyIfSingle && phones.count == 1 {
-        log("no device matched the UDID or name; using the only iPhone screen found (\(phones[0].localizedName))")
-        return phones[0]
+var loggedOnce = Set<String>()
+func logOnce(_ s: String) {
+    if loggedOnce.insert(s).inserted { log(s) }
+}
+
+// MARK: - UDID -> screen device mapping
+//
+// Since macOS 27 the iPhone screen devices' uniqueIDs are random UUIDs, not the UDID, so phonecap links each screen
+// device to a UDID itself, strongest first:
+//   1. a direct link: the UDID (or the USB serial, which is the UDID without its dash) is in the device's uniqueID or
+//      in one of its CoreMediaIO strings (model UID, linked CoreAudio device UIDs, name, manufacturer); or the
+//      iPhone's IOKit USB entry (found by that serial) or anything under it names the screen's uniqueID or USB location;
+//   2. the name: `ideviceinfo -u <udid> -k DeviceName` against the screen device's name, only when exactly one
+//      unlinked screen and exactly one unlinked connected iPhone (`idevice_id -l`) carry that name (so a phone whose
+//      twin is linked another way is still found, by elimination); without libimobiledevice, the server's --name;
+//   3. --any-if-single: the only iPhone screen, if nothing links it to another iPhone.
+// Several iPhones with the same name and no link: an `error:` line asking for unique names (exit 7), never a guess.
+
+struct UDIDLink {
+    let udid: String
+    let how: String
+}
+
+struct ScreenMap {
+    var byUDID: [String: AVCaptureDevice] = [:]    // hexOnly(UDID) -> screen device
+    var byDevice: [String: UDIDLink] = [:]             // screen uniqueID -> UDID and how it was linked
+    var ambiguous: [String: (message: String, settled: Bool)] = [:] // hexOnly(UDID) -> why it can't be told apart
+    var names: [String: String] = [:]              // UDID -> DeviceName (ideviceinfo)
+    var udids: [String] = []                       // iPhones connected over USB
+    var listed = false                             // udids came from idevice_id -l
+}
+
+/// The path of a command-line tool, looked up in PATH and Homebrew's folders (launchd's PATH is short).
+func findTool(_ name: String) -> String? {
+    let path = ProcessInfo.processInfo.environment["PATH"] ?? ""
+    let dirs = path.split(separator: ":").map(String.init) + ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin"]
+    for d in dirs where !d.isEmpty {
+        let p = d.hasSuffix("/") ? d + name : d + "/" + name
+        if FileManager.default.isExecutableFile(atPath: p) { return p }
     }
     return nil
+}
+
+/// Runs a tool (stdin closed, stderr dropped, killed after `timeout` seconds); its trimmed stdout, or nil if it failed.
+func runTool(_ name: String, _ args: [String], timeout: Double = 5) -> String? {
+    guard let path = findTool(name) else { return nil }
+    let p = Process()
+    p.executableURL = URL(fileURLWithPath: path)
+    p.arguments = args
+    let out = Pipe()
+    p.standardOutput = out
+    p.standardError = FileHandle.nullDevice
+    p.standardInput = FileHandle.nullDevice
+    let exited = DispatchSemaphore(value: 0)
+    p.terminationHandler = { _ in exited.signal() }
+    do { try p.run() } catch { return nil }
+    let killer = DispatchWorkItem { if p.isRunning { p.terminate() } }
+    DispatchQueue.global().asyncAfter(deadline: .now() + timeout, execute: killer)
+    let data = out.fileHandleForReading.readDataToEndOfFile()
+    killer.cancel()
+    guard exited.wait(timeout: .now() + 2) == .success, p.terminationReason == .exit, p.terminationStatus == 0 else {
+        return nil
+    }
+    return String(decoding: data, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
+}
+
+/// iPhones' DeviceNames from ideviceinfo, asked in parallel, kept for this run (a failed one is asked again after 3 s).
+final class NameBook: @unchecked Sendable {
+    private let lock = NSLock()
+    private var known: [String: String] = [:]
+    private var failedAt: [String: Date] = [:]
+
+    func names(for udids: [String]) -> [String: String] {
+        lock.lock()
+        let todo = udids.filter { u in
+            known[u] == nil && (failedAt[u].map { Date().timeIntervalSince($0) > 3 } ?? true)
+        }
+        lock.unlock()
+        if !todo.isEmpty {
+            DispatchQueue.concurrentPerform(iterations: todo.count) { i in
+                let u = todo[i]
+                let name = runTool("ideviceinfo", ["-u", u, "-k", "DeviceName"]) ?? ""
+                self.lock.lock()
+                if name.isEmpty { self.failedAt[u] = Date() } else { self.known[u] = name }
+                self.lock.unlock()
+            }
+        }
+        lock.lock()
+        defer { lock.unlock() }
+        var out: [String: String] = [:]
+        for u in udids { if let n = known[u] { out[u] = n } }
+        return out
+    }
+}
+
+let nameBook = NameBook()
+var udidListAt = Date.distantPast
+var udidListCache: [String]?
+
+/// UDIDs of the iPhones connected over USB (`idevice_id -l`, refreshed every 2 s), or nil without libimobiledevice.
+func connectedUDIDs() -> [String]? {
+    if Date().timeIntervalSince(udidListAt) < 2 { return udidListCache }
+    var list: [String]?
+    if let out = runTool("idevice_id", ["-l"]) {
+        var seen = Set<String>()
+        list = out.components(separatedBy: .whitespacesAndNewlines)
+            .filter { hexOnly($0).count >= 24 && seen.insert(hexOnly($0)).inserted }
+    }
+    udidListAt = Date()
+    udidListCache = list
+    return list
+}
+
+// CoreMediaIO, by FourCC (the raw codes, so no SDK rename can break the build)
+
+func fourcc(_ s: String) -> UInt32 { s.utf8.reduce(UInt32(0)) { ($0 << 8) | UInt32($1) } }
+
+func cmioAddress(_ selector: UInt32) -> CMIOObjectPropertyAddress {
+    CMIOObjectPropertyAddress(
+        mSelector: CMIOObjectPropertySelector(selector),
+        mScope: CMIOObjectPropertyScope(kCMIOObjectPropertyScopeGlobal),
+        mElement: CMIOObjectPropertyElement(0)) // kCMIOObjectPropertyElementMain
+}
+
+func cmioDeviceIDs() -> [CMIOObjectID] {
+    let system = CMIOObjectID(kCMIOObjectSystemObject)
+    var addr = cmioAddress(fourcc("dev#")) // kCMIOHardwarePropertyDevices
+    var size: UInt32 = 0
+    guard CMIOObjectGetPropertyDataSize(system, &addr, 0, nil, &size) == 0 else { return [] }
+    let count = Int(size) / MemoryLayout<CMIOObjectID>.size
+    guard count > 0 else { return [] }
+    var ids = [CMIOObjectID](repeating: 0, count: count)
+    var used: UInt32 = 0
+    let st = ids.withUnsafeMutableBytes { buf in
+        CMIOObjectGetPropertyData(system, &addr, 0, nil, UInt32(buf.count), &used, buf.baseAddress)
+    }
+    guard st == 0 else { return [] }
+    return Array(ids.prefix(Int(used) / MemoryLayout<CMIOObjectID>.size))
+}
+
+/// A CFString property of a CoreMediaIO object (only call it with selectors whose data is a CFString).
+func cmioString(_ obj: CMIOObjectID, _ selector: UInt32) -> String? {
+    var addr = cmioAddress(selector)
+    var size: UInt32 = 0
+    guard CMIOObjectGetPropertyDataSize(obj, &addr, 0, nil, &size) == 0,
+          Int(size) == MemoryLayout<Unmanaged<CFString>>.size else { return nil }
+    var value: Unmanaged<CFString>?
+    var used: UInt32 = 0
+    let st = withUnsafeMutablePointer(to: &value) { p in
+        CMIOObjectGetPropertyData(obj, &addr, 0, nil, size, &used, p)
+    }
+    guard st == 0, let v = value else { return nil }
+    return v.takeRetainedValue() as String
+}
+
+let cmioStringProps: [(code: String, label: String)] = [
+    ("uid ", "device UID"), ("muid", "model UID"), ("plud", "linked CoreAudio UID"),
+    ("plsd", "linked synced CoreAudio UID"), ("lnam", "name"), ("lmak", "manufacturer"),
+]
+
+/// Each CoreMediaIO device's strings, by its device UID (the same as AVCaptureDevice.uniqueID).
+func cmioStrings() -> [String: [String: String]] {
+    var out: [String: [String: String]] = [:]
+    for id in cmioDeviceIDs() {
+        var props: [String: String] = [:]
+        for p in cmioStringProps {
+            if let v = cmioString(id, fourcc(p.code)), !v.isEmpty { props[p.label] = v }
+        }
+        if let uid = props["device UID"] { out[uid] = props }
+    }
+    return out
+}
+
+// IOKit: Apple's USB devices (iPhones), their serial (the UDID) and every string in their registry subtree
+
+struct USBPhone {
+    let serial: String
+    let location: UInt32
+    let strings: [String]
+}
+
+func collectStrings(_ v: Any, into out: inout [String]) {
+    if let s = v as? String {
+        out.append(s)
+    } else if let a = v as? [Any] {
+        for x in a { collectStrings(x, into: &out) }
+    } else if let d = v as? [String: Any] {
+        for x in d.values { collectStrings(x, into: &out) }
+    }
+}
+
+func registryProperty(_ e: io_registry_entry_t, _ key: String) -> AnyObject? {
+    IORegistryEntryCreateCFProperty(e, key as CFString, kCFAllocatorDefault, 0)?.takeRetainedValue()
+}
+
+func registryStrings(_ e: io_registry_entry_t, into out: inout [String]) {
+    var props: Unmanaged<CFMutableDictionary>?
+    guard IORegistryEntryCreateCFProperties(e, &props, kCFAllocatorDefault, 0) == KERN_SUCCESS,
+          let cf = props?.takeRetainedValue() else { return }
+    let obj: AnyObject = cf
+    if let dict = obj as? [String: Any] { collectStrings(dict, into: &out) }
+}
+
+func usbApplePhones() -> [USBPhone] {
+    var out: [USBPhone] = []
+    var iter: io_iterator_t = 0
+    // 0 is MACH_PORT_NULL: the default main port on every macOS version
+    guard IOServiceGetMatchingServices(0, IOServiceMatching("IOUSBHostDevice"), &iter) == KERN_SUCCESS else { return [] }
+    defer { IOObjectRelease(iter) }
+    while true {
+        let dev = IOIteratorNext(iter)
+        if dev == 0 { break }
+        defer { IOObjectRelease(dev) }
+        guard (registryProperty(dev, "idVendor") as? NSNumber)?.intValue == 0x05AC else { continue }
+        let serial = (registryProperty(dev, "USB Serial Number") as? String)
+            ?? (registryProperty(dev, "kUSBSerialNumberString") as? String) ?? ""
+        guard hexOnly(serial).count >= 24 else { continue }
+        let location = (registryProperty(dev, "locationID") as? NSNumber)?.uint32Value ?? 0
+        var strings: [String] = []
+        registryStrings(dev, into: &strings)
+        var children: io_iterator_t = 0
+        if IORegistryEntryCreateIterator(dev, kIOServicePlane, IOOptionBits(kIORegistryIterateRecursively), &children) == KERN_SUCCESS {
+            while true {
+                let c = IOIteratorNext(children)
+                if c == 0 { break }
+                registryStrings(c, into: &strings)
+                IOObjectRelease(c)
+            }
+            IOObjectRelease(children)
+        }
+        out.append(USBPhone(serial: serial, location: location, strings: strings))
+    }
+    return out
+}
+
+/// A UDID from a USB serial: 24 hex digits are a newer iPhone's UDID without its dash (00008110-001A...), 40 an older one's.
+func udidFromSerial(_ serial: String) -> String {
+    let h = hexOnly(serial)
+    if h.count == 24 { return (String(h.prefix(8)) + "-" + String(h.dropFirst(8))).uppercased() }
+    return h
+}
+
+struct NameGroup {
+    var phones: [AVCaptureDevice] = []
+    var udids: [String] = []
+}
+
+/// Links the iPhone screen devices to the connected iPhones' UDIDs. `want` (a UDID, may be empty) is always counted as
+/// connected; `wantName` is its name if ideviceinfo can't say; `allNames` asks every iPhone's name (for --list).
+func resolve(_ devices: [AVCaptureDevice], want: String, wantName: String, allNames: Bool = false) -> ScreenMap {
+    var r = ScreenMap()
+    let phones = devices.filter(isPhoneScreen)
+    let listed = connectedUDIDs()
+    r.listed = listed != nil
+    var udids = listed ?? []
+    if !want.isEmpty && !udids.contains(where: { hexOnly($0) == hexOnly(want) }) { udids.append(want) }
+
+    // 1. direct links
+    let cmio = cmioStrings()
+    let usb = usbApplePhones()
+    if !r.listed {
+        // no idevice_id: every Apple USB device with a UDID-like serial counts as connected
+        for p in usb where !udids.contains(where: { hexOnly($0) == hexOnly(p.serial) }) { udids.append(udidFromSerial(p.serial)) }
+    }
+    r.udids = udids
+    var linkOf: [String: UDIDLink] = [:]
+    var screensOf: [String: [AVCaptureDevice]] = [:]
+    for d in phones {
+        let id = hexOnly(d.uniqueID)
+        let uidLower = d.uniqueID.lowercased()
+        let strings = (cmio[d.uniqueID] ?? [:]).filter { $0.key != "device UID" }
+        var found: [UDIDLink] = []
+        for u in udids {
+            let key = hexOnly(u)
+            guard key.count >= 24 else { continue }
+            if id.count >= 8 && (id == key || id.contains(key) || key.contains(id)) {
+                found.append(UDIDLink(udid: u, how: "uniqueID"))
+            } else if let hit = strings.first(where: { hexOnly($0.value).contains(key) }) {
+                found.append(UDIDLink(udid: u, how: "CoreMediaIO \(hit.key)"))
+            } else if let p = usb.first(where: { hexOnly($0.serial) == key }) {
+                if p.strings.contains(where: { $0.lowercased().contains(uidLower) }) {
+                    found.append(UDIDLink(udid: u, how: "IOKit USB entry"))
+                } else if p.location != 0 && id.contains(String(p.location, radix: 16) + "05ac") {
+                    found.append(UDIDLink(udid: u, how: "USB location"))
+                }
+            }
+        }
+        let distinct = Set(found.map { hexOnly($0.udid) })
+        if distinct.count == 1 {
+            linkOf[d.uniqueID] = found[0]
+            screensOf[hexOnly(found[0].udid), default: []].append(d)
+        } else if distinct.count > 1 {
+            logOnce("screen \(d.uniqueID) links to several iPhones (\(found.map { $0.udid }.joined(separator: ", "))); not using those links")
+        }
+    }
+    for (key, ds) in screensOf {
+        if ds.count == 1 {
+            r.byUDID[key] = ds[0]
+            r.byDevice[ds[0].uniqueID] = linkOf[ds[0].uniqueID]
+        } else {
+            logOnce("several screens link to the same iPhone (\(ds.map { $0.uniqueID }.joined(separator: ", "))); not using those links")
+        }
+    }
+
+    // 2. names, among what is still unlinked
+    let openUDIDs = udids.filter { r.byUDID[hexOnly($0)] == nil }
+    let openPhones = phones.filter { r.byDevice[$0.uniqueID] == nil }
+    guard !openUDIDs.isEmpty && !openPhones.isEmpty else {
+        if allNames { r.names = nameBook.names(for: udids) }
+        return r
+    }
+    var names = nameBook.names(for: allNames ? udids : openUDIDs)
+    if !want.isEmpty && !wantName.isEmpty, let w = udids.first(where: { hexOnly($0) == hexOnly(want) }), names[w] == nil {
+        names[w] = wantName
+    }
+    r.names = names
+    var groups: [String: NameGroup] = [:]
+    for d in openPhones { groups[d.localizedName, default: NameGroup()].phones.append(d) }
+    for u in openUDIDs { if let n = names[u] { groups[n, default: NameGroup()].udids.append(u) } }
+    for (name, g) in groups where !g.udids.isEmpty && !g.phones.isEmpty {
+        if g.phones.count == 1 && g.udids.count == 1 {
+            let u = g.udids[0]
+            let d = g.phones[0]
+            r.byUDID[hexOnly(u)] = d
+            r.byDevice[d.uniqueID] = UDIDLink(udid: u, how: r.listed ? "name (ideviceinfo)" : "name (no idevice_id)")
+        } else {
+            let n = max(g.phones.count, g.udids.count)
+            let message = "\(n) iPhones are named \"\(name)\" (\(g.udids.joined(separator: ", "))) and macOS gives their "
+                + "screen devices random IDs, so phonecap can't tell which screen is which. Give each iPhone a unique name "
+                + "(on the iPhone: Settings > General > About > Name), then unplug and replug it"
+            for u in g.udids { r.ambiguous[hexOnly(u)] = (message: message, settled: g.phones.count >= g.udids.count) }
+        }
+    }
+    return r
+}
+
+enum Pick {
+    case found(AVCaptureDevice, String)
+    case ambiguous(String, settled: Bool)
+    case notYet
+}
+
+func pickDevice(_ o: Options) -> Pick {
+    let all = captureDevices()
+    let phones = all.filter(isPhoneScreen)
+    var linkedElsewhere = Set<String>()
+    if !o.udid.isEmpty {
+        let r = resolve(all, want: o.udid, wantName: o.name)
+        let key = hexOnly(o.udid)
+        if let d = r.byUDID[key] { return .found(d, r.byDevice[d.uniqueID]?.how ?? "link") }
+        if let a = r.ambiguous[key] { return .ambiguous(a.message, settled: a.settled) }
+        linkedElsewhere = Set(r.byDevice.keys)
+    } else if !o.name.isEmpty {
+        let same = phones.filter { $0.localizedName == o.name }
+        if same.count == 1 { return .found(same[0], "--name") }
+        if same.count > 1 {
+            return .ambiguous("\(same.count) iPhone screens are named \"\(o.name)\", so phonecap can't tell which one to "
+                + "use. Give each iPhone a unique name (on the iPhone: Settings > General > About > Name), then unplug and "
+                + "replug it", settled: true)
+        }
+    }
+    if o.anyIfSingle && phones.count == 1 && !linkedElsewhere.contains(phones[0].uniqueID) {
+        return .found(phones[0], "the only iPhone screen (--any-if-single)")
+    }
+    return .notYet
 }
 
 func spin(_ seconds: Double) {
@@ -548,24 +900,64 @@ ensureCameraAccess()
 
 if opts.list {
     spin(3)
-    for d in captureDevices() {
-        print("\(d.uniqueID)\t\(d.modelID)\t\(d.localizedName)\t\(isPhoneScreen(d) ? "iphone-screen" : "")")
+    let all = captureDevices()
+    let map = resolve(all, want: opts.udid, wantName: opts.name, allNames: true)
+    if !map.listed { log("idevice_id (libimobiledevice) not found or failed: UDIDs come from the USB serials only") }
+    for u in map.udids {
+        let screen = map.byUDID[hexOnly(u)].map { "screen \($0.uniqueID)" } ?? "no screen linked"
+        log("iPhone \(u) named \"\(map.names[u] ?? "?")\": \(screen)")
     }
+    let cmio = cmioStrings()
+    for d in all where isPhoneScreen(d) {
+        let props = (cmio[d.uniqueID] ?? [:]).sorted { $0.key < $1.key }.map { "\($0.key)=\($0.value)" }
+        log("screen \(d.uniqueID) CoreMediaIO: \(props.isEmpty ? "none" : props.joined(separator: ", "))")
+    }
+    for p in usbApplePhones() {
+        log("USB Apple device serial \(p.serial) locationID 0x\(String(p.location, radix: 16)) (\(p.strings.count) registry strings)")
+    }
+    print("uniqueID\tname\tudid\thow\tkind")
+    for d in all {
+        let hit = map.byDevice[d.uniqueID]
+        let how = hit?.how ?? (isPhoneScreen(d) ? "no link" : "not an iPhone screen")
+        let kind = isPhoneScreen(d) ? "iphone-screen" : d.modelID
+        print("\(d.uniqueID)\t\(d.localizedName)\t\(hit?.udid ?? "unresolved")\t\(how)\t\(kind)")
+    }
+    var shown = Set<String>()
+    for a in map.ambiguous.values where shown.insert(a.message).inserted { log("error: \(a.message)") }
     exit(0)
 }
 
 // screen-capture devices show up a moment after they're allowed
 var device: AVCaptureDevice?
+var linkedBy = ""
+var sameName: String?
 let deadline = Date().addingTimeInterval(opts.waitSeconds)
 while device == nil && Date() < deadline {
-    device = pickDevice(opts)
-    if device == nil { spin(0.25) }
+    switch pickDevice(opts) {
+    case .found(let d, let how):
+        device = d
+        linkedBy = how
+    case .ambiguous(let message, let settled):
+        if settled {
+            log("error: \(message)")
+            exit(7)
+        }
+        sameName = message // a same-named iPhone's screen may still show up: wait, then say so
+        spin(0.25)
+    case .notYet:
+        spin(0.25)
+    }
 }
 guard let phone = device else {
+    if let message = sameName {
+        log("error: \(message)")
+        exit(7)
+    }
     let names = captureDevices().map { "\($0.localizedName) [\($0.uniqueID)]" }.joined(separator: ", ")
     log("no screen capture device for this iPhone (is it unlocked and trusted? found: \(names.isEmpty ? "none" : names))")
     exit(2)
 }
+log("screen for \(opts.udid.isEmpty ? opts.name : opts.udid): \(phone.localizedName) [\(phone.uniqueID)], linked by \(linkedBy)")
 
 let capturer = Capturer(opts)
 do {
