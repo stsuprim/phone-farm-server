@@ -163,6 +163,8 @@ export interface Transport {
   send(r: Rec): void;
   fail(reason: string): void;
   path?(): string | null;
+  /** WebRTC: the round trip from the receiver reports, its base and the queue beyond it (ms). */
+  net?(): { rtt_ms: number | null; base_rtt_ms: number | null; queue_ms: number | null };
   /** True while frames sent earlier still wait on the way (flow control): frames are skipped, never queued. */
   congested?(): boolean;
   /** Bytes waiting in the socket that count as backed up (default 256 KB; small for a far viewer). */
@@ -254,6 +256,17 @@ export interface SourceOptions {
   log?: (m: string) => void;
   /** Whose lane this is: "lan" (full settings) or "remote" (a far viewer's), for the stats. */
   kind?: 'lan' | 'remote';
+}
+
+/** A lane's network numbers: its WebRTC viewers' longest round trip and queue (the worst one counts). */
+function netOf(list: ({ rtt_ms: number | null; queue_ms: number | null } | null)[]): { rtt_ms: number | null; queue_ms: number | null } {
+  let rtt: number | null = null;
+  let queue: number | null = null;
+  for (const n of list) {
+    if (n?.rtt_ms != null) rtt = Math.max(rtt ?? 0, n.rtt_ms);
+    if (n?.queue_ms != null) queue = Math.max(queue ?? 0, n.queue_ms);
+  }
+  return { rtt_ms: rtt, queue_ms: queue };
 }
 
 /** One capture helper per phone, started on demand, shared, restarted with backoff, stopped when idle. */
@@ -424,6 +437,7 @@ export class H264Source {
       viewers_ws: ws,
       viewers_rtc: rtc.length,
       path: rtc.map((v) => v.t.path?.() ?? null).find((p) => p) ?? null,
+      ...netOf(rtc.map((v) => v.t.net?.() ?? null)),
       dropped: [...this.sinks].reduce((n, v) => n + v.dropped, 0),
       bitrate_kbps: this.running && this.applied ? Math.round(this.applied / 1000) : null,
       fps_target: this.running ? this.appliedFps || this.want.fps : null,
@@ -672,6 +686,8 @@ export function phoneStats(
     viewers_h264_ws: viewersWs,
     viewers_mjpeg: mjpeg.viewers,
     path: busy.map((s) => s.path).find((p) => p) ?? null,
+    rtt_ms: h?.rtt_ms ?? null,
+    queue_ms: h?.queue_ms ?? null,
     dropped: all.reduce((n, s) => n + s.dropped, 0),
     bitrate_kbps: h?.bitrate_kbps ?? null,
     h264_available: h264Reason === null,
@@ -686,6 +702,8 @@ export function phoneStats(
       bitrate_kbps: s.bitrate_kbps,
       viewers: s.viewers_ws + s.viewers_rtc,
       dropped: s.dropped,
+      rtt_ms: s.rtt_ms,
+      queue_ms: s.queue_ms,
     })),
     helper_build_error: buildError,
   };

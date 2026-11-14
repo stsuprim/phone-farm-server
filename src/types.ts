@@ -23,8 +23,10 @@ export interface PhoneInfo {
   height: number | null;
   /** Live view numbers for this phone (see README). */
   stats?: StreamStats;
-  /** The Mac's own base URLs on its LAN/Tailscale addresses, e.g. "http://192.168.1.20:8787". */
+  /** The Mac's own base URLs on its LAN (private IPv4), e.g. "http://192.168.1.20:8787". */
   lan?: string[];
+  /** The Mac's Tailscale base URLs (100.64.0.0/10), apart from `lan`: a tailnet address is not a local one. */
+  tailnet?: string[];
 }
 
 /** Per-phone live view stats in GET /phones. Timings are averages in ms; null when unknown. */
@@ -39,6 +41,9 @@ export interface StreamStats {
   viewers_h264_ws: number;
   viewers_mjpeg: number;
   path: string | null; // WebRTC path of a viewer: "lan", "tailscale", "loopback" or "direct" (always host, never relayed)
+  /** WebRTC: the round trip from RTCP receiver reports (ms), and the queue beyond the path's own (delay-based control). */
+  rtt_ms?: number | null;
+  queue_ms?: number | null;
   dropped: number; // frames dropped by latest-only since the viewers joined
   bitrate_kbps: number | null; // the encoder's target now (congestion control lowers it for a slow viewer)
   h264_available: boolean;
@@ -71,6 +76,8 @@ export interface LaneStats {
   bitrate_kbps: number | null;
   viewers: number;
   dropped: number;
+  rtt_ms?: number | null;
+  queue_ms?: number | null;
 }
 
 /** What a client asked of the H.264 stream. */

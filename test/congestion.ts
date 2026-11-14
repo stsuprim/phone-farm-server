@@ -5,11 +5,11 @@ import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
 import { AddressInfo } from 'node:net';
 import WebSocket from 'ws';
-import { bitrateAsk, MIN_BPS, parseRtcp, RateControl, WsFlow } from '../src/congestion.js';
+import { bitrateAsk, DelayTracker, MIN_BPS, ntpMid32, parseRtcp, RateControl, WsFlow } from '../src/congestion.js';
 import { H264Source, H264Viewer, KIND, ProducerHooks, Transport } from '../src/h264.js';
 import { MockBackend } from '../src/mock.js';
 import { isRemote, rtcWant } from '../src/rtc.js';
-import { createServer } from '../src/server.js';
+import { createServer, lanUrls } from '../src/server.js';
 
 let passed = 0;
 const ok = (name: string) => {
@@ -148,9 +148,61 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
   assert.equal(info.remb, 1_500_000);
   assert.equal(info.wantsKey, true);
   const none = parseRtcp(Buffer.from([0x80, 201, 0, 1, 0, 0, 0, 1]));
-  assert.deepEqual(none, { fractionLost: null, nacked: 0, remb: null, wantsKey: false });
+  assert.deepEqual(none, { fractionLost: null, rttMs: null, nacked: 0, remb: null, wantsKey: false });
   assert.doesNotThrow(() => parseRtcp(Buffer.from([0x81, 201, 0, 50, 1, 2])));
   ok('RTCP: receiver report loss, NACKed packets, REMB, PLI in one compound packet; short packets are safe');
+
+  // the round trip from LSR/DLSR: our SR left at t0, the browser held it 40 ms, its RR arrives at t0 + 230 ms
+  const t0 = 1_794_620_000_123;
+  const rr2 = Buffer.from(rr);
+  rr2.writeUInt32BE(ntpMid32(t0), 24); // LSR
+  rr2.writeUInt32BE(Math.round(0.04 * 65536), 28); // DLSR 40 ms
+  const r = parseRtcp(rr2, t0 + 230);
+  assert.ok(r.rttMs !== null && Math.abs(r.rttMs - 190) < 1, `rtt ${r.rttMs}`);
+  assert.equal(parseRtcp(rr, t0).rttMs, null, 'no LSR yet: no round trip');
+  // across the 32-bit NTP wrap
+  const tw = (61_091 * 65_536 - 2_208_988_800) * 1000 - 50; // 50 ms before the middle 32 bits wrap (2026-11-15)
+  rr2.writeUInt32BE(ntpMid32(tw), 24);
+  rr2.writeUInt32BE(0, 28);
+  const w = parseRtcp(rr2, tw + 180).rttMs!;
+  assert.ok(Math.abs(w - 180) < 1, `rtt across the wrap ${w}`);
+  ok('RTCP: round trip from the receiver report (LSR/DLSR, NTP middle 32 bits, across the wrap)');
+}
+
+// ---- delay-based: the queue beyond the path's own round trip ----
+{
+  let t = 0;
+  const d = new DelayTracker(30_000, () => t);
+  assert.equal(d.queueMs(), null);
+  for (const rtt of [190, 185, 200, 188]) (t += 1000), d.add(rtt);
+  assert.equal(d.base(), 185);
+  assert.equal(d.queueMs(), 3);
+  t += 1000;
+  d.add(900); // a router's buffer filling: no loss yet, but 715 ms of queue
+  assert.equal(d.queueMs(), 715);
+  assert.deepEqual(d.stats(), { rtt_ms: 900, base_rtt_ms: 185, queue_ms: 715 });
+  t += 5000;
+  assert.equal(d.queueMs(), null, 'a stale report is not a queue');
+  d.add(-5);
+  d.add(Number.NaN);
+  assert.equal(d.rtt, 900, 'bad samples are ignored');
+  t += 40_000;
+  d.add(400); // the old base aged out (a longer path): the new one counts
+  assert.equal(d.base(), 400);
+  ok('delay tracker: base = quickest of 30 s, queue = latest beyond it, stale and bad samples ignored');
+}
+
+// ---- the LAN addresses the server lists are LAN only (Tailscale apart) ----
+{
+  const ifaces = {
+    en0: [{ address: '192.168.68.108', family: 'IPv4', internal: false }, { address: 'fe80::1', family: 'IPv6', internal: false }],
+    utun4: [{ address: '100.95.176.73', family: 'IPv4', internal: false }, { address: 'fd7a:115c:a1e0::1', family: 'IPv6', internal: false }],
+    lo0: [{ address: '127.0.0.1', family: 'IPv4', internal: true }],
+    en5: [{ address: '169.254.10.2', family: 'IPv4', internal: false }],
+  } as unknown as ReturnType<typeof import('node:os').networkInterfaces>;
+  assert.deepEqual(lanUrls(8787, 'lan', ifaces), ['http://192.168.68.108:8787']);
+  assert.deepEqual(lanUrls(8787, 'tailnet', ifaces), ['http://100.95.176.73:8787']);
+  ok('GET /phones `lan` lists private LAN addresses only; Tailscale ones go in `tailnet`');
 }
 
 // ---- the shared encoder follows the slowest viewer ----

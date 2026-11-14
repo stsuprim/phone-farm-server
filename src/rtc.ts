@@ -1,5 +1,5 @@
 import type NdcModule from 'node-datachannel';
-import { bitrateAsk, DEFAULT_CEILING_BPS, parseRtcp, RateControl, REMOTE_START_BPS } from './congestion.js';
+import { bitrateAsk, DEFAULT_CEILING_BPS, DelayTracker, parseRtcp, RateControl, REMOTE_START_BPS } from './congestion.js';
 import type { Control } from './control.js';
 import { H264Settings, H264Source, H264Viewer, KIND, Rec, Transport } from './h264.js';
 import { Backend, HttpError } from './types.js';
@@ -18,6 +18,18 @@ type DataChannel = ReturnType<PeerConnection['createDataChannel']>;
 type RtpConfig = InstanceType<Ndc['RtpPacketizationConfig']>;
 
 const PLAYOUT_DELAY_URI = 'http://www.webrtc.org/experiments/rtp-hdrext/playout-delay';
+
+/**
+ * Delay-based congestion control (the round trip from RTCP beyond the path's own): a queue over `cut` ms lowers the
+ * bitrate (x0.85, x0.6 over `hard`), and the bitrate only climbs while it stays under `clear`. A far link (Tailscale
+ * across countries) has a long, jittery path, so its marks are higher than the LAN's.
+ */
+export const DELAY_MARKS = {
+  remote: { cut: 150, hard: 500, clear: 50 },
+  lan: { cut: 80, hard: 300, clear: 25 },
+};
+/** After a delay cut, the next waits this long: the queue needs a round trip or two to drain. */
+export const DELAY_HOLD_MS = 2000;
 
 let lib: Ndc | null | undefined;
 let libError = '';
@@ -172,6 +184,7 @@ export class RtcSession {
   private reportLoss: number | null = null; // the highest fraction lost in its receiver reports since the last tick
   private lastKeyAsk = 0;
   private want?: { bitrate: number | null };
+  private delay = new DelayTracker(); // the round trip from the browser's receiver reports
 
   constructor(
     private backend: Backend,
@@ -205,6 +218,9 @@ export class RtcSession {
       if (state === 'connected') {
         const pair = pc.getSelectedCandidatePair();
         this.path = pair ? pathKind(pair.remote.address) : null; // the remote may be prflx (mDNS-hidden client)
+        // the server's word on the media path and the lane it streams, so the client shows it rather than guessing
+        // from addresses (Tailscale's IPv6 fd7a:115c:a1e0::/48 looks like a private LAN address)
+        if (!this.closed) this.signal({ type: 'rtc-path', path: this.path, remote: this.remote, lane: this.src?.kind ?? null, address: pair?.remote.address ?? null });
       }
       if (state === 'failed' || state === 'closed') this.close(`peer connection ${state}`);
     });
@@ -289,6 +305,7 @@ export class RtcSession {
       send: (r: Rec) => self.sendFrame(r),
       fail: (reason: string) => self.fail(reason),
       path: () => self.path,
+      net: () => self.delay.stats(),
     };
     this.viewer = new H264Viewer(transport, this.src);
     // a far viewer starts low and climbs to its ask (its lane's frame rate follows the bitrate)
@@ -307,6 +324,7 @@ export class RtcSession {
     } catch {
       return;
     }
+    this.delay.add(info.rttMs);
     if (info.wantsKey) {
       const now = Date.now();
       if (now - this.lastKeyAsk >= 500) {
@@ -319,8 +337,11 @@ export class RtcSession {
   }
 
   /**
-   * Once a second, loss-based like WebRTC's own (GCC): more than 10 % lost -> bitrate x (1 - loss/2); under 2 % -> up
-   * slowly; between: hold. (REMB isn't used: a browser's receive-side estimate starts low and ramps.)
+   * Once a second, like WebRTC's own (GCC), delay first: a queue building in front of the viewer (its round trip
+   * beyond the path's own, from the receiver reports) cuts the bitrate before any loss shows, since a router's buffer
+   * holds seconds of video before it drops anything (and the acks of taps wait in the same queue). Then loss: more than
+   * 10 % lost -> bitrate x (1 - loss/2). The bitrate climbs only while the queue is short and under 2 % is lost.
+   * (REMB isn't used: a browser's receive-side estimate starts low and ramps.)
    */
   private ccTick(): void {
     if (!this.rc || !this.viewer || !this.src || this.closed) return;
@@ -329,9 +350,12 @@ export class RtcSession {
     const sent = this.packets;
     this.packets = this.nacked = 0;
     this.reportLoss = null;
+    const marks = this.remote ? DELAY_MARKS.remote : DELAY_MARKS.lan;
+    const queue = this.delay.queueMs();
     let changed = false;
     if (sent >= 10 && loss > 0.1) changed = this.rc.down(Math.max(0.5, 1 - loss / 2), null, 900);
-    else if (loss < 0.02) changed = this.rc.up();
+    else if (queue !== null && queue > marks.cut) changed = this.rc.down(queue > marks.hard ? 0.6 : 0.85, null, DELAY_HOLD_MS);
+    else if (loss < 0.02 && (queue === null || queue < marks.clear)) changed = this.rc.up();
     if (changed) this.src.setTarget(this.viewer, this.rc.bps);
   }
 

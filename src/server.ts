@@ -6,16 +6,22 @@ import { bitrateAsk, DEFAULT_CEILING_BPS, RateControl, REMOTE_START_BPS, WsFlow 
 import { Control } from './control.js';
 import { H264Viewer, REMOTE_DROP_BYTES, Transport, wsMessage } from './h264.js';
 import type { InputResult } from './inputlog.js';
-import { isRemote, rtcSignaling } from './rtc.js';
+import { isRemote, pathKind, rtcSignaling } from './rtc.js';
 import { Backend, H264Want, HttpError, StreamSettings } from './types.js';
 import type { Updater } from './updater.js';
 
-/** The Mac's own base URLs (LAN and Tailscale IPv4 addresses), so a client on the LAN can go direct. */
-function lanUrls(port: number): string[] {
+/**
+ * The Mac's own base URLs on its LAN (private IPv4), so a client on the same LAN can go direct. Tailscale's
+ * 100.64.0.0/10 addresses are not a LAN (a client that picks one is still ~180 ms away): they're listed apart, in
+ * `tailnet`, so no client takes a Tailscale address for a local one.
+ */
+export function lanUrls(port: number, which: 'lan' | 'tailnet' = 'lan', ifaces = os.networkInterfaces()): string[] {
   const out: string[] = [];
-  for (const list of Object.values(os.networkInterfaces())) {
+  for (const list of Object.values(ifaces)) {
     for (const a of list ?? []) {
-      if (a.family === 'IPv4' && !a.internal && !a.address.startsWith('169.254.')) out.push(`http://${a.address}:${port}`);
+      if (a.family !== 'IPv4' || a.internal || a.address.startsWith('169.254.')) continue;
+      const k = pathKind(a.address);
+      if ((which === 'lan' && k === 'lan') || (which === 'tailnet' && k === 'tailscale')) out.push(`http://${a.address}:${port}`);
     }
   }
   return out;
@@ -133,8 +139,10 @@ export function createServer(backend: Backend, token: string, updater?: Updater)
       }
       if (req.method === 'GET' && path === '/phones') {
         const addr = server.address();
-        const lan = lanUrls(addr && typeof addr === 'object' ? addr.port : 8787);
-        return send(res, 200, (await backend.list()).map((p) => ({ ...p, lan, stats: withInput(p.udid, p.stats) })));
+        const port = addr && typeof addr === 'object' ? addr.port : 8787;
+        const lan = lanUrls(port);
+        const tailnet = lanUrls(port, 'tailnet');
+        return send(res, 200, (await backend.list()).map((p) => ({ ...p, lan, tailnet, stats: withInput(p.udid, p.stats) })));
       }
       if (path === '/update/status' || path === '/update/now') {
         if (!updater) return send(res, 503, { error: 'updater unavailable (mock mode)' });

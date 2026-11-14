@@ -104,6 +104,13 @@ try {
   assert.equal(hello.codec, 'h264');
   for (const k of ['width', 'height', 'fps', 'scale', 'server_time']) assert.equal(typeof hello[k], 'number');
   ok(`signaling: rtc-offer -> rtc-answer (PT 125, playout-delay, host only), trickle ICE, rtc-hello ${hello.width}x${hello.height}`);
+  await until('rtc-path', () => inbox.some((m) => m.type === 'rtc-path'));
+  const rpath = inbox.find((m) => m.type === 'rtc-path');
+  // the pair ICE picks on this machine (loopback, the LAN, or Tailscale's own interface)
+  assert.ok(['loopback', 'lan', 'tailscale', 'direct'].includes(rpath.path), `path ${rpath.path}`);
+  assert.equal(rpath.remote, false, 'the lane follows the control socket (loopback here)');
+  assert.equal(typeof rpath.address, 'string');
+  ok(`rtc-path: the server says the media path (${rpath.path} via ${rpath.address}, lane ${rpath.lane}) once connected`);
 
   // ---- media ----
   await until('RTP video', () => nals.some((n) => n.nal === 5) && nals.some((n) => n.nal === 1));
@@ -154,6 +161,7 @@ try {
   assert.ok(st.fps > 0);
   assert.equal(typeof st.capture_to_encoded_ms, 'number');
   assert.equal(typeof st.encoded_to_sent_ms, 'number');
+  assert.ok('rtt_ms' in st && 'queue_ms' in st, 'stats carry the RTCP round trip and queue');
   ok(`stats: ${st.fps} fps, ${st.viewers} viewer(s), path ${st.path}, capture->encoded ${st.capture_to_encoded_ms} ms, encoded->sent ${st.encoded_to_sent_ms} ms`);
 
   // ---- errors fall back ----

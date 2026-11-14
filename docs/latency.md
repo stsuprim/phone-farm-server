@@ -95,3 +95,20 @@ long side, 1.5 Mbps climbing to its ask, frame rate following the bitrate), WebR
 one frame in flight behind another. Expected over the Nepal -> UK link (~180 ms): WebRTC 25-30 fps at roughly
 250-400 ms glass to glass (one way ~90 ms + capture/encode/decode ~60 ms + pacing/jitter); the H.264 WebSocket
 20-30 fps at ~300-600 ms; taps keep their ~1 round trip plus WDA. To be confirmed with the client's numbers.
+
+### 2026-11-14: reading the numbers right (Nepal: "LAN · 28 fps · 6377 ms · tap 2386 ms")
+
+- **"LAN" was a label bug in the client.** WebRTC picked the Tailscale IPv6 pair (`fd7a:115c:a1e0::/48`; the repo's own
+  WebRTC test on the owner's PC picks exactly that pair), and Lotus's `routeOf` checks `fc00::/7` (private) before
+  Tailscale. The server classified it right (Tailscale first) and streamed the far lane (30 fps cap: the 28 fps). The
+  server now says the path itself (`rtc-path`) and no longer lists its Tailscale address under `lan`.
+- **6377 ms was a clock artifact.** The client's offset comes from pings stamped with the PC's wall clock (Rust
+  `SystemTime`), but frames were stamped with `performance.timeOrigin + performance.now()`, a monotonic clock fixed at
+  page load that doesn't follow wall-clock steps (time sync, waking from sleep). On the owner's PC the two were seconds
+  apart (wall vs monotonic since boot: 6.5 s; a 10.6 h sleep/resume step at 07:21, eight minutes before the reading).
+  Glass-to-glass must use one clock: `Date.now()` on both sides of the offset, or pings over the data channel stamped
+  with the same clock as the frames.
+- **2386 ms taps are real, but the method's:** the test phone runs iOS 18.5, so no HID; a tap goes through WDA, and
+  2.2 s on the server side means the old XCTest `/wda/tap` route (the fast `/wda/lotus/touch` route answers when queued,
+  tens of ms). WDA must be rebuilt with the patch (RINOR_TAP_CHECK.md step 3). Each ack also waits behind any queue in
+  front of the video on the way back, which the delay-based control above now keeps short.

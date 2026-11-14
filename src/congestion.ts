@@ -8,7 +8,11 @@
  *   order), so a pong says everything before it arrived: the round trip includes the queue in front of the viewer.
  *   While the oldest unanswered ping has waited too long the viewer counts as congested (frames are skipped, never
  *   queued) and the bitrate goes down; the delivered rate comes from the acknowledged bytes.
- * - parseRtcp: WebRTC viewers. Receiver reports' fraction lost, NACKed packets, REMB and PLI/FIR from the browser.
+ * - parseRtcp: WebRTC viewers. Receiver reports' fraction lost, NACKed packets, REMB, PLI/FIR and the round trip
+ *   (LSR/DLSR against our own sender reports) from the browser.
+ * - DelayTracker: WebRTC viewers' queue, the round trip beyond the quickest of the last 30 s. A queue in front of a far
+ *   viewer (a router's buffer filling before it drops anything) is cut on before any loss shows (delay-based, like
+ *   GCC), so seconds of video and acks never wait in the network.
  */
 
 export const MIN_BPS = 400_000;
@@ -243,6 +247,12 @@ export class WsFlow {
 export interface RtcpInfo {
   /** The highest fraction lost (0-1) in the receiver reports, or null if none. */
   fractionLost: number | null;
+  /**
+   * The round trip (ms) from a report block's LSR/DLSR (RFC 3550 6.4.1): now - the sender report it answers - the time
+   * it was held. Null without one (no sender report seen yet). Our SRs carry the system clock (libdatachannel's
+   * ntp_time), the same as Date.now().
+   */
+  rttMs: number | null;
   /** Packets the receiver asked again (generic NACK). */
   nacked: number;
   /** The receiver's estimate (REMB), bit/s, or null. */
@@ -251,9 +261,15 @@ export interface RtcpInfo {
   wantsKey: boolean;
 }
 
-/** Reads a (compound) RTCP packet from the receiver. */
-export function parseRtcp(buf: Buffer): RtcpInfo {
-  const info: RtcpInfo = { fractionLost: null, nacked: 0, remb: null, wantsKey: false };
+/** NTP's middle 32 bits (RTCP's LSR units: 1/65536 s) of a Date.now() time. */
+export function ntpMid32(ms: number): number {
+  return Math.floor((ms / 1000 + 2_208_988_800) * 65536) % 0x1_0000_0000;
+}
+
+/** Reads a (compound) RTCP packet from the receiver; `nowMs` is when it arrived (for the round trip). */
+export function parseRtcp(buf: Buffer, nowMs: number = Date.now()): RtcpInfo {
+  const info: RtcpInfo = { fractionLost: null, rttMs: null, nacked: 0, remb: null, wantsKey: false };
+  const arrived = ntpMid32(nowMs);
   let off = 0;
   while (off + 4 <= buf.length) {
     if (buf[off]! >> 6 !== 2) break;
@@ -266,6 +282,12 @@ export function parseRtcp(buf: Buffer): RtcpInfo {
       for (let i = 0; i < count && b + 24 <= end; i++, b += 24) {
         const f = buf[b + 4]! / 256;
         info.fractionLost = info.fractionLost === null ? f : Math.max(info.fractionLost, f);
+        const lsr = buf.readUInt32BE(b + 16);
+        const dlsr = buf.readUInt32BE(b + 20);
+        if (lsr !== 0) {
+          const rtt = ((((arrived - lsr - dlsr) % 0x1_0000_0000) + 0x1_0000_0000) % 0x1_0000_0000) / 65.536; // ms
+          if (rtt < 60_000) info.rttMs = info.rttMs === null ? rtt : Math.min(info.rttMs, rtt);
+        }
       }
     } else if (pt === 205 && count === 1) {
       for (let b = off + 12; b + 4 <= end; b += 4) {
@@ -289,4 +311,40 @@ export function parseRtcp(buf: Buffer): RtcpInfo {
     off = end;
   }
   return info;
+}
+
+/** A WebRTC viewer's queue: base round trip (quickest of the last `windowMs`) and the latest one beyond it. */
+export class DelayTracker {
+  private samples: { t: number; rtt: number }[] = [];
+  /** The last round trip, ms (null before any). */
+  rtt: number | null = null;
+  private lastT = 0;
+  constructor(private windowMs = 30_000, private now: () => number = Date.now) {}
+
+  add(rtt: number | null): void {
+    if (rtt === null || !Number.isFinite(rtt) || rtt < 0 || rtt > 10_000) return;
+    const t = this.now();
+    this.samples.push({ t, rtt });
+    this.rtt = rtt;
+    this.lastT = t;
+    while (this.samples.length && (t - this.samples[0]!.t > this.windowMs || this.samples.length > 600)) this.samples.shift();
+  }
+
+  /** The path's own round trip: the quickest of the window (0 before any). */
+  base(): number {
+    let m = Infinity;
+    for (const s of this.samples) m = Math.min(m, s.rtt);
+    return Number.isFinite(m) ? m : 0;
+  }
+
+  /** The latest round trip beyond the base, or null when there's no recent one (older than `freshMs`). */
+  queueMs(freshMs = 3000): number | null {
+    if (this.rtt === null || this.now() - this.lastT > freshMs) return null;
+    return Math.max(0, this.rtt - this.base());
+  }
+
+  stats() {
+    const q = this.queueMs();
+    return { rtt_ms: this.rtt === null ? null : Math.round(this.rtt), base_rtt_ms: this.samples.length ? Math.round(this.base()) : null, queue_ms: q === null ? null : Math.round(q) };
+  }
 }

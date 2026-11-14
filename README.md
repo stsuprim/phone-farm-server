@@ -25,7 +25,7 @@ recovering) or `WDA refused the request on <name>: ...` (WDA answered but said n
 | Method | Path | Body / query | Result |
 |---|---|---|---|
 | GET | `/health` | - | `{ok, mock}` (no auth) |
-| GET | `/phones` | - | `[{udid, name, model, ios, battery, online, ready, control, scale, point_width, point_height, width, height}]`: `battery` 0-100 or null; `model` the product type (`iPhone14,5`); `ready` = WDA running; `control` = `"ready"` (session warm), `"recovering"` (WDA starting or session being remade) or `"down"`; `scale`, `point_width`, `point_height` from WDA (`/wda/screen`, window size), cached per WDA session, null until known; `width`/`height` the screen in pixels (points x scale); `stats` the live view numbers (see [Live view](#live-view-webrtc-h264-mjpeg)); `lan` the Mac's own base URLs on its LAN/Tailscale IPv4 addresses (`["http://192.168.1.20:8787", ...]`, same for every phone) |
+| GET | `/phones` | - | `[{udid, name, model, ios, battery, online, ready, control, scale, point_width, point_height, width, height}]`: `battery` 0-100 or null; `model` the product type (`iPhone14,5`); `ready` = WDA running; `control` = `"ready"` (session warm), `"recovering"` (WDA starting or session being remade) or `"down"`; `scale`, `point_width`, `point_height` from WDA (`/wda/screen`, window size), cached per WDA session, null until known; `width`/`height` the screen in pixels (points x scale); `stats` the live view numbers (see [Live view](#live-view-webrtc-h264-mjpeg)); `lan` the Mac's own base URLs on its LAN (private IPv4 only, `["http://192.168.1.20:8787", ...]`, same for every phone); `tailnet` its Tailscale ones (100.64/10), listed apart because a Tailscale address is not a local path |
 | GET | `/phones/:udid/screenshot` | `?format=png` (default) or `jpeg` | image bytes (`jpeg` = latest MJPEG frame; mock always returns PNG, check `Content-Type`) |
 | WS | `/phones/:udid/stream` | `?codec=` (`h264` or `mjpeg`; absent = MJPEG as before), `?fps=` (1-60, default 60), `?quality=`, `?scale=` (10-100 %; MJPEG default 50, H.264 default 100) | MJPEG: first a text message `{"type":"hello", udid, contentType, fps, scale, quality}` with the settings actually used, then one binary message per frame (JPEG from WDA's MJPEG server in real mode, PNG in mock); latest frame only. H.264: see [Live view](#live-view-webrtc-h264-mjpeg) |
 | WS | `/phones/:udid/control` | JSON text messages, see below | low-latency control over one connection |
@@ -181,8 +181,17 @@ bitrate (`src/lanes.ts`, `native/phonecap/main.swift`). Viewers with the same se
   congestion the bitrate is cut toward what the link delivers and the frame rate follows it (30 -> 20 fps under 1 Mbps,
   12 fps under 650 kbit/s). Keyframes every 2 s, and on request. `full=1` (query) / `want.full: true` (rtc-offer)
   gives a far viewer exactly what it asked.
-- WebRTC: loss-based (receiver reports + NACKs: > 10 % lost cuts, < 2 % raises), PLI/FIR at most every 500 ms (only
-  the far lane re-keys), packets paced at 1.5x the ceiling (3-8 Mbit/s, `RTC_PACING=0` turns it off).
+- WebRTC: delay first, then loss, like GCC. The round trip comes from the browser's receiver reports (LSR/DLSR against
+  our sender reports); its excess over the quickest of the last 30 s is the queue in front of the viewer. A far viewer's
+  queue over 150 ms cuts the bitrate (x0.85, x0.6 over 500 ms; LAN: 80 / 300 ms), at most every 2 s, before any packet
+  is lost (a router buffers seconds of video before it drops, and taps' acks wait in the same queue). Then loss
+  (receiver reports + NACKs: > 10 % lost cuts). The bitrate climbs only while the queue stays under 50 ms (LAN 25 ms)
+  and under 2 % is lost. PLI/FIR at most every 500 ms (only the far lane re-keys), packets paced at 1.5x the ceiling
+  (3-8 Mbit/s, `RTC_PACING=0` turns it off).
+- Once the WebRTC link connects, the control socket gets `{type:"rtc-path", path, remote, lane, address}`: the media
+  path the server sees (`lan`, `tailscale`, `loopback`, `direct`), whether the viewer is on a far lane and the address of
+  the pair ICE chose. Show this rather than classifying addresses on the client: Tailscale's IPv6 addresses
+  (`fd7a:115c:a1e0::/48`) look like private LAN ones (`fc00::/7`).
 - WebSockets: a ping follows the frames; its pong's round trip beyond the base is the queue. H.264: the bitrate is cut
   past 150 ms of queue, deltas dropped (then a keyframe) past 300 ms. MJPEG: one frame may follow one still on its way,
   never more; a far viewer asks WDA for at most 35 % / quality 40.
@@ -193,8 +202,9 @@ bitrate (`src/lanes.ts`, `native/phonecap/main.swift`). Viewers with the same se
 
 `GET /phones` -> each phone's `stats`:
 `{codec, fps, encode_ms, capture_to_encoded_ms, encoded_to_sent_ms, viewers, viewers_webrtc, viewers_h264_ws,
-viewers_mjpeg, path, dropped, bitrate_kbps, h264_available, h264_reason, lanes, helper_build_error}` (`lanes`: each
-running lane `{kind: "lan"|"remote", fps, fps_target, scale, width, height, bitrate_kbps, viewers, dropped}`; `input`
+viewers_mjpeg, path, rtt_ms, queue_ms, dropped, bitrate_kbps, h264_available, h264_reason, lanes, helper_build_error}`
+(`rtt_ms`/`queue_ms`: a WebRTC viewer's RTCP round trip and the queue beyond the path's own; `lanes`: each running lane
+`{kind: "lan"|"remote", fps, fps_target, scale, width, height, bitrate_kbps, viewers, dropped, rtt_ms, queue_ms}`; `input`
 `{via, tap_avg_ms, tap_p90_ms, last, samples, methods}`, see [Input](#input-taps-swipes-typing)). `codec` is what viewers get now (`h264` if any WebRTC/H.264
 viewer, else `mjpeg`, null when nobody watches); timings are running averages in ms (capture -> encoded measured in the
 helper from the capture timestamp, encoded -> sent in the server); `path` is the WebRTC path (`lan`, `tailscale`,
