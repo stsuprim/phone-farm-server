@@ -122,6 +122,13 @@ function says(el: UiElement, q: ElementQuery): boolean {
 export class Agent {
   private uiCache = new Map<string, { at: number; t0: number; p: Promise<UiSnapshot> }>();
   private lane = new Map<string, Promise<void>>();
+  /** A read saw the app in front (the server keeps the phone's card up to date with it). */
+  onApp?: (udid: string, bundleId: string) => void;
+
+  /** A reported action or batch (an agent's) is running or waiting on the phone now. */
+  busy(udid: string): boolean {
+    return this.lane.has(udid);
+  }
 
   constructor(private backend: Backend, private control: Control) {
     control.resolveApp = (udid, name) => this.bundleId(udid, name);
@@ -199,7 +206,9 @@ export class Agent {
 
   private async app(udid: string): Promise<string | null> {
     try {
-      return (await this.backend.activeApp?.(udid)) ?? null;
+      const app = (await this.backend.activeApp?.(udid)) ?? null;
+      if (app) this.onApp?.(udid, app);
+      return app;
     } catch {
       return null;
     }

@@ -22,12 +22,13 @@ interface Entry extends PowerState {
   known: boolean; // seen online + ready since the server started (idle time counts from then)
   busy?: Promise<void>; // a lock or wake in progress
   checkedAt: number; // when the phone was last asked whether it's locked before an input
+  unsure?: boolean; // the last ask got no answer: every input asks again until one comes
 }
 
 /** A phone can't have gone dark by itself sooner than this after its last input (iOS's shortest Auto-Lock is 30 s). */
 export const AWAKE_FOR_MS = 25_000;
 /** An input waits this long at most to hear whether the phone is locked. */
-const LOCKED_ASK_MS = 1500;
+const LOCKED_ASK_MS = 4000;
 
 export interface IdleOptions {
   now?: () => number;
@@ -93,7 +94,7 @@ export class IdleLock {
     e.known = true;
     if (e.busy) return e.busy.catch(() => {});
     if (e.locked === true) return this.wake(udid).then(() => undefined, () => undefined);
-    if (discrete && this.supported && this.backend.isLocked && quiet >= AWAKE_FOR_MS && now - e.checkedAt >= AWAKE_FOR_MS) {
+    if (discrete && this.supported && this.backend.isLocked && (quiet >= AWAKE_FOR_MS || e.unsure) && now - e.checkedAt >= AWAKE_FOR_MS) {
       e.checkedAt = now;
       return this.ensureAwake(udid).catch(() => {});
     }
@@ -106,12 +107,19 @@ export class IdleLock {
     return this.serial(e, async () => {
       const ask = this.backend.isLocked!(udid).catch(() => null);
       const l = await Promise.race([ask, new Promise<null>((r) => setTimeout(() => r(null), LOCKED_ASK_MS).unref?.())]);
+      if (l !== null) e.unsure = false;
       if (l === false) {
         e.locked = false;
         e.screenOn = true;
         return;
       }
-      if (l !== true) return; // it can't tell: the input goes as it is
+      if (l !== true) {
+        // it can't tell (WDA slow to answer after a quiet spell): the input goes as it is, and the next one asks again
+        // rather than every input for the next 25 s going to a phone that may be dark
+        e.checkedAt = -Infinity;
+        e.unsure = true;
+        return;
+      }
       e.locked = true;
       e.screenOn = false;
       await this.backend.unlock!(udid);
@@ -121,6 +129,19 @@ export class IdleLock {
       e.error = still ? 'still locked after wake (a passcode is set: enter it on the phone once, or remove it)' : null;
       if (!still) this.log(`${udid.slice(-8)} was dark: woke before the input`);
     });
+  }
+
+  /**
+   * What a health check learned about the lock (not activity): a phone found locked is woken by the next input
+   * before it acts, without asking first.
+   */
+  note(udid: string, locked: boolean | null): void {
+    if (locked === null) return;
+    const e = this.entry(udid);
+    if (e.busy) return; // a lock or wake in progress says better
+    e.unsure = false;
+    e.locked = locked;
+    e.screenOn = !locked;
   }
 
   /** A viewer opened (stream or WebRTC session): activity, and the phone wakes. Returns the release. */

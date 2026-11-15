@@ -45,8 +45,8 @@ export interface PhoneInfo {
  * phone (or its tools) couldn't say is null.
  */
 export interface DeviceInfo {
-  /** `level` 0..1; `charging` true while it takes charge. */
-  battery: { level: number | null; charging: boolean | null };
+  /** `level` 0..1 (a fraction); `percent` the same as 0..100 (an integer); `charging` true while it takes charge. */
+  battery: { level: number | null; percent?: number | null; charging: boolean | null };
   /** The battery's temperature in degrees Celsius (IORegistry AppleSmartBattery Temperature / 100). */
   temperatureC: number | null;
   /** The app in front. */
@@ -135,6 +135,10 @@ export interface StreamStats {
   sessions?: SessionStats[];
   /** The capture's picture doesn't have the phone's shape (wide against tall) and couldn't be put right: why. */
   capture_mismatch?: string | null;
+  /** WDA self-heals since the server started (a session remade, WDA restarted, a port forward respawned). */
+  heals?: number;
+  /** The last self-heal: when (ms since the epoch) and why; null when there was none. */
+  lastHeal?: { at: number; reason: string } | null;
 }
 
 /**
@@ -275,6 +279,15 @@ export interface Backend {
   playFailure?(udid: string, since: number): string | null;
   /** Drop the WDA session, restart the runner if WDA doesn't answer, make a new warm session. */
   recover(udid: string): Promise<ControlState>;
+  /**
+   * Make sure the phone can take input: probe its WDA session and heal what's wrong (a new session, WDA restarted).
+   * False when it can't take input even so. `reason` is logged with any heal.
+   */
+  heal?(udid: string, reason: string): Promise<boolean>;
+  /** Tell the backend which phones are being watched (their health check probes the session itself). */
+  setWatched?(fn: (udid: string) => boolean): void;
+  /** Stop the phone's capture now (another phone took the focus): no warm time; its viewers are told why. */
+  stopCapture?(udid: string, why: string): void;
   /** Subscribe to image frames. Returns unsubscribe and the settings actually used. Throws HttpError if unknown/not ready. */
   subscribe(
     udid: string,

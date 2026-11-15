@@ -56,7 +56,33 @@ interface Entry {
   /** When a quiet call last had the session remade (at most one such remake every few seconds). */
   goneAt?: number;
   agent: http.Agent; // keep-alive connections to WDA (through iproxy): no new usbmux connection per touch
+  /** Self-heals so far (a session remade, WDA restarted, a forward respawned), and the last one with its reason. */
+  heals: number;
+  lastHeal: HealRecord | null;
+  /** Actions and reads on their way to WDA now (a quiet read skips while one is: WDA takes one thing at a time). */
+  inflight: number;
+  /** A liveness probe in progress (shared by everyone asking). */
+  probeP?: Promise<boolean>;
 }
+
+/** One self-heal: when (ms since the epoch) and why. */
+export interface HealRecord {
+  at: number;
+  reason: string;
+}
+
+/** How long WDA gets to answer each kind of request before it counts as hung (ms). */
+export interface WdaTimeouts {
+  /** A tap, a button, the home screen, a fast-route touch. */
+  input: number;
+  /** Launching an app. */
+  launch: number;
+  /** A liveness probe (GET /session/:id). */
+  probe: number;
+  /** How long a restarted runner gets to come back. */
+  restart: number;
+}
+export const DEFAULT_TIMEOUTS: WdaTimeouts = { input: 8000, launch: 20000, probe: 3000, restart: 90000 };
 
 const newAgent = () => new http.Agent({ keepAlive: true, maxSockets: 6 });
 type HttpErr = Error & { code?: string };
@@ -108,11 +134,14 @@ export class WdaManager {
   private health: NodeJS.Timeout;
   /** Called when a phone's orientation (or its screen size, once known) changed. */
   onOrientation?: (udid: string) => void;
+  /** Whether someone is watching the phone now: its health check probes the session, not just /status. */
+  watched?: (udid: string) => boolean;
 
   constructor(
     private cfg: Config,
     private nameOf: (udid: string) => string = (u) => u,
     private spawnFn: typeof spawn = spawn, // tests: no real iproxy/xcodebuild
+    private timeouts: WdaTimeouts = DEFAULT_TIMEOUTS,
   ) {
     try {
       this.ports = JSON.parse(fs.readFileSync(PORTS_FILE, 'utf8'));
@@ -137,6 +166,19 @@ export class WdaManager {
 
   private log(e: Entry, m: string): void {
     console.log(`[wda ${e.udid.slice(-8)}] ${m}`); // UDID end: the start (00008110...) is the chip, same on both phones
+  }
+
+  /** A self-heal: counted, kept as the phone's last one and logged with its reason. */
+  private healed(e: Entry, reason: string): void {
+    e.heals++;
+    e.lastHeal = { at: Date.now(), reason: reason.slice(0, 200) };
+    console.log(`[wda-heal] ${e.udid.slice(-8)} ${reason}`);
+  }
+
+  /** The phone's self-heals (`heals`) and the last one (`lastHeal`), for its stats. */
+  healStats(udid: string): { heals: number; lastHeal: HealRecord | null } {
+    const e = this.entries.get(udid);
+    return { heals: e?.heals ?? 0, lastHeal: e?.lastHeal ?? null };
   }
 
   status(udid: string): WdaStatus {
@@ -171,7 +213,7 @@ export class WdaManager {
     e ??= {
       udid, wdaPort: this.cfg.wdaBasePort + n, mjpegPort: this.cfg.mjpegBasePort + n, status: 'starting', control: 'recovering',
       wanted: true, procs: [], restarts: 0, checking: false, lastOk: 0, orientation: null, orientAt: 0, tapRoute: 0, fast: 'unknown', fastFails: 0,
-      mjpeg: { ...DEFAULT_MJPEG }, agent: newAgent(),
+      mjpeg: { ...DEFAULT_MJPEG }, agent: newAgent(), heals: 0, lastHeal: null, inflight: 0,
     };
     e.wanted = true;
     this.entries.set(udid, e);
@@ -253,9 +295,27 @@ export class WdaManager {
       return p;
     };
 
-    // device ports are fixed (8100 / 9100); the Mac-side ports differ per phone
-    const fwdWda = spawnLogged('iproxy', ['-u', e.udid, `${e.wdaPort}:8100`]);
-    const fwdMjpeg = spawnLogged('iproxy', ['-u', e.udid, `${e.mjpegPort}:9100`]);
+    // device ports are fixed (8100 / 9100); the Mac-side ports differ per phone. A forward that dies (a usbmuxd
+    // hiccup, the phone re-enumerating after a long sleep) is started again by itself: WDA is still fine, and without
+    // its forward every request looked like WDA being down (a slow full restart).
+    const forward = (slot: 0 | 1, local: number, remote: number): ChildProcess => {
+      const p = spawnLogged('iproxy', ['-u', e.udid, `${local}:${remote}`]);
+      p.on('exit', (code) => {
+        if (!e.wanted || e.procs[slot] !== p) return; // killed on purpose, or superseded
+        this.healed(e, `the ${remote === 8100 ? 'WDA' : 'MJPEG'} port forward (iproxy :${local}) exited (${code}); starting it again`);
+        setTimeout(() => {
+          if (!e.wanted || e.procs[slot] !== p) return;
+          if (slot === 0) {
+            e.agent.destroy(); // its connections went with it
+            e.agent = newAgent();
+          }
+          e.procs[slot] = forward(slot, local, remote);
+        }, 500).unref?.();
+      });
+      return p;
+    };
+    const fwdWda = forward(0, e.wdaPort, 8100);
+    const fwdMjpeg = forward(1, e.mjpegPort, 9100);
     const xcode = spawnLogged(
       'xcodebuild',
       [
@@ -305,7 +365,11 @@ export class WdaManager {
    * connection the other side had already closed is retried once on a fresh one, so a stale socket never looks
    * like WDA being down (which would trigger a session recovery).
    */
-  private request(e: Entry, method: string, p: string, body: string | undefined, timeout: number, retried = false): Promise<{ status: number; text: string }> {
+  private request(e: Entry, method: string, p: string, body: string | undefined, timeout: number): Promise<{ status: number; text: string }> {
+    return this.requestOnce(e, method, p, body, timeout, false);
+  }
+
+  private requestOnce(e: Entry, method: string, p: string, body: string | undefined, timeout: number, retried: boolean): Promise<{ status: number; text: string }> {
     return new Promise((resolve, reject) => {
       let settled = false;
       const headers: Record<string, string | number> = {};
@@ -330,7 +394,7 @@ export class WdaManager {
         settled = true;
         clearTimeout(timer);
         const stale = req.reusedSocket && (err.code === 'ECONNRESET' || err.code === 'EPIPE' || /socket hang up/i.test(err.message));
-        if (stale && !retried) resolve(thisRef.request(e, method, p, body, timeout, true));
+        if (stale && !retried) resolve(thisRef.requestOnce(e, method, p, body, timeout, true));
         else reject(err);
       }
       const thisRef = this;
@@ -396,7 +460,7 @@ export class WdaManager {
   }
 
   private async createSession(e: Entry): Promise<string> {
-    const j = await this.raw(e, 'POST', '/session', { capabilities: { alwaysMatch: CAPS }, desiredCapabilities: CAPS });
+    const j = await this.raw(e, 'POST', '/session', { capabilities: { alwaysMatch: CAPS }, desiredCapabilities: CAPS }, 15000);
     const id = j.sessionId ?? j.value?.sessionId;
     if (!id) throw new WdaError('server', 'WDA did not return a session id');
     e.sessionId = id;
@@ -451,7 +515,7 @@ export class WdaManager {
     if (!(err instanceof WdaError) || err.kind !== 'session' || e.sessionId !== sid || e.recovering || e.status !== 'ready') return;
     if (e.goneAt && Date.now() - e.goneAt < 5000) return; // a WDA that refuses every session: the health check's job
     e.goneAt = Date.now();
-    this.log(e, `the session expired (${err.message}); making a new one`);
+    this.healed(e, `the session expired (${err.message}); making a new one`);
     e.sessionId = undefined;
     e.mjpegApplied = undefined;
     void this.session(e).then(
@@ -583,14 +647,26 @@ export class WdaManager {
       e.control = 'recovering';
       e.sessionId = undefined;
       e.mjpegApplied = undefined;
-      this.log(e, `recovering: ${why}`);
+      this.healed(e, `recovering: ${why}`);
+      let restarted = false;
       if (!(await this.ping(e, 2500)).ok) {
         this.log(e, 'WDA is not answering; restarting it');
         this.restart(e);
+        restarted = true;
       }
-      if (e.status !== 'ready') await this.waitReady(e, 45000);
+      if (e.status !== 'ready') await this.waitReady(e, restarted ? this.timeouts.restart : 45000);
       if (e.status !== 'ready') throw new WdaError('unreachable', `WebDriverAgent did not come back (${e.status})`);
-      await this.session(e);
+      try {
+        await this.session(e);
+      } catch (err) {
+        // /status answers but no session can be made (XCTest hung under it): only a fresh runner fixes that
+        if (restarted || !(err instanceof WdaError) || !err.down) throw err;
+        this.log(e, `no session could be made (${err.message}); restarting WDA`);
+        this.restart(e);
+        await this.waitReady(e, this.timeouts.restart);
+        if (e.status !== 'ready') throw new WdaError('unreachable', `WebDriverAgent did not come back (${e.status})`);
+        await this.session(e);
+      }
       e.control = 'ready';
       this.log(e, 'recovered');
     })();
@@ -608,6 +684,15 @@ export class WdaManager {
 
   private async withRecovery<T>(udid: string, fn: (e: Entry) => Promise<T>): Promise<T> {
     const e = await this.usable(udid);
+    e.inflight++;
+    try {
+      return await this.retryOnce(e, fn);
+    } finally {
+      e.inflight--;
+    }
+  }
+
+  private async retryOnce<T>(e: Entry, fn: (e: Entry) => Promise<T>): Promise<T> {
     try {
       const r = await fn(e);
       e.lastOk = Date.now();
@@ -664,7 +749,7 @@ export class WdaManager {
         return await this.raw(e, method, `/session/${sid}${sub}`, body, timeout);
       } catch (err) {
         if (!(err instanceof WdaError) || err.down || !(await this.sessionExpired(e, sid))) throw err;
-        this.log(e, `the session expired (${err.message}); making a new one`);
+        this.healed(e, `the session expired (${err.message}); making a new one`);
         const r = await this.raw(e, method, `/session/${await this.session(e)}${sub}`, body, timeout);
         e.control = 'ready';
         return r;
@@ -680,6 +765,7 @@ export class WdaManager {
     const e = this.entries.get(udid);
     if (!e || !e.wanted || e.status !== 'ready' || e.recovering) return null;
     if (session && !e.sessionId) return null;
+    if (e.inflight > 0) return null; // WDA is busy with an action: a card's read never piles on top of it
     try {
       return (await this.raw(e, 'GET', session ? `/session/${e.sessionId}${p}` : p, undefined, timeout))?.value ?? null;
     } catch {
@@ -694,12 +780,89 @@ export class WdaManager {
   /** A read that never triggers a recovery (a slow /source on a heavy screen must not restart WDA). */
   private async read(udid: string, p: string, timeout: number): Promise<any> {
     const e = await this.usable(udid);
+    e.inflight++;
     try {
       const r = await this.raw(e, 'GET', p, undefined, timeout);
       e.lastOk = Date.now();
       return r;
     } catch (err) {
       throw this.named(e, err);
+    } finally {
+      e.inflight--;
+    }
+  }
+
+  /**
+   * Is the phone's WDA really there? Asks the session itself (GET /session/:id: /status alone answers while the
+   * session is long gone or XCTest under it is stuck), within the probe timeout, and heals what it finds: a session
+   * that expired is remade, a WDA that doesn't answer is recovered (restarted when /status fails too), a WDA waiting
+   * out a restart back-off is started now. True when WDA can take an action afterwards. One probe at a time per
+   * phone; never throws. `reason` names who asked (logged with any heal).
+   */
+  probe(udid: string, reason: string): Promise<boolean> {
+    const e = this.entries.get(udid);
+    if (!e || !e.wanted) return Promise.resolve(false);
+    e.probeP ??= this.probeNow(e, reason)
+      .catch(() => false)
+      .finally(() => {
+        e.probeP = undefined;
+      });
+    return e.probeP;
+  }
+
+  private async probeNow(e: Entry, reason: string): Promise<boolean> {
+    if (e.status === 'failed' && e.timer) {
+      clearTimeout(e.timer);
+      e.timer = undefined;
+      this.healed(e, `${reason}: WDA was waiting to restart; starting it now`);
+      this.launch(e);
+    }
+    if (e.status === 'starting') await this.waitReady(e, 45000);
+    if (e.recovering) await e.recovering.catch(() => {});
+    if (e.status !== 'ready') return false;
+    // an action or read is on its way to WDA (a long gesture, a big /source): WDA works one thing at a time, so a
+    // probe now would only wait behind it and look like a hang; that action finds out for itself
+    if (e.inflight > 0) return true;
+    const sid = e.sessionId;
+    try {
+      if (!sid) {
+        await this.session(e);
+      } else {
+        e.inflight++;
+        try {
+          await this.raw(e, 'GET', `/session/${sid}`, undefined, this.timeouts.probe);
+        } finally {
+          e.inflight--;
+        }
+      }
+      e.lastOk = Date.now();
+      e.control = 'ready';
+      return true;
+    } catch (err) {
+      if (!(err instanceof WdaError)) throw err;
+      if (!sid) {
+        await this.recover(e, `${reason}: no session could be made (${err.message})`);
+      } else if (err.kind === 'session' || (!err.down && (await this.sessionExpired(e, sid)))) {
+        this.healed(e, `${reason}: the session expired (${err.message}); making a new one`);
+        if (e.sessionId === sid) {
+          e.sessionId = undefined;
+          e.mjpegApplied = undefined;
+        }
+        try {
+          await this.session(e);
+        } catch (err2) {
+          await this.recover(e, `${reason}: no new session (${(err2 as Error).message})`);
+        }
+      } else if (!err.down) {
+        // this WDA has no GET /session/:id (or refuses it) and the session is still its own: alive
+        e.lastOk = Date.now();
+        return true;
+      } else {
+        await this.recover(e, `${reason}: ${err.message}`);
+      }
+      e.lastOk = Date.now();
+      e.control = 'ready';
+      return true;
     }
   }
 
@@ -720,7 +883,7 @@ export class WdaManager {
 
   /** A hardware button (XCUIDevice's: volumeUp, volumeDown, home). */
   async pressButton(udid: string, name: ButtonName | 'home'): Promise<void> {
-    await this.call(udid, 'POST', '/wda/pressButton', { name });
+    await this.call(udid, 'POST', '/wda/pressButton', { name }, this.timeouts.input);
   }
 
   /** Whether this phone's WDA has the fast touch route (unknown until the first touch tries it). */
@@ -748,7 +911,7 @@ export class WdaManager {
         }
         return [Math.round(x * 10) / 10, Math.round(y * 10) / 10, Math.round(t)];
       });
-      await this.callNoSession(udid, 'POST', FAST_TOUCH_ROUTE, { ...body, points, orientation: 1 }, 5000);
+      await this.callNoSession(udid, 'POST', FAST_TOUCH_ROUTE, { ...body, points, orientation: 1 }, Math.min(5000, this.timeouts.input));
       if (e.fast !== 'yes') this.log(e, 'fast touch route answers (patched WDA)');
       e.fast = 'yes';
       e.fastFails = 0;
@@ -776,7 +939,7 @@ export class WdaManager {
     const unknown = (err: unknown) => err instanceof WdaError && err.kind === 'unknown';
     if (!e || e.tapRoute === 0) {
       try {
-        await this.call(udid, 'POST', '/wda/tap', { x, y });
+        await this.call(udid, 'POST', '/wda/tap', { x, y }, this.timeouts.input);
         return 'wda';
       } catch (err) {
         if (!unknown(err)) throw err;
@@ -785,7 +948,7 @@ export class WdaManager {
     }
     if (!e || e.tapRoute <= 1) {
       try {
-        await this.call(udid, 'POST', '/wda/tap/0', { x, y });
+        await this.call(udid, 'POST', '/wda/tap/0', { x, y }, this.timeouts.input);
         return 'wda';
       } catch (err) {
         if (!unknown(err)) throw err;
@@ -806,7 +969,7 @@ export class WdaManager {
   private async w3c(udid: string, pts: PathPoint[]): Promise<void> {
     const ms = pts[pts.length - 1]![2];
     const actions = [{ type: 'pointer', id: 'finger1', parameters: { pointerType: 'touch' }, actions: pointerActions(pts) }];
-    await this.call(udid, 'POST', '/actions', { actions }, 30000 + ms);
+    await this.call(udid, 'POST', '/actions', { actions }, this.timeouts.input + ms);
   }
 
   /** Every ~10 s per phone: /status; recover before the owner notices. Skipped right after a successful action. */
@@ -815,6 +978,13 @@ export class WdaManager {
       if (!e.wanted || e.status !== 'ready' || e.recovering || e.checking) continue;
       if (e.sessionId && Date.now() - e.lastOk < HEALTH_MS - 1000) continue;
       e.checking = true;
+      if (this.watched?.(e.udid)) {
+        // someone is looking at this phone: ask the session itself, not just /status
+        void this.probe(e.udid, 'health check').finally(() => {
+          e.checking = false;
+        });
+        continue;
+      }
       void (async () => {
         const st = await this.ping(e, 3000);
         if (!st.ok) {
@@ -823,7 +993,7 @@ export class WdaManager {
         }
         e.lastOk = Date.now();
         if (e.sessionId && st.sessionId && st.sessionId !== e.sessionId) {
-          this.log(e, 'session was replaced on the phone; making a new one');
+          this.healed(e, 'health check: the session was replaced on the phone; making a new one');
           e.sessionId = undefined;
         }
         if (!e.sessionId) {

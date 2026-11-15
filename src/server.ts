@@ -8,7 +8,7 @@ import { Control, touchAck, TouchOwner } from './control.js';
 import { H264Viewer, KIND, RateMeter, REMOTE_DROP_BYTES, Transport, wsMessage } from './h264.js';
 import { IdleLock } from './idle.js';
 import { imageSize } from './imgsize.js';
-import { InfoCache, WdaSigning } from './info.js';
+import { appName, InfoCache, WdaSigning } from './info.js';
 import { THUMB_DEFAULT_FPS, THUMB_MAX_FPS, THUMB_MIN_FPS } from './lanes.js';
 import { frameAgrees, Size } from './orient.js';
 import type { WdaResigner, WdaSignStatus } from './resign.js';
@@ -22,7 +22,14 @@ export interface ServerExtras {
   settings?: SettingsStore;
   idle?: IdleLock;
   resigner?: WdaResigner;
+  /** How often a watched phone's WDA and lock state are checked (ms; default WATCH_MS; 0 = never on its own). */
+  watchMs?: number;
 }
+
+/** A phone someone watches (an open control socket or stream, or the focused one) is health-checked this often. */
+export const WATCH_MS = 12_000;
+/** Focusing a phone waits this long at most for the previous one to lock. */
+const FOCUS_LOCK_WAIT_MS = 8_000;
 
 /**
  * A viewer's connection profile: `profile=lan|remote` from the client wins; else from its address (the LAN and
@@ -155,6 +162,8 @@ export function createServer(backend: Backend, token: string, updater?: Updater,
   const control = new Control(backend);
   control.onInput = (udid, discrete) => idle.activity(udid, discrete);
   if (idle.supported) control.power = { lock: (u) => idle.lock(u), wake: (u) => idle.wake(u) };
+  // the first action after a quiet spell (and one that hung) has the phone's WDA probed and healed first
+  if (backend.heal) control.onHeal = (udid, reason) => backend.heal!(udid, reason);
   const agent = new Agent(backend, control);
 
   // ---- orientation: every open view of a phone hears when it turns (or its picture changes size) ----
@@ -192,6 +201,7 @@ export function createServer(backend: Backend, token: string, updater?: Updater,
         /* a closed socket */
       }
     }
+    void pushInfo(udid);
   };
   // a phone someone is watching is asked how it's turned every few seconds
   const watched = new Map<string, { n: number; timer: NodeJS.Timeout }>();
@@ -242,6 +252,9 @@ export function createServer(backend: Backend, token: string, updater?: Updater,
     const s = (stats ?? {}) as Record<string, unknown>;
     return {
       ...s,
+      // WDA's self-heals (a backend that never heals: none)
+      heals: typeof s.heals === 'number' ? s.heals : 0,
+      lastHeal: s.lastHeal ?? null,
       ...('h264_available' in s ? { video_path: s.h264_available ? ('h264' as const) : ('mjpeg' as const) } : {}),
       sessions: sessionsOf(udid),
       input: { ...control.meter.stats(udid), methods: backend.inputMethods?.(udid) },
@@ -253,7 +266,10 @@ export function createServer(backend: Backend, token: string, updater?: Updater,
    */
   const phoneView = (p: PhoneInfo, lan: string[], tailnet: string[]) => {
     const pw = idle.state(p.udid);
-    return { ...p, lan, tailnet, locked: pw.locked, screenOn: pw.screenOn, lastActive: pw.lastActive, stats: withInput(p.udid, p.stats), info: info.peek(p) };
+    return {
+      ...p, lan, tailnet, focused: p.udid === focused, locked: pw.locked, screenOn: pw.screenOn, lastActive: pw.lastActive,
+      stats: withInput(p.udid, p.stats), info: info.peek(p),
+    };
   };
   const wdaStatus = (): WdaSignStatus | { state: 'unavailable'; lastError: string } =>
     resigner ? resigner.status() : { state: 'unavailable', lastError: backend.mock ? 'mock mode' : 'the WDA re-sign scheduler is off' };
@@ -289,6 +305,126 @@ export function createServer(backend: Backend, token: string, updater?: Updater,
     if (!p.online) throw new HttpError(503, 'phone is offline');
     return p;
   };
+
+  // ---- info that keeps up: every control socket of a phone hears at once when its card changes ----
+  const infoSubs = new Map<string, Set<(msg: unknown) => void>>();
+  const onInfo = (udid: string, fn: (msg: unknown) => void): (() => void) => {
+    let set = infoSubs.get(udid);
+    if (!set) infoSubs.set(udid, (set = new Set()));
+    const mine = set;
+    mine.add(fn);
+    return () => {
+      mine.delete(fn);
+      if (!mine.size && infoSubs.get(udid) === mine) infoSubs.delete(udid);
+    };
+  };
+  /** `{type: "info", udid, info}` to the phone's control sockets: the card as it is now, with the orientation. */
+  async function pushInfo(udid: string): Promise<void> {
+    const subs = infoSubs.get(udid);
+    if (!subs?.size) return;
+    const p = (await backend.list().catch(() => [])).find((x) => x.udid === udid);
+    if (!p) return;
+    const msg = { type: 'info', udid, info: { ...info.peek(p), orientation: backend.orientation?.(udid) ?? null } };
+    for (const fn of [...subs]) {
+      try {
+        fn(msg);
+      } catch {
+        /* a closed socket */
+      }
+    }
+  }
+  info.onChange = (udid) => void pushInfo(udid);
+  // an action may have changed the app in front (or the battery): look again shortly, for the phones on show
+  control.onActed = (udid) => {
+    if (infoSubs.has(udid)) info.soon(udid);
+  };
+  // an AI read or a reported action saw the app in front: the cards hear it now
+  agent.onApp = (udid, bundleId) => info.patch(udid, { app: { bundleId, name: appName(bundleId) } });
+
+  // ---- one live phone at a time ----
+  /** The phone in focus (POST /focus): the only one whose capture runs; null until a client picks one. */
+  let focused: string | null = null;
+  /** Control sockets and streams open per phone (a viewer is attached). */
+  const attached = new Map<string, number>();
+  const attach = (udid: string): (() => void) => {
+    attached.set(udid, (attached.get(udid) ?? 0) + 1);
+    let done = false;
+    return () => {
+      if (done) return;
+      done = true;
+      const n = (attached.get(udid) ?? 1) - 1;
+      if (n > 0) attached.set(udid, n);
+      else attached.delete(udid);
+    };
+  };
+  const isWatched = (udid: string) => udid === focused || attached.has(udid);
+  backend.setWatched?.(isWatched);
+
+  /**
+   * Make `udid` the only live phone: the one in focus before it stops its capture and goes to sleep (locks) first,
+   * unless an agent action is running on it; then this one is woken and its capture started.
+   */
+  const focus = async (udid: string) => {
+    await phoneFor(udid);
+    const prev = focused;
+    focused = udid;
+    let previous: { udid: string; slept: boolean; reason?: string } | null = null;
+    if (prev && prev !== udid) {
+      backend.stopCapture?.(prev, 'another phone is in focus');
+      if (agent.busy(prev) || control.pending(prev) > 0) {
+        previous = { udid: prev, slept: false, reason: 'an agent action is running on it' };
+      } else if (!idle.supported) {
+        previous = { udid: prev, slept: false, reason: 'this backend cannot lock phones' };
+      } else {
+        // in the phone's queue, so it never lands on top of an action; a slow lock doesn't hold the new phone up long
+        const lock = control.handle(prev, { type: 'key', key: 'lock' }).then(
+          () => ({ udid: prev, slept: true }),
+          (err: Error) => ({ udid: prev, slept: false, reason: `lock failed: ${err.message}` }),
+        );
+        previous = await Promise.race([
+          lock,
+          new Promise<{ udid: string; slept: boolean; reason: string }>((r) =>
+            setTimeout(() => r({ udid: prev, slept: false, reason: 'still locking' }), FOCUS_LOCK_WAIT_MS).unref(),
+          ),
+        ]);
+      }
+      console.log(`[focus] ${prev.slice(-8)} -> ${udid.slice(-8)}${previous.slept ? ' (the previous one is asleep)' : ` (the previous one stays awake: ${previous.reason})`}`);
+    }
+    const state = warmUp(udid);
+    return { focused: udid, previous, ...state, input: backend.inputMethods?.(udid) ?? null };
+  };
+
+  // ---- the watch: phones on show are health-checked every WATCH_MS, in their queue ----
+  let watching = false;
+  const watchTick = async () => {
+    if (watching) return;
+    watching = true;
+    try {
+      const ids = new Set([...attached.keys(), ...(focused ? [focused] : [])]);
+      const list = ids.size ? await backend.list() : [];
+      await Promise.all(
+        [...ids].map(async (udid) => {
+          const p = list.find((x) => x.udid === udid);
+          if (!p?.online) return;
+          // WDA alive (a dead session remade, a dead WDA restarted) and the lock known before the next touch
+          await control
+            .check(udid, async () => {
+              if (backend.heal && !(await backend.heal(udid, 'watch'))) return;
+              if (backend.isLocked) idle.note(udid, await backend.isLocked(udid).catch(() => null));
+            })
+            .catch(() => {});
+          // the focused phone's capture stays warm while a viewer is attached (its view can reopen at once)
+          if (udid === focused && attached.has(udid) && !(p.stats?.viewers ?? 0)) warmUp(udid, false);
+          info.peek(p); // the card gathers again when it's ~15 s old: a change is pushed (info.onChange)
+        }),
+      );
+    } finally {
+      watching = false;
+    }
+  };
+  const watchEvery = extras.watchMs ?? WATCH_MS;
+  const watchTimer = watchEvery > 0 ? setInterval(() => void watchTick(), watchEvery) : undefined;
+  watchTimer?.unref();
 
   const server = http.createServer(async (req, res) => {
     try {
@@ -346,7 +482,7 @@ export function createServer(backend: Backend, token: string, updater?: Updater,
         return send(res, 200, await updater.now());
       }
 
-      const m = /^\/(?:phones|api\/devices)\/([^/]+)\/(screenshot|tap|swipe|path|hold|touch|type|key|home|launch|recover|input|wake|lock|ui|apps|orientation|tap-element|act|info|warm)$/.exec(path);
+      const m = /^\/(?:phones|api\/devices)\/([^/]+)\/(screenshot|tap|swipe|path|hold|touch|type|key|home|launch|recover|input|wake|lock|ui|apps|orientation|tap-element|act|info|warm|focus)$/.exec(path);
       if (!m) return send(res, 404, { error: 'not found' });
       const udid = decodeURIComponent(m[1]!);
       const action = m[2]!;
@@ -375,6 +511,11 @@ export function createServer(backend: Backend, token: string, updater?: Updater,
         if (req.method !== 'POST') throw new HttpError(405, 'use POST');
         await phoneFor(udid);
         return send(res, 200, { ok: true, udid, ...warmUp(udid), input: backend.inputMethods?.(udid) ?? null });
+      }
+      if (action === 'focus') {
+        // one live phone at a time: this one; the one before it stops its capture and sleeps
+        if (req.method !== 'POST') throw new HttpError(405, 'use POST');
+        return send(res, 200, { ok: true, udid, ...(await focus(udid)) });
       }
 
       if (action === 'screenshot') {
@@ -469,6 +610,7 @@ export function createServer(backend: Backend, token: string, updater?: Updater,
       const releaseIdle = idle.viewer(udid);
       ws.on('close', releaseIdle);
       ws.on('close', watch(udid));
+      ws.on('close', attach(udid));
       const sess: Sess = { profile, tier: tierOf(url.searchParams), net, t0 };
       if (codec === 'h264') void h264Socket(ws, udid, url.searchParams, remote, sess);
       else mjpegSocket(ws, udid, streamSettings(url.searchParams, remote), codec === 'mjpeg' ? { codec: 'mjpeg' } : {}, remote, sess);
@@ -717,6 +859,9 @@ export function createServer(backend: Backend, token: string, updater?: Updater,
     // the phone turned: the picture's size is the WebRTC view's when one runs here, else the screen's own
     const unturn = onTurn(udid, () => reply(orientMsg(udid, rtc.frame())));
     const unwatch = watch(udid);
+    // the phone is on show: health-checked every WATCH_MS, and its card's changes are pushed here as they happen
+    const unattach = attach(udid);
+    const uninfo = onInfo(udid, reply);
     ws.on('message', (data, isBinary) => {
       if (isBinary) return;
       const msg = parseObject(data);
@@ -734,11 +879,16 @@ export function createServer(backend: Backend, token: string, updater?: Updater,
       unlist();
       unturn();
       unwatch();
+      unattach();
+      uninfo();
     };
     ws.on('close', done);
     ws.on('error', done);
   }
 
+  server.on('close', () => {
+    if (watchTimer) clearInterval(watchTimer);
+  });
 
   return server;
 }

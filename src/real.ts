@@ -270,7 +270,11 @@ export class RealBackend implements Backend {
     const m = this.sources.get(udid);
     const srcs = this.phoneSources(udid);
     const reason = this.helperProblem() ?? srcs.map((s) => s.unavailable()).find((r) => r) ?? null;
-    return { ...phoneStats(srcs, { fps: m?.viewers ? m.meter.rate() : 0, viewers: m?.viewers ?? 0 }, reason, this.buildError()), capture_mismatch: this.capture.get(udid)?.mismatch ?? null };
+    return {
+      ...phoneStats(srcs, { fps: m?.viewers ? m.meter.rate() : 0, viewers: m?.viewers ?? 0 }, reason, this.buildError()),
+      capture_mismatch: this.capture.get(udid)?.mismatch ?? null,
+      ...this.wda.healStats(udid),
+    };
   }
 
   /** The last phonecap build's error while an older helper still runs, else null. */
@@ -579,7 +583,7 @@ export class RealBackend implements Backend {
       if ('done' in hid) return hid.done;
       why = hid.why;
     }
-    await this.wda.call(udid, 'POST', '/wda/keys', { value: Array.from(text) });
+    await this.wda.call(udid, 'POST', '/wda/keys', { value: Array.from(text) }, 10000 + text.length * 150);
     return why ? { via: 'wda', reason: why } : { via: 'wda' };
   }
 
@@ -632,12 +636,12 @@ export class RealBackend implements Backend {
   }
   async home(udid: string): Promise<InputResult> {
     this.known(udid);
-    await this.wda.callNoSession(udid, 'POST', '/wda/homescreen', {});
+    await this.wda.callNoSession(udid, 'POST', '/wda/homescreen', {}, 8000);
     return { via: 'wda' };
   }
   async launch(udid: string, bundleId: string): Promise<InputResult> {
     this.known(udid);
-    await this.wda.call(udid, 'POST', '/wda/apps/launch', { bundleId });
+    await this.wda.call(udid, 'POST', '/wda/apps/launch', { bundleId }, 20000);
     return { via: 'wda' };
   }
 
@@ -654,7 +658,7 @@ export class RealBackend implements Backend {
 
   async lock(udid: string): Promise<void> {
     this.known(udid);
-    await this.wdaPower(udid, 'POST', '/wda/lock');
+    await this.wdaPower(udid, 'POST', '/wda/lock', 8000);
   }
 
   async unlock(udid: string): Promise<void> {
@@ -676,6 +680,22 @@ export class RealBackend implements Backend {
 
   restartWda(udid: string): void {
     this.wda.restartRunner(udid);
+  }
+
+  /** Probe the phone's WDA session and heal what's wrong (src/wda.ts probe); false when WDA can't take input. */
+  async heal(udid: string, reason: string): Promise<boolean> {
+    if (!this.phones.get(udid)?.online) return false;
+    return this.wda.probe(udid, reason);
+  }
+
+  setWatched(fn: (udid: string) => boolean): void {
+    this.wda.watched = fn;
+  }
+
+  /** Stop the phone's capture now (another phone took the focus): no warm time, its viewers are told why. */
+  stopCapture(udid: string, why: string): void {
+    if (this.phoneSources(udid).length || this.hosts.has(udid)) console.log(`[capture ${udid.slice(-8)}] stopped: ${why}`);
+    this.closeH264(udid, why);
   }
 
   async recover(udid: string): Promise<ControlState> {

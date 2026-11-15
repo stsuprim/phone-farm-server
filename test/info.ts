@@ -118,12 +118,12 @@ const KEYS = ['battery', 'temperatureC', 'app', 'uptimeSec', 'model', 'ios', 'bo
   // nothing gathered yet: peek answers at once with what the list knows, and starts a gathering
   const first = cache.peek(phone);
   assert.deepEqual(Object.keys(first), KEYS);
-  assert.deepEqual([first.fresh, first.battery, first.temperatureC, first.model, first.wda.daysLeft], [false, { level: 0.5, charging: null }, null, 'iPhone14,5', 4.2]);
+  assert.deepEqual([first.fresh, first.battery, first.temperatureC, first.model, first.wda.daysLeft], [false, { level: 0.5, percent: 50, charging: null }, null, 'iPhone14,5', 4.2]);
   await sleep(5);
   assert.equal(asked, 1);
   const a = await cache.get(phone);
   assert.equal(asked, 1, 'under 15 s old: not gathered again');
-  assert.deepEqual([a.fresh, a.battery, a.temperatureC, a.at], [true, { level: 0.51, charging: true }, 30, 1_000_000]);
+  assert.deepEqual([a.fresh, a.battery, a.temperatureC, a.at], [true, { level: 0.51, percent: 51, charging: true }, 30, 1_000_000]);
   assert.deepEqual([a.bootedAt, a.uptimeSec], [400_000, 600]);
   now += 14_000;
   assert.equal((await cache.get(phone)).uptimeSec, 614, 'the phone kept running: uptime from its boot time');
@@ -175,7 +175,7 @@ const KEYS = ['battery', 'temperatureC', 'app', 'uptimeSec', 'model', 'ios', 'bo
   assert.equal(asked, before);
   // a phone never asked: the list's own facts, everything else null
   const none = await cache.get({ udid: 'U2', battery: null, model: '', ios: '', online: false } as PhoneInfo);
-  assert.deepEqual(none.battery, { level: null, charging: null });
+  assert.deepEqual(none.battery, { level: null, percent: null, charging: null });
   assert.deepEqual([none.temperatureC, none.app, none.uptimeSec, none.model, none.ios, none.bootedAt], [null, { bundleId: null, name: null }, null, null, null, null]);
   ok('cache: gathered at most every ~15 s, shared while it runs, peek never waits, a failure keeps the last answer');
 }
@@ -208,7 +208,7 @@ const KEYS = ['battery', 'temperatureC', 'app', 'uptimeSec', 'model', 'ios', 'bo
     assert.equal(status, 200);
     assert.deepEqual(Object.keys(body), ['ok', 'udid', ...KEYS]);
     assert.deepEqual([body.ok, body.udid], [true, u1]);
-    assert.deepEqual(body.battery, { level: 0.9, charging: true });
+    assert.deepEqual(body.battery, { level: 0.9, percent: 90, charging: true });
     assert.equal(body.temperatureC, 29.5);
     assert.deepEqual(body.app, { bundleId: 'com.apple.springboard', name: 'Home Screen' });
     assert.deepEqual([body.model, body.ios, body.thermal], ['iPhone14,5', '18.1', 'nominal']);
@@ -229,7 +229,7 @@ const KEYS = ['battery', 'temperatureC', 'app', 'uptimeSec', 'model', 'ios', 'bo
     // a phone that doesn't say its temperature or uptime: null, never a guess
     const quiet = (await get(`/phones/${u2}/info`)).body;
     assert.deepEqual([quiet.temperatureC, quiet.uptimeSec, quiet.bootedAt, quiet.thermal], [null, null, null, null]);
-    assert.deepEqual(quiet.battery, { level: 0.83, charging: false });
+    assert.deepEqual(quiet.battery, { level: 0.83, percent: 83, charging: false });
 
     // an unplugged phone: 200 with what's known, nothing asked of it
     const off = (await get(`/phones/${u4}/info`)).body;

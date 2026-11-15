@@ -215,3 +215,44 @@ prompt) and WDA does **not** need a rebuild. Set `B`, `H`, `J`, `U` as at the to
     **Report back** for steps 9-12, per phone: the three suites' last lines; step 10's JSON (the whole answer; it has no
     secrets) and its time, and any `null` that shouldn't be; step 11's cold, warm and warmed-ahead `connectMs`, how it
     felt in Lotus, the idle `phonecap` CPU; step 12's four answers and the log lines. Never include the token.
+
+---
+
+## 2026-11-16 (later): one live phone, staying responsive, info that keeps up (steps 13-16)
+
+Same rules as above (never print the token, don't edit the source, don't push). Read `README.md` sections "One live
+phone at a time", "Staying responsive (WDA self-heal)" and "Info that keeps up" first. Nothing native changed:
+`phonecap` and WDA are **not** rebuilt. Set `B`, `H`, `J`, `U` as at the top; `U2` = a second phone's UDID.
+
+13. **Get the code, build, test.** `ls test/heal.ts` (else `curl -s -X POST -H "$H" $B/update/now`, wait 60 s).
+    `npm install && npm run build`, then `npm test`: the last suite must say `all 5 heal checks passed`. Then
+    `launchctl kickstart -k gui/$(id -u)/com.lotus.phonefarm`, wait 30 s.
+
+14. **One live phone at a time.**
+    ```sh
+    curl -s -X POST -H "$H" $B/api/devices/$U/focus | python3 -m json.tool
+    curl -s -X POST -H "$H" $B/api/devices/$U2/focus | python3 -m json.tool
+    curl -s -H "$H" $B/api/devices | python3 -c 'import sys,json; [print(p["name"], p["focused"], p["locked"], p["info"]["battery"]) for p in json.load(sys.stdin)]'
+    grep -E '\[focus\]|\[capture .*stopped' server.log | tail -4
+    ```
+    -> the second answer has `"previous": {"udid": "<U>", "slept": true}`; **the first phone's screen goes dark**, the
+    second one wakes; the list shows `focused` true only for `U2`, and `battery` has both `level` (0..1) and `percent`
+    (0..100, the phone's own number). `ps -axo %cpu,command | grep -i '[p]honecap'` a few seconds later: one capture
+    running (the focused phone's), not two.
+
+15. **Doesn't stop answering after a while.** In Lotus, open the focused phone, tap around, then **leave it alone for
+    5 minutes** with the view open (let the phone's own Auto-Lock turn the screen off if it does). Then tap once.
+    -> the phone wakes and the tap lands, in one go (a second or two at most). Then:
+    `grep -E '\[wda-heal\]|was dark|woke' server.log | tail -10` and
+    `curl -s -H "$H" $B/api/devices | python3 -c 'import sys,json; [print(p["name"], p["stats"]["heals"], p["stats"]["lastHeal"]) for p in json.load(sys.stdin)]'`
+    -> note every `[wda-heal]` line (each names why). Also do a burst: tap 15 times as fast as you can in Lotus; every
+    tap should land, none should be stuck behind another. If a tap ever answers `got no answer within`, show me the
+    `[wda-heal]` lines around that time.
+
+16. **Info that keeps up.** With the phone open in Lotus, open Settings on it from Lotus (tap its icon): the card's app
+    should switch to Settings within about 2 s, without reloading. Unplug its charger for 30 s and plug it back:
+    `charging` follows within ~15 s.
+
+    **Report back** for steps 13-16: the suite's last line; step 14's two answers (no secrets in them) and whether the
+    first phone really went dark; step 15's `[wda-heal]` lines and `heals` numbers, how the tap after 5 minutes felt;
+    step 16 yes/no. Never include the token.

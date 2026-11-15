@@ -55,14 +55,23 @@ export function parseIoreg(xml: string): BatteryFacts {
     const m = new RegExp(`<key>${k}</key>\\s*<(true|false)\\s*/>`).exec(xml);
     return m ? m[1] === 'true' : null;
   };
-  const t = int('Temperature');
-  // 0 = no reading; anything outside what a phone survives is a different unit or a bad read
-  const temperatureC = t !== null && t > 0 && t / 100 > -30 && t / 100 < 110 ? round(t / 100, 1) : null;
+  const temperatureC = ioregCelsius(int('Temperature'));
   const cur = int('CurrentCapacity');
   const max = int('MaxCapacity');
   const level = cur !== null && max !== null && max > 0 && cur >= 0 && cur <= max ? round(cur / max, 2) : null;
   const charging = flag('IsCharging');
   return { level, charging: charging === true || (flag('FullyCharged') === true && flag('ExternalConnected') !== false) ? true : charging, temperatureC };
+}
+
+/**
+ * AppleSmartBattery's Temperature in degrees Celsius. iPhones say hundredths of a degree (3015 = 30.2 C); a battery
+ * that already says whole degrees (30) would otherwise read as 0.3 C, so a value that's only plausible in degrees is
+ * taken as degrees. 0 is no reading; anything a working phone can't be at (below 1 C, 90 C or more) is a bad read.
+ */
+export function ioregCelsius(t: number | null): number | null {
+  if (t === null || !Number.isFinite(t) || t <= 0) return null;
+  const c = t >= 100 ? t / 100 : t;
+  return c >= 1 && c < 90 ? round(c, 1) : null;
 }
 
 /** WDA's GET /wda/batteryInfo: `{level: 0..1, state: 1 unplugged | 2 charging | 3 full}` (UIDevice's). */
@@ -88,6 +97,8 @@ export function parseDeviceInfo(v: unknown, now: number): { thermal: DeviceInfo[
   const ts = finite(o.thermalState);
   const thermal = ts !== null && Number.isInteger(ts) && ts >= 0 && ts <= 3 ? THERMAL[ts]! : null;
   let uptimeSec = finite(o.uptime) ?? finite(o.systemUptime);
+  // seconds; a build that gives milliseconds would read as years (no phone runs 3 years without a reboot)
+  if (uptimeSec !== null && uptimeSec > 1e8) uptimeSec /= 1000;
   let bootedAt: number | null = null;
   const boot = finite(o.bootTime) ?? finite(o.bootedAt);
   if (boot !== null && boot > 0) {
@@ -147,6 +158,16 @@ export function basicFacts(p: Pick<PhoneInfo, 'battery' | 'model' | 'ios'>): Pho
   };
 }
 
+/** The battery's 0..1 level as a whole percent (0..100); null when unknown. */
+export function batteryPercent(level: number | null | undefined): number | null {
+  return typeof level === 'number' && Number.isFinite(level) ? Math.min(100, Math.max(0, Math.round(level * 100))) : null;
+}
+
+/** What a card shows that's worth telling at once when it changes (not the temperature's every tenth of a degree). */
+function signature(f: PhoneFacts): string {
+  return JSON.stringify([f.app.bundleId, f.battery.level, f.battery.charging, f.thermal]);
+}
+
 export type WdaSigning = DeviceInfo['wda'];
 
 interface Kept {
@@ -162,6 +183,9 @@ interface Kept {
 export class InfoCache {
   private kept = new Map<string, Kept>();
   private flying = new Map<string, Promise<Kept>>();
+  private timers = new Map<string, NodeJS.Timeout>();
+  /** A gathering (or a patch) changed what a card shows: the app in front, the battery, charging, the thermal state. */
+  onChange?: (udid: string) => void;
 
   constructor(
     private gather: (udid: string) => Promise<PhoneFacts>,
@@ -172,8 +196,9 @@ export class InfoCache {
 
   private view(k: Kept | undefined, basic: PhoneFacts, fresh: boolean): DeviceInfo {
     const f = k?.facts;
+    const level = f?.battery.level ?? basic.battery.level;
     return {
-      battery: { level: f?.battery.level ?? basic.battery.level, charging: f?.battery.charging ?? basic.battery.charging },
+      battery: { level, percent: batteryPercent(level), charging: f?.battery.charging ?? basic.battery.charging },
       temperatureC: f?.temperatureC ?? null,
       app: f?.app ?? basic.app,
       // the phone keeps running between two gatherings
@@ -208,13 +233,37 @@ export class InfoCache {
     };
   }
 
+  /**
+   * Gather the phone's facts again shortly (`ms`; several asks inside that time make one gathering): after an action
+   * or an AI read that may have changed the app in front or the battery. `onChange` hears when they did.
+   */
+  soon(udid: string, ms = 1200): void {
+    if (this.timers.has(udid)) return;
+    const t = setTimeout(() => {
+      this.timers.delete(udid);
+      void this.refresh(udid).catch(() => {});
+    }, ms);
+    t.unref?.();
+    this.timers.set(udid, t);
+  }
+
+  /** What an action or AI read already learned (the app in front): kept now, and `onChange` told when it's news. */
+  patch(udid: string, part: { app?: DeviceInfo['app'] }): void {
+    const k = this.kept.get(udid);
+    if (!k || !part.app?.bundleId || part.app.bundleId === k.facts.app.bundleId) return;
+    k.facts = { ...k.facts, app: { bundleId: part.app.bundleId, name: part.app.name ?? null } };
+    this.onChange?.(udid);
+  }
+
   private refresh(udid: string): Promise<Kept> {
     let p = this.flying.get(udid);
     if (!p) {
       p = this.gather(udid)
         .then((facts) => {
+          const prev = this.kept.get(udid);
           const k = { facts: this.carry(udid, facts), at: this.now() };
           this.kept.set(udid, k);
+          if (prev && signature(prev.facts) !== signature(k.facts)) this.onChange?.(udid);
           return k;
         })
         .finally(() => this.flying.delete(udid));

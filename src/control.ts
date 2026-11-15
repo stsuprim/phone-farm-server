@@ -129,11 +129,52 @@ interface RunOptions {
   silent?: boolean;
   /** Why a slower route took it, for the meter and the ack. */
   reason?: string;
+  /** How long it may take before it counts as hung (ms; default the action timeout; Infinity: no limit). */
+  timeoutMs?: number;
+  /** Not input at all (a health check): not activity, not timed, no spacing, never marks the phone as acted on. */
+  quiet?: boolean;
 }
 
 export interface ControlOptions {
   /** A live touch with no event for this long is lifted (ms; default TOUCH_RELEASE_MS). */
   releaseMs?: number;
+  /** Discrete actions on one phone start at least this long after the last one ended (ms; default MIN_GAP_MS). */
+  minGapMs?: number;
+  /** An action that takes longer than this is answered with an error and the phone is healed (ms; default ACTION_TIMEOUT_MS). */
+  actionTimeoutMs?: number;
+  /** The first discrete action after this long without one probes the phone first (ms; default IDLE_PROBE_MS). */
+  idleProbeMs?: number;
+}
+
+/** Bursts are spaced: WDA (and the phone) get a breath between two discrete actions. */
+export const MIN_GAP_MS = 40;
+/** An action hung longer than this (beyond its own length) is given up on and the phone healed. */
+export const ACTION_TIMEOUT_MS = 20_000;
+/** A phone left alone this long is probed (and healed) before the next action, inside the same request. */
+export const IDLE_PROBE_MS = 30_000;
+/** How long an action waits for that probe (a WDA restart takes longer: the action then waits in WDA's own start). */
+const HEAL_WAIT_MS = 20_000;
+/** How long an action waits for the phone to wake before it goes anyway. */
+const WAKE_WAIT_MS = 30_000;
+/** After an action timed out, the next one waits this much longer for it to settle (never two at once on WDA). */
+const HUNG_GRACE_MS = 5_000;
+
+/** `p`, or `onTimeout()`'s error after `ms`. */
+function within<T>(p: Promise<T>, ms: number, onTimeout: () => Error): Promise<T> {
+  if (!Number.isFinite(ms)) return p;
+  return new Promise<T>((resolve, reject) => {
+    const t = setTimeout(() => reject(onTimeout()), ms);
+    p.then(
+      (v) => {
+        clearTimeout(t);
+        resolve(v);
+      },
+      (e) => {
+        clearTimeout(t);
+        reject(e);
+      },
+    );
+  });
 }
 
 const round1 = (v: number) => Math.round(v * 10) / 10;
@@ -175,10 +216,40 @@ export class Control {
   power?: { lock(udid: string): Promise<unknown>; wake(udid: string): Promise<unknown> };
   /** An app's name -> its bundle id (src/agent.ts), for `launch {name}`. */
   resolveApp?: (udid: string, name: string) => Promise<string>;
+  /**
+   * Probe the phone and heal what's wrong (backend.heal): called inside the queue before the first discrete action
+   * after `idleProbeMs` without one, and (not waited for) when an action hung.
+   */
+  onHeal?: (udid: string, reason: string) => Promise<unknown>;
+  /** An action ran (or failed): what it may have changed (the app in front, the battery) is worth a fresh look. */
+  onActed?: (udid: string) => void;
+  private minGapMs: number;
+  private actionTimeoutMs: number;
+  private idleProbeMs: number;
 
   constructor(private backend: Backend, meter?: InputMeter, opts: ControlOptions = {}) {
     this.meter = meter ?? new InputMeter();
     this.releaseMs = opts.releaseMs ?? TOUCH_RELEASE_MS;
+    this.minGapMs = opts.minGapMs ?? MIN_GAP_MS;
+    this.actionTimeoutMs = opts.actionTimeoutMs ?? ACTION_TIMEOUT_MS;
+    this.idleProbeMs = opts.idleProbeMs ?? IDLE_PROBE_MS;
+  }
+
+  /** Actions waiting in (or running from) the phone's queue now. */
+  pending(udid: string): number {
+    return this.queues.get(udid)?.waiting ?? 0;
+  }
+
+  /**
+   * A health check in the phone's queue, so it never runs on WDA alongside an action; skipped (false) when the queue
+   * isn't empty (the phone is busy, so it's being used: the actions themselves find out).
+   */
+  async check(udid: string, fn: () => Promise<void>): Promise<boolean> {
+    if (this.pending(udid) > 0) return false;
+    await this.run(udid, 'health', null, async () => {
+      await fn();
+    }, { quiet: true, timeoutMs: Infinity });
+    return true;
   }
 
   /**
@@ -222,7 +293,7 @@ export class Control {
         if (typeof msg.text !== 'string') throw new HttpError(400, '"text" must be a string');
         const text = msg.text + (msg.enter === true ? '\n' : '');
         if (!text) throw new HttpError(400, '"text" is empty');
-        return this.run(udid, 'type', tRecv, () => this.backend.type(udid, text), { discrete: true });
+        return this.run(udid, 'type', tRecv, () => this.backend.type(udid, text), { discrete: true, timeoutMs: this.actionTimeoutMs + text.length * 150 });
       }
       case 'key':
         return this.key(udid, msg.key, tRecv);
@@ -234,7 +305,7 @@ export class Control {
         return this.run(udid, 'wake', tRecv, async () => {
           await power.wake(udid);
           return { via: 'wda' as InputVia };
-        });
+        }, { timeoutMs: 45_000 });
       }
       case 'launch': {
         const bundleId = typeof msg.bundleId === 'string' && msg.bundleId ? msg.bundleId : null;
@@ -284,7 +355,7 @@ export class Control {
     let state: ControlState = 'down';
     return this.run(udid, 'recover', null, async () => {
       state = await this.backend.recover(udid);
-    }, { silent: true }).then(() => state);
+    }, { silent: true, timeoutMs: Infinity }).then(() => state);
   }
 
   /** Forget unfinished live touches started by `owner` (its socket closed); a finger down on the phone is lifted. */
@@ -340,7 +411,7 @@ export class Control {
 
   /** `pts` are upright points already (mapped and clamped). */
   private gesture(udid: string, pts: PathPoint[], type: string, tRecv: number): Promise<Result> {
-    return this.run(udid, type, tRecv, () => this.backend.gesture(udid, pts), { discrete: true });
+    return this.run(udid, type, tRecv, () => this.backend.gesture(udid, pts), { discrete: true, timeoutMs: this.actionTimeoutMs + Math.max(0, pts[pts.length - 1]![2]) });
   }
 
   // ---- the phone's queue ----
@@ -355,16 +426,39 @@ export class Control {
     if (q.waiting >= MAX_WAITING && !opts.must) return Promise.reject(new HttpError(503, 'too many actions waiting for this phone'));
     const queue = q;
     queue.waiting++;
+    let hung: Promise<unknown> | null = null; // the action that timed out, still on its way at the phone
     const p = queue.tail.then(async () => {
+      if (opts.quiet) return fn();
+      // the first action after a quiet spell: the phone's WDA is probed (and healed) first, in this same request
+      if (opts.discrete && this.onHeal) {
+        const last = this.acted.get(udid);
+        const quiet = last === undefined ? Infinity : performance.now() - last;
+        if (quiet >= this.idleProbeMs) {
+          const why = last === undefined ? 'first action since the server started' : `first action after ${Math.round(quiet / 1000)} s idle`;
+          await within(this.onHeal(udid, why), HEAL_WAIT_MS, () => new Error('probe')).catch(() => {});
+        }
+      }
       // input is activity (idle lock); a locked or dark phone is woken first, here, so the order of actions holds
       if (!opts.silent) {
         const waking = this.onInput?.(udid, !!opts.discrete);
-        if (waking && opts.discrete) await waking;
+        if (waking && opts.discrete) await within(waking, WAKE_WAIT_MS, () => new Error('wake')).catch(() => {});
+      }
+      // bursts are spaced: a discrete action starts a breath after the last one ended
+      if (opts.discrete && this.minGapMs > 0) {
+        const since = performance.now() - (this.acted.get(udid) ?? -Infinity);
+        if (since < this.minGapMs) await sleep(this.minGapMs - since);
       }
       const tStart = performance.now();
       this.acted.set(udid, tStart);
       try {
-        let r = await fn();
+        const inner = fn();
+        const limit = opts.timeoutMs ?? this.actionTimeoutMs;
+        let r = await within(inner, limit, () => {
+          hung = inner.catch(() => {});
+          const why = `${type} on the phone got no answer within ${Math.round(limit / 1000)} s`;
+          void this.onHeal?.(udid, why)?.catch(() => {});
+          return new HttpError(504, `${why}: the phone is being checked and healed; it may still happen, so look at the screen before trying again`);
+        });
         if (opts.reason && r && !r.reason) r = { ...r, reason: opts.reason };
         if (tRecv !== null) this.record(udid, type, tRecv, tStart, r ? r.via : null, true, undefined, r ? r.reason : undefined);
         return r;
@@ -373,17 +467,18 @@ export class Control {
         throw err;
       } finally {
         this.acted.set(udid, performance.now());
+        if (opts.discrete) this.onActed?.(udid);
       }
     });
     // An action answered when it was queued on the phone (HID's paths, the fast WDA route) is still playing there:
     // its sender has its answer, but the phone's next action waits until it's through, so a Home press or a tap by
-    // another route never lands in the middle of a swipe.
+    // another route never lands in the middle of a swipe. One that timed out is waited for a little longer too.
     queue.tail = p.then(
       (r) => {
         const play = r && typeof r.play_ms === 'number' && r.play_ms > 0 ? Math.min(r.play_ms, MAX_GESTURE_MS) : 0;
         return play ? sleep(play).then(() => void this.acted.set(udid, performance.now())) : undefined;
       },
-      () => undefined,
+      () => (hung ? Promise.race([hung, sleep(HUNG_GRACE_MS)]).then(() => undefined) : undefined),
     );
     void queue.tail.then(() => {
       queue.waiting--;
@@ -566,7 +661,7 @@ export class Control {
     this.disarm(g);
     if (this.touches.get(udid) === g) this.touches.delete(udid);
     g.ended = true;
-    return this.run(udid, this.isTap(g) ? 'tap' : 'gesture', tRecv, () => this.play(udid, g), { discrete: true, must: true, reason: g.reason });
+    return this.run(udid, this.isTap(g) ? 'tap' : 'gesture', tRecv, () => this.play(udid, g), { discrete: true, must: true, reason: g.reason, timeoutMs: this.actionTimeoutMs + Math.max(0, g.pts[g.pts.length - 1]?.[2] ?? 0) });
   }
 
   private isTap(g: Touch): boolean {
