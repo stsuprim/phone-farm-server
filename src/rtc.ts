@@ -1,7 +1,7 @@
 import type NdcModule from 'node-datachannel';
 import { bitrateAsk, DEFAULT_CEILING_BPS, DelayTracker, parseRtcp, RateControl, REMOTE_START_BPS } from './congestion.js';
-import type { Control } from './control.js';
-import { H264Settings, H264Source, H264Viewer, KIND, Rec, Transport } from './h264.js';
+import { Control, touchAck } from './control.js';
+import { H264Info, H264Settings, H264Source, H264Viewer, KIND, Rec, Transport } from './h264.js';
 import { THUMB_DEFAULT_FPS } from './lanes.js';
 import { Backend, HttpError, Profile, QualityTier } from './types.js';
 
@@ -161,6 +161,14 @@ export function paceFor(ceilingBps: number): number {
 
 const errText = (err: unknown) => (err instanceof Error ? err.message : String(err));
 
+/** What the server gives a session beyond the backend (src/server.ts); tests leave it out. */
+export interface RtcHooks {
+  /** One input message -> its answer (src/agent.ts `dispatch`): acks, touch acks, reports. */
+  dispatch?: (msg: Record<string, unknown>, owner: object) => Promise<Record<string, unknown> | null>;
+  /** The phone as it's turned now: `{orientation, point_width, point_height, screen_width, screen_height}`. */
+  view?: () => Record<string, unknown>;
+}
+
 /** One WebRTC session for one control WebSocket: a sendonly H.264 track plus the "input"/"input-r" channels. */
 export class RtcSession {
   private pc?: PeerConnection;
@@ -177,8 +185,6 @@ export class RtcSession {
   private t0 = 0;
   private lastTs = -1;
   private path: string | null = null;
-  private pendingMove?: Record<string, unknown>;
-  private moveScheduled = false;
   private lastMoveT = -1;
   private inputR?: DataChannel;
   private lastTsMsg = 0;
@@ -192,6 +198,7 @@ export class RtcSession {
   private want?: { bitrate: number | null };
   private delay = new DelayTracker(); // the round trip from the browser's receiver reports
   private tier: QualityTier = 'full';
+  private uninfo?: () => void;
   readonly since = Date.now();
 
   constructor(
@@ -200,7 +207,38 @@ export class RtcSession {
     private udid: string,
     private signal: (msg: Record<string, unknown>) => void,
     private remote = false,
+    private hooks: RtcHooks = {},
   ) {}
+
+  /** The picture's size now (null until frames flow). */
+  frame(): H264Info | null {
+    return this.ready && !this.closed ? this.src?.info ?? null : null;
+  }
+
+  /** The server lifted one of this session's touches itself (src/control.ts): the client hears it on "input-r". */
+  touchReleased(info: { id: unknown; reason: string; error?: string }): void {
+    try {
+      if (this.inputR?.isOpen()) this.inputR.sendMessage(JSON.stringify({ type: 'touch-released', ...info }));
+    } catch {
+      /* closed */
+    }
+  }
+
+  /** An input message's answer: the server's dispatch, else (tests) the plain acks. */
+  private async answer(msg: Record<string, unknown>): Promise<Record<string, unknown> | null> {
+    if (this.hooks.dispatch) return this.hooks.dispatch(msg, this);
+    const t0 = performance.now();
+    const id = msg.id ?? null;
+    try {
+      const r = await this.control.handle(this.udid, msg, this);
+      const ack = touchAck(msg, t0, r);
+      if (ack) return ack;
+      return id !== null ? { type: 'ack', id, ok: true, ...(r ? { via: r.via, ms: Math.round((performance.now() - t0) * 10) / 10 } : {}) } : null;
+    } catch (err) {
+      const error = err instanceof HttpError ? err.message : 'internal error';
+      return touchAck(msg, t0, undefined, error) ?? { type: 'ack', id, ok: false, error };
+    }
+  }
 
   async start(sdp: string, wantRaw: unknown): Promise<void> {
     const ndc = await loadRtc();
@@ -283,7 +321,14 @@ export class RtcSession {
       (info) => {
         if (this.closed) return;
         this.ready = true;
-        this.signal({ type: 'rtc-hello', codec: 'h264', width: info.width, height: info.height, fps: info.fps, scale: info.scale, lane: src.kind, server_time: Date.now() });
+        this.signal({
+          type: 'rtc-hello', codec: 'h264', ...(this.hooks.view?.() ?? {}), width: info.width, height: info.height, fps: info.fps, scale: info.scale,
+          lane: src.kind, server_time: Date.now(),
+        });
+        // the picture changed size (the phone turned): a new config and keyframe follow, and the client hears the size
+        this.uninfo = src.onInfo((i) => {
+          if (!this.closed) this.signal({ type: 'orientation', udid: this.udid, ...(this.hooks.view?.() ?? {}), width: i.width, height: i.height });
+        });
         this.attach();
       },
       (err) => this.fail(errText(err)),
@@ -436,36 +481,18 @@ export class RtcSession {
         return reply({ type: 'ack', id: null, ok: false, error: 'message must be a JSON object' });
       }
       if (msg.type === 'ping') return reply({ type: 'pong', t: msg.t ?? null, server_time: Date.now() });
-      if (msg.type === 'touch' && msg.phase === 'move' && msg.id === undefined) return this.move(msg);
+      if (msg.type === 'touch' && msg.phase === 'move' && typeof msg.seq !== 'number') {
+        // an older client's move on the unordered channel (no `seq` to order it by): one older than the newest is late
+        const t = typeof msg.t === 'number' ? msg.t : null;
+        if (t !== null && t < this.lastMoveT) return;
+        if (t !== null) this.lastMoveT = t;
+      }
       if (msg.type === 'touch' && msg.phase === 'down') this.lastMoveT = -1;
-      this.flushMove(); // a down/up after moves keeps their order
-      const id = msg.id ?? null;
-      const t0 = performance.now();
-      this.control.handle(this.udid, msg, this).then(
-        (r) => {
-          if (id !== null) reply({ type: 'ack', id, ok: true, ...(r ? { via: r.via, ms: Math.round((performance.now() - t0) * 10) / 10 } : {}) });
-        },
-        (err) => reply({ type: 'ack', id, ok: false, error: err instanceof HttpError ? err.message : 'internal error' }),
-      );
+      // touches are applied in the order they came (src/control.ts): a down and an up always, moves folded into the
+      // newest while the phone is behind, a move older than one already applied skipped by its `seq`; each is answered
+      // on the channel it came on
+      void this.answer(msg).then((m) => m && reply(m));
     });
-  }
-
-  /** Moves (unordered, unreliable channel): late ones are dropped, a burst is coalesced to the latest point. */
-  private move(msg: Record<string, unknown>): void {
-    const t = typeof msg.t === 'number' ? msg.t : null;
-    if (t !== null && t < this.lastMoveT) return; // arrived out of order
-    if (t !== null) this.lastMoveT = t;
-    this.pendingMove = msg;
-    if (this.moveScheduled) return;
-    this.moveScheduled = true;
-    setImmediate(() => this.flushMove());
-  }
-
-  private flushMove(): void {
-    this.moveScheduled = false;
-    const m = this.pendingMove;
-    this.pendingMove = undefined;
-    if (m) this.control.handle(this.udid, m, this).catch(() => {});
   }
 
   private fail(reason: string): void {
@@ -477,6 +504,7 @@ export class RtcSession {
   close(_why = 'closed'): void {
     if (this.closed) return;
     this.closed = true;
+    this.uninfo?.();
     if (this.ccTimer) clearInterval(this.ccTimer);
     if (this.viewer) this.src?.remove(this.viewer);
     this.viewer = undefined;
@@ -495,7 +523,7 @@ export class RtcSession {
 }
 
 /** Handles the rtc-* messages of one control socket. Returns true if the message was a signaling message. */
-export function rtcSignaling(backend: Backend, control: Control, udid: string, send: (m: Record<string, unknown>) => void, remote = false) {
+export function rtcSignaling(backend: Backend, control: Control, udid: string, send: (m: Record<string, unknown>) => void, remote = false, hooks: RtcHooks = {}) {
   let session: RtcSession | undefined;
   return {
     handle(msg: Record<string, unknown>): boolean {
@@ -506,7 +534,7 @@ export function rtcSignaling(backend: Backend, control: Control, udid: string, s
             send({ type: 'rtc-error', reason: '"sdp" must be a string' });
             return true;
           }
-          const s = new RtcSession(backend, control, udid, send, remote);
+          const s = new RtcSession(backend, control, udid, send, remote, hooks);
           session = s;
           s.start(msg.sdp, msg.want).catch((err) => {
             send({ type: 'rtc-error', reason: errText(err) });
@@ -533,6 +561,10 @@ export function rtcSignaling(backend: Backend, control: Control, udid: string, s
     /** The WebRTC session's numbers, or null without one. */
     info() {
       return session?.info() ?? null;
+    },
+    /** The WebRTC picture's size now, or null without one. */
+    frame() {
+      return session?.frame() ?? null;
     },
   };
 }

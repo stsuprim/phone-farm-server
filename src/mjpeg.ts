@@ -53,10 +53,44 @@ export class MjpegSource {
   private req?: http.ClientRequest;
   private retry?: NodeJS.Timeout;
   readonly meter = new RateMeter();
+  /** The newest frame and when it came (while connected). */
+  last?: Buffer;
+  lastAt = 0;
+  private waiters = new Set<(f: Buffer) => void>();
+  private peekOff?: () => void;
+  private peekTimer?: NodeJS.Timeout;
   constructor(private port: () => number) {}
 
   get viewers(): number {
-    return this.subs.size;
+    return this.subs.size - (this.peekOff ? 1 : 0);
+  }
+
+  /**
+   * The newest frame without being a viewer: the last one if it came within `maxAgeMs`, else the next (null after
+   * `timeoutMs`). The connection it opens stays a few seconds, so a second look (after an action) costs nothing.
+   */
+  grab(maxAgeMs: number, timeoutMs: number): Promise<Buffer | null> {
+    if (!this.peekOff) this.peekOff = this.add(() => {});
+    if (this.peekTimer) clearTimeout(this.peekTimer);
+    this.peekTimer = setTimeout(() => {
+      this.peekTimer = undefined;
+      const off = this.peekOff;
+      this.peekOff = undefined;
+      off?.();
+    }, 4000);
+    this.peekTimer.unref?.();
+    if (this.last && Date.now() - this.lastAt <= maxAgeMs) return Promise.resolve(this.last);
+    return new Promise((resolve) => {
+      const w = (f: Buffer) => {
+        clearTimeout(t);
+        resolve(f);
+      };
+      const t = setTimeout(() => {
+        this.waiters.delete(w);
+        resolve(null);
+      }, timeoutMs);
+      this.waiters.add(w);
+    });
   }
 
   add(cb: (f: Buffer) => void): () => void {
@@ -78,6 +112,13 @@ export class MjpegSource {
     }
     const parser = new MjpegParser((f) => {
       this.meter.tick();
+      this.last = f;
+      this.lastAt = Date.now();
+      if (this.waiters.size) {
+        const ws = [...this.waiters];
+        this.waiters.clear();
+        for (const w of ws) w(f);
+      }
       for (const cb of this.subs) cb(f);
     });
     const req = http.get({ host: '127.0.0.1', port, path: '/', agent: false }, (res) => {
@@ -104,6 +145,7 @@ export class MjpegSource {
   private stop(): void {
     this.req?.destroy();
     this.req = undefined;
+    this.last = undefined;
     if (this.retry) clearTimeout(this.retry);
     this.retry = undefined;
   }

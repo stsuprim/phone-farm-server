@@ -1,8 +1,11 @@
+import crypto from 'node:crypto';
+import { withKnown } from './apps.js';
 import { H264Source, phoneStats, RateMeter } from './h264.js';
 import { mockProducer } from './h264mock.js';
+import { isLandscape, Orientation } from './orient.js';
 import { encodePng } from './png.js';
 import type { InputResult } from './inputlog.js';
-import { Backend, ControlState, H264Want, HttpError, Image, ImageFormat, InputMethods, PathPoint, PhoneInfo, ScreenInfo, StreamSettings } from './types.js';
+import { AppInfo, Backend, ButtonName, ControlState, H264Want, HttpError, Image, ImageFormat, InputMethods, PathPoint, PhoneInfo, ScreenInfo, StreamSettings } from './types.js';
 
 const MOCK: InputResult = { via: 'mock' };
 
@@ -11,14 +14,25 @@ export interface MockOptions {
   h264?: boolean;
   /** Stop an unused mock H.264 source after this long (default 10 s, like the real one). */
   h264IdleMs?: number;
+  /** true = the mock phones take live touch (down/move/up as they come), like CoreDevice HID. Default false. */
+  live?: boolean;
 }
 
-const W = 270;
-const H = 585;
+/** The mock home screen's apps (GET /ui shows them as buttons; tapping one opens it). */
+const HOME_APPS: [string, string][] = [
+  ['Safari', 'com.apple.mobilesafari'],
+  ['Settings', 'com.apple.Preferences'],
+  ['Camera', 'com.apple.camera'],
+  ['Photos', 'com.apple.mobileslideshow'],
+];
+const SPRINGBOARD = 'com.apple.springboard';
+
+const PORTRAIT_W = 270; // the mock picture's size in portrait (it's turned with the phone)
+const PORTRAIT_H = 585;
 const SCREEN_W = 390; // logical points, like a real iPhone
 const SCREEN_H = 844;
 const PIXEL_SCALE = 3; // reported like an @3x phone
-const SCALE = W / SCREEN_W;
+const SCALE = PORTRAIT_W / SCREEN_W;
 
 type RGB = [number, number, number];
 
@@ -37,6 +51,9 @@ interface MockPhone {
   app: string;
   typed: string;
   frame: number;
+  orientation: Orientation;
+  /** What reached the phone, in order (tests): "tap x,y", "down x,y", "move x,y", "up x,y", "button volumeUp"... */
+  log: string[];
 }
 
 function hsv(h: number, s: number, v: number): RGB {
@@ -60,6 +77,8 @@ export class MockBackend implements Backend {
   private streams = new Set<NodeJS.Timeout>();
   private h264Sources = new Map<string, H264Source>();
   private mjpeg = new Map<string, { viewers: number; meter: RateMeter }>();
+  /** Set by the server: a phone's orientation or upright size changed. */
+  onOrientation?: (udid: string) => void;
 
   constructor(count: number, private opts: MockOptions = {}) {
     const models = ['iPhone14,5', 'iPhone13,2', 'iPhone15,2', 'iPhone12,1'];
@@ -73,7 +92,7 @@ export class MockBackend implements Backend {
           scale: PIXEL_SCALE, point_width: SCREEN_W, point_height: SCREEN_H,
           width: SCREEN_W * PIXEL_SCALE, height: SCREEN_H * PIXEL_SCALE,
         },
-        hue: hash(udid) % 360, marks: [], app: 'com.apple.springboard', typed: '', frame: 0,
+        hue: hash(udid) % 360, marks: [], app: SPRINGBOARD, typed: '', frame: 0, orientation: 'portrait', log: [],
       });
     }
     // slowly drain the batteries so the UI has something moving
@@ -95,8 +114,30 @@ export class MockBackend implements Backend {
       const m = this.mjpeg.get(p.info.udid);
       const src = this.h264Sources.get(p.info.udid);
       const reason = this.opts.h264 === false ? 'H.264 is turned off in this mock' : src?.unavailable() ?? null;
-      return { ...p.info, stats: phoneStats(src, { fps: m?.viewers ? m.meter.rate() : 0, viewers: m?.viewers ?? 0 }, reason) };
+      const s = this.screen(p.info.udid)!;
+      return {
+        ...p.info, point_width: s.width, point_height: s.height, width: s.width * PIXEL_SCALE, height: s.height * PIXEL_SCALE, orientation: p.orientation,
+        stats: phoneStats(src, { fps: m?.viewers ? m.meter.rate() : 0, viewers: m?.viewers ?? 0 }, reason),
+      };
     });
+  }
+
+  orientation(udid: string): Orientation | null {
+    return this.phones.get(udid)?.orientation ?? null;
+  }
+  async refreshOrientation(udid: string): Promise<Orientation | null> {
+    return this.orientation(udid);
+  }
+  /** Turn a mock phone (tests, and trying a client against a landscape phone). */
+  setOrientation(udid: string, o: Orientation): void {
+    const p = this.live(udid);
+    if (p.orientation === o) return;
+    p.orientation = o;
+    this.onOrientation?.(udid);
+  }
+  /** What reached a mock phone, in order (tests). */
+  inputLog(udid: string): string[] {
+    return this.live(udid).log;
   }
 
   h264(udid: string, want: H264Want): H264Source | string {
@@ -114,10 +155,81 @@ export class MockBackend implements Backend {
   }
 
   screen(udid: string): ScreenInfo | null {
-    return this.phones.has(udid) ? { width: SCREEN_W, height: SCREEN_H, scale: PIXEL_SCALE } : null;
+    const p = this.phones.get(udid);
+    if (!p) return null;
+    return isLandscape(p.orientation) ? { width: SCREEN_H, height: SCREEN_W, scale: PIXEL_SCALE } : { width: SCREEN_W, height: SCREEN_H, scale: PIXEL_SCALE };
+  }
+
+  /** The mock screen as WDA's /source would give it (upright points): a few things to read, tap and type into. */
+  private tree(p: MockPhone): Record<string, unknown> {
+    const s = this.screen(p.info.udid)!;
+    const node = (type: string, label: string | null, x: number, y: number, w: number, h: number, extra: Record<string, unknown> = {}) => ({
+      type, label, name: label, value: null, rect: { x, y, width: w, height: h }, isEnabled: '1', isVisible: '1', children: [] as unknown[], ...extra,
+    });
+    const kids: unknown[] = [node('StaticText', p.info.name, 16, 50, s.width - 32, 24)];
+    if (p.app === SPRINGBOARD) {
+      const cell = (s.width - 32) / HOME_APPS.length;
+      HOME_APPS.forEach(([name], i) => kids.push(node('Icon', name, 16 + i * cell, 120, cell - 8, 70)));
+      kids.push(node('Button', 'Hidden', 16, 300, 80, 30, { isVisible: '0' }));
+    } else {
+      const name = HOME_APPS.find(([, id]) => id === p.app)?.[0] ?? p.app;
+      const bar = node('NavigationBar', name, 0, 80, s.width, 44);
+      bar.children.push(node('Button', 'Back', 8, 84, 70, 36), node('StaticText', name, s.width / 2 - 60, 88, 120, 28));
+      kids.push(bar, node('TextField', 'Search', 16, 140, s.width - 32, 40, { value: p.typed || null }), node('Switch', 'Wi-Fi', s.width - 80, 200, 60, 32, { value: '1' }));
+    }
+    const win = node('Window', null, 0, 0, s.width, s.height);
+    win.children = kids;
+    const app = node('Application', p.app === SPRINGBOARD ? 'SpringBoard' : p.app, 0, 0, s.width, s.height);
+    app.children = [win];
+    return app;
+  }
+
+  /** A tap on the mock screen does what the thing under it does: an icon opens its app, Back goes home. */
+  private hit(p: MockPhone, x: number, y: number): void {
+    const s = this.screen(p.info.udid)!;
+    if (p.app === SPRINGBOARD) {
+      const cell = (s.width - 32) / HOME_APPS.length;
+      const i = Math.floor((x - 16) / cell);
+      if (y >= 120 && y <= 190 && i >= 0 && i < HOME_APPS.length && x - 16 - i * cell <= cell - 8) p.app = HOME_APPS[i]![1];
+    } else if (x >= 8 && x <= 78 && y >= 84 && y <= 120) p.app = SPRINGBOARD;
+  }
+
+  async uiSource(udid: string): Promise<unknown> {
+    return this.tree(this.live(udid));
+  }
+  async activeApp(udid: string): Promise<string | null> {
+    return this.phones.get(udid)?.app ?? null;
+  }
+  async apps(udid: string): Promise<AppInfo[]> {
+    this.live(udid);
+    return withKnown(HOME_APPS.map(([name, bundleId]) => ({ name, bundleId, installed: true })));
+  }
+  async pressButton(udid: string, name: ButtonName): Promise<InputResult> {
+    this.live(udid).log.push(`button ${name}`);
+    return MOCK;
+  }
+  /** Changes when the mock screen does (the app, the typed text, the orientation, the lock). */
+  async frameHash(udid: string): Promise<string | null> {
+    const p = this.phones.get(udid);
+    if (!p?.info.online) return null;
+    return crypto.createHash('sha1').update(JSON.stringify([p.app, p.typed, p.orientation, this.lockedSet.has(udid)])).digest('hex').slice(0, 16);
+  }
+
+  liveTouchReady(udid: string): boolean {
+    return !!this.opts.live && !!this.phones.get(udid)?.info.online;
+  }
+  async liveTouch(udid: string, phase: 'down' | 'move' | 'up', x: number, y: number): Promise<InputResult> {
+    const p = this.live(udid);
+    p.log.push(`${phase} ${Math.round(x)},${Math.round(y)}`);
+    if (phase !== 'move') p.marks.push({ x, y, at: Date.now() });
+    return { via: 'hid' };
   }
 
   private render(p: MockPhone): Buffer {
+    // the picture is upright: wide when the mock phone is in landscape
+    const wide = isLandscape(p.orientation);
+    const W = wide ? PORTRAIT_H : PORTRAIT_W;
+    const H = wide ? PORTRAIT_W : PORTRAIT_H;
     const px = new Uint8Array(W * H * 3);
     const c0 = hsv(p.hue, 0.55, 0.95);
     const c1 = hsv((p.hue + 40) % 360, 0.7, 0.45);
@@ -173,7 +285,10 @@ export class MockBackend implements Backend {
     return { data: this.render(this.live(udid)), contentType: 'image/png' }; // mock always serves PNG
   }
   async tap(udid: string, x: number, y: number): Promise<InputResult> {
-    this.live(udid).marks.push({ x, y, at: Date.now() });
+    const p = this.live(udid);
+    p.marks.push({ x, y, at: Date.now() });
+    p.log.push(`tap ${Math.round(x)},${Math.round(y)}`);
+    this.hit(p, x, y);
     return MOCK;
   }
   async gesture(udid: string, points: PathPoint[]): Promise<InputResult> {
@@ -181,19 +296,25 @@ export class MockBackend implements Backend {
     const a = points[0]!;
     const b = points[points.length - 1]!;
     p.marks.push({ x: a[0], y: a[1], x2: b[0], y2: b[1], at: Date.now() });
+    p.log.push(`gesture ${points.length}`);
     return MOCK;
   }
   async type(udid: string, text: string): Promise<InputResult> {
     const p = this.live(udid);
-    p.typed = (p.typed + text).slice(-200);
+    for (const ch of text) p.typed = ch === '\b' ? p.typed.slice(0, -1) : (p.typed + ch).slice(-200);
+    p.log.push(`type ${JSON.stringify(text)}`);
     return MOCK;
   }
   async home(udid: string): Promise<InputResult> {
-    this.live(udid).app = 'com.apple.springboard';
+    const p = this.live(udid);
+    p.app = SPRINGBOARD;
+    p.log.push('home');
     return MOCK;
   }
   async launch(udid: string, bundleId: string): Promise<InputResult> {
-    this.live(udid).app = bundleId;
+    const p = this.live(udid);
+    p.app = bundleId;
+    p.log.push(`launch ${bundleId}`);
     return MOCK;
   }
   inputMethods(_udid: string): InputMethods {
@@ -202,11 +323,11 @@ export class MockBackend implements Backend {
 
   private lockedSet = new Set<string>();
   async lock(udid: string): Promise<void> {
-    this.live(udid);
+    this.live(udid).log.push('lock');
     this.lockedSet.add(udid);
   }
   async unlock(udid: string): Promise<void> {
-    this.live(udid);
+    this.live(udid).log.push('unlock');
     this.lockedSet.delete(udid);
   }
   async isLocked(udid: string): Promise<boolean | null> {

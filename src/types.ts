@@ -1,5 +1,6 @@
 import type { H264Source } from './h264.js';
 import type { InputResult, InputStats } from './inputlog.js';
+import type { Orientation } from './orient.js';
 
 /** Whether a phone can be driven right now: WDA session warm, being recovered, or unavailable. */
 export type ControlState = 'ready' | 'recovering' | 'down';
@@ -15,12 +16,14 @@ export interface PhoneInfo {
   control: ControlState;
   /** Screen scale (points -> pixels), from WDA; null until a WDA session has been made. */
   scale: number | null;
-  /** Screen size in points (WDA's coordinate space); null until known. */
+  /** Screen size in points (WDA's coordinate space), upright: as the phone is turned now; null until known. */
   point_width: number | null;
   point_height: number | null;
-  /** Screen size in pixels (points x scale); null until known. */
+  /** Screen size in pixels (points x scale), upright: the picture's true shape now; null until known. */
   width: number | null;
   height: number | null;
+  /** How the phone is turned now (src/orient.ts); null until WDA has said. */
+  orientation?: Orientation | null;
   /** Live view numbers for this phone (see README). */
   stats?: StreamStats;
   /** The Mac's own base URLs on its LAN (private IPv4), e.g. "http://192.168.1.20:8787". */
@@ -89,6 +92,8 @@ export interface StreamStats {
   video_path?: 'h264' | 'mjpeg';
   /** Each open live view (server.ts fills it in). */
   sessions?: SessionStats[];
+  /** The capture's picture doesn't have the phone's shape (wide against tall) and couldn't be put right: why. */
+  capture_mismatch?: string | null;
 }
 
 /**
@@ -129,7 +134,17 @@ export interface H264Want {
   tier?: QualityTier;
 }
 
-/** Screen size in points plus the scale, as WDA reports it. */
+/** An app on the phone (GET /apps): `installed` null when the phone's own list couldn't be read (a well-known app). */
+export interface AppInfo {
+  bundleId: string;
+  name: string;
+  installed: boolean | null;
+}
+
+/** A hardware button POST /key presses through the backend. */
+export type ButtonName = 'volumeUp' | 'volumeDown';
+
+/** Screen size in points (upright: as the phone is turned now) plus the scale, as WDA reports it. */
 export interface ScreenInfo {
   width: number;
   height: number;
@@ -161,8 +176,14 @@ export class HttpError extends Error {
 export interface Backend {
   readonly mock: boolean;
   list(): Promise<PhoneInfo[]>;
-  /** Cached screen size in points (for clamping); null when not known yet. */
+  /** Cached screen size in points, upright (as the phone is turned now), for mapping and clamping; null when not known yet. */
   screen(udid: string): ScreenInfo | null;
+  /** How the phone is turned now (cached); null when not known. */
+  orientation?(udid: string): Orientation | null;
+  /** Ask the phone how it's turned unless that was asked within `maxAgeMs`; resolves to what's known then. */
+  refreshOrientation?(udid: string, maxAgeMs?: number): Promise<Orientation | null>;
+  /** Set by the server: called when a phone's orientation or upright size changed. */
+  onOrientation?: (udid: string) => void;
   screenshot(udid: string, format: ImageFormat): Promise<Image>;
   /** Quick tap at a point. Resolves once it's injected (or queued on the phone), saying how it went. */
   tap(udid: string, x: number, y: number): Promise<InputResult | void>;
@@ -173,6 +194,8 @@ export interface Backend {
   launch(udid: string, bundleId: string): Promise<InputResult | void>;
   /** The phone takes live touch (down/move/up injected as they come) right now. */
   liveTouchReady?(udid: string): boolean;
+  /** Why it doesn't (HID starting, failed, not on this iOS...), for the ack's `reason`; null when it does. */
+  liveTouchWhy?(udid: string): string | null;
   /** One live touch event straight to the phone (only after liveTouchReady said yes). */
   liveTouch?(udid: string, phase: 'down' | 'move' | 'up', x: number, y: number): Promise<InputResult | void>;
   /** A live view opened: keep the phone's fast input channel open until the returned release is called. */
@@ -185,6 +208,16 @@ export interface Backend {
   unlock?(udid: string): Promise<void>;
   /** Whether the phone is locked now (WDA /wda/locked); null when it can't tell. */
   isLocked?(udid: string): Promise<boolean | null>;
+  /** WDA's /source tree (format=json) of what's on screen (src/ui.ts flattens it). */
+  uiSource?(udid: string): Promise<unknown>;
+  /** The foreground app's bundle id; null when it can't tell. */
+  activeApp?(udid: string): Promise<string | null>;
+  /** The phone's apps (installed ones when they can be listed, plus the well-known ones). */
+  apps?(udid: string): Promise<AppInfo[]>;
+  /** Press a hardware button. */
+  pressButton?(udid: string, name: ButtonName): Promise<InputResult | void>;
+  /** A cheap hash of the picture now (the newest frame), to tell whether an action changed the screen; null when none. */
+  frameHash?(udid: string): Promise<string | null>;
   /** Restart the phone's WDA runner (reinstalls a freshly signed build). */
   restartWda?(udid: string): void;
   /** Drop the WDA session, restart the runner if WDA doesn't answer, make a new warm session. */

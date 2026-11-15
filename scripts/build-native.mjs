@@ -51,7 +51,7 @@ const tmpApp = path.join(out, 'PhoneCap.app.tmp');
 const args = [
   '--sdk', 'macosx', 'swiftc', '-O', '-swift-version', '5', '-o', tmp, src,
   '-framework', 'AVFoundation', '-framework', 'CoreMedia', '-framework', 'CoreMediaIO',
-  '-framework', 'CoreVideo', '-framework', 'VideoToolbox',
+  '-framework', 'CoreVideo', '-framework', 'VideoToolbox', '-framework', 'CoreImage', '-framework', 'ImageIO',
   // embed an Info.plist so macOS's camera prompt (TCC) has a usage string for this command-line tool
   '-Xlinker', '-sectcreate', '-Xlinker', '__TEXT', '-Xlinker', '__info_plist', '-Xlinker', plist,
 ];

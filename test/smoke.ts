@@ -250,8 +250,10 @@ try {
           let frames = 0;
           const t = setTimeout(() => reject(new Error('no fallback frames')), 5000);
           ws.on('message', (d, isBinary) => {
-            if (!isBinary) hello = JSON.parse(d.toString());
-            else if (++frames >= 2) { clearTimeout(t); ws.close(); resolve({ hello, frames }); }
+            if (!isBinary) {
+              const m = JSON.parse(d.toString());
+              if (m.type === 'hello') hello = m; // an "orientation" message follows with the frames' real size
+            } else if (++frames >= 2) { clearTimeout(t); ws.close(); resolve({ hello, frames }); }
           });
           ws.on('error', reject);
         }, reject);

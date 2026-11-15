@@ -20,7 +20,13 @@ stdout, one JSON object per line:
   {"id", "ok", "error"?, "ms"}             the answer: when the report is written (down/move/up/tap) or queued
   {"ev": "done", "id", "ok", "error"?, "ms"} a queued path/type finished
   {"ev": "hello", "version"} / {"ev": "open", "tsid", "ms"} / {"ev": "closed", "why"} / {"ev": "fatal", "error"}
+  {"ev": "released", "why"}                  a finger left down with no report for 3 s was lifted here (the server
+                                             lifts a quiet touch after 1.5 s itself; this is for when it can't)
 `ms` is the time on this side from reading the line to the report written (receive -> injected).
+
+A report that fails closes the touch session and its tunnel ({"ev": "closed", "why": "error: ..."}): the phone lifts
+any finger with it, the failed input is answered {"ok": false}, and the server reopens the session (src/hid.ts)
+while WebDriverAgent takes that gesture.
 
 --mock: no device, no pymobiledevice3; reports are only counted (for the server's tests).
 """
@@ -33,10 +39,11 @@ import sys
 import threading
 import time
 
-VERSION = 1
+VERSION = 2
 CONTACT = 0xC2
 RELEASE = 0x02
 MAIN_TOUCHSCREEN = 257
+STUCK_SECONDS = 3.0  # a finger down with no report for this long is lifted
 
 
 def out(obj):
@@ -122,6 +129,9 @@ class Phone:
         self.tsid = MAIN_TOUCHSCREEN
         self.kb = None
         self.last = None  # last contact point while a finger is down
+        self.touch_at = 0.0  # when the last touch report went out (time.monotonic())
+        self.scripted = False  # a path is playing (its holds are meant)
+        self.lock = asyncio.Lock()  # one report at a time (the watchdog lifts from its own task)
 
     async def open(self):
         if self.svc is not None:
@@ -173,7 +183,20 @@ class Phone:
             await self.drop_rsd()
 
     async def report(self, state, x, y):
-        await self.svc.send_touchscreen(state, x, y, service_id=self.tsid)
+        async with self.lock:
+            await self.svc.send_touchscreen(state, x, y, service_id=self.tsid)
+            self.touch_at = time.monotonic()
+
+    async def lift_if_stuck(self):
+        """Lift a finger left down with no report for STUCK_SECONDS. True if it did."""
+        if self.last is None or self.scripted or self.svc is None:
+            return False
+        if time.monotonic() - self.touch_at < STUCK_SECONDS:
+            return False
+        x, y = self.last
+        self.last = None
+        await self.report(RELEASE, x, y)
+        return True
 
     async def down(self, x, y):
         if self.last is not None:  # a press while a finger is still down: lift it first
@@ -198,19 +221,23 @@ class Phone:
     async def path(self, points):
         t0 = time.perf_counter()
         first = True
-        for p in points:
-            x, y = clamp16(p[0]), clamp16(p[1])
-            at = max(0.0, float(p[2]) / 1000.0) if len(p) > 2 else 0.0
-            wait = at - (time.perf_counter() - t0)
-            if wait > 0:
-                await asyncio.sleep(wait)
-            if first:
-                await self.down(x, y)
-                first = False
-            else:
-                await self.move(x, y)
-        if self.last is not None:
-            await self.up(*self.last)
+        self.scripted = True
+        try:
+            for p in points:
+                x, y = clamp16(p[0]), clamp16(p[1])
+                at = max(0.0, float(p[2]) / 1000.0) if len(p) > 2 else 0.0
+                wait = at - (time.perf_counter() - t0)
+                if wait > 0:
+                    await asyncio.sleep(wait)
+                if first:
+                    await self.down(x, y)
+                    first = False
+                else:
+                    await self.move(x, y)
+            if self.last is not None:
+                await self.up(*self.last)
+        finally:
+            self.scripted = False
 
     async def type(self, text):
         if self.mock:
@@ -257,6 +284,17 @@ class Answered(Exception):
     """A failure whose answer already went out."""
 
 
+async def watchdog(phone):
+    """No stuck fingers: lift one left down with no report for STUCK_SECONDS."""
+    while True:
+        await asyncio.sleep(0.25)
+        try:
+            if await phone.lift_if_stuck():
+                out({"ev": "released", "why": f"no report for {STUCK_SECONDS:g} s"})
+        except Exception:  # noqa: BLE001 - the next input finds the broken session and reopens it
+            pass
+
+
 async def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--udid", required=True)
@@ -285,6 +323,7 @@ async def main():
         loop.call_soon_threadsafe(lines.put_nowait, None)
 
     threading.Thread(target=reader, daemon=True).start()
+    guard = asyncio.ensure_future(watchdog(phone))
     out({"ev": "hello", "version": VERSION, "mock": args.mock})
 
     while True:
@@ -362,6 +401,7 @@ async def main():
             answer(False, f"{type(e).__name__}: {e}")
             await phone.close(f"error: {type(e).__name__}", drop_tunnel=True)
 
+    guard.cancel()
     await phone.close("exit", drop_tunnel=True)
     return 0
 

@@ -272,6 +272,8 @@ export interface SourceOptions {
   log?: (m: string) => void;
   /** Whose lane this is: "lan" (full settings) or "remote" (a far viewer's), for the stats. */
   kind?: 'lan' | 'remote' | 'thumb';
+  /** The picture's size is known or changed (the phone turned): the backend checks it against the orientation. */
+  onInfo?: (info: H264Info) => void;
 }
 
 /** A lane's network numbers: its WebRTC viewers' longest round trip and queue (the worst one counts). */
@@ -314,12 +316,22 @@ export class H264Source {
   private idleMs: number;
   private openTimeoutMs: number;
   private log: (m: string) => void;
+  private infoSubs = new Set<(info: H264Info) => void>();
 
   constructor(private label: string, private startFn: StartProducer, private want: H264Settings, opts: SourceOptions = {}) {
     this.idleMs = opts.idleMs ?? 10_000;
     this.openTimeoutMs = opts.openTimeoutMs ?? 8_000;
     this.log = opts.log ?? ((m) => console.log(`[h264 ${label}] ${m}`));
     this.kind = opts.kind ?? null;
+    if (opts.onInfo) this.infoSubs.add(opts.onInfo);
+  }
+
+  /** Hear when the picture's size changes (the phone turned: a new config and keyframe follow). Returns the unsubscribe. */
+  onInfo(cb: (info: H264Info) => void): () => void {
+    this.infoSubs.add(cb);
+    return () => {
+      this.infoSubs.delete(cb);
+    };
   }
 
   get running(): boolean {
@@ -491,7 +503,12 @@ export class H264Source {
       case KIND.INFO: {
         try {
           const j = JSON.parse(r.payload.toString('utf8'));
+          const was = this.info;
           this.info = { width: Number(j.width) || 0, height: Number(j.height) || 0, fps: Number(j.fps) || this.want.fps, scale: Number(j.scale) || this.want.scale };
+          if (!was || was.width !== this.info.width || was.height !== this.info.height) {
+            if (was) this.log(`picture ${was.width}x${was.height} -> ${this.info.width}x${this.info.height}`);
+            for (const cb of [...this.infoSubs]) cb(this.info);
+          }
         } catch {
           /* ignore a bad info record */
         }

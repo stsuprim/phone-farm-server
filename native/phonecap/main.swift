@@ -14,22 +14,30 @@
 //   --bitrate --key-seconds); its records have the high nibble 0, exactly as before lanes.
 // stdin: "key [lane]" forces an IDR now (re-encoding the current screen if nothing new arrived), "bitrate [lane] <bit/s>"
 //   and "fps <lane> <fps>" change a running lane, "lane <id> <fps> <scale %> <bit/s> [<key seconds>]" adds or changes
-//   a lane, "unlane <id>" stops one, "quit" exits. A lane without the number is lane 0.
-// phonecap-caps: lanes
+//   a lane, "unlane <id>" stops one, "rotate <0|90|180|270>" turns the picture that many degrees clockwise before
+//   encoding (every lane; a new info record and keyframe follow), "quit" exits. A lane without the number is lane 0.
+// Rotation: the picture follows the phone as it turns (the buffers change size: each lane gets a new encoder, info
+//   record and keyframe). If the buffers keep the size the session started with (the turned picture squashed into
+//   it), the output is asked for the screen's own size; if that doesn't take, phonecap exits 8 and the server starts
+//   it again (a new session takes the screen's size as it is).
+// phonecap-caps: lanes rotate
 //   (scripts/build-native.mjs copies the caps above to build/phonecap.caps, so the server knows what this build speaks)
 // stderr: human-readable log lines. Exit codes: 2 no device, 3 camera access denied, 4 capture failed,
-//          5 device disconnected, 6 encoder failed, 7 several iPhones share a name and can't be told apart.
+//          5 device disconnected, 6 encoder failed, 7 several iPhones share a name and can't be told apart,
+//          8 the picture kept its old shape after the phone turned (the server starts the capture again).
 // --udid: macOS 27 gives iPhone screens random UUIDs, so phonecap links them to UDIDs itself (see "UDID -> screen
 //          device mapping"); --list prints each capture device's uniqueID, name, UDID (or "unresolved") and how.
 //
 // Build: scripts/build-native.mjs (npm run build): swiftc, then wraps it in build/PhoneCap.app and signs the bundle.
 
 import AVFoundation
+import CoreImage
 import CoreMedia
 import CoreMediaIO
 import CoreVideo
 import Foundation
 import IOKit
+import ImageIO
 import VideoToolbox
 
 signal(SIGPIPE, SIG_IGN)
@@ -845,7 +853,26 @@ final class Capturer: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate {
     private var lanes: [Int: EncodeLane] = [:]
     private var transfer: VTPixelTransferSession?
     private var lastBuffer: CVPixelBuffer?
+    private var lastRaw: CVPixelBuffer? // the last frame as captured (before any turn)
     private var lastFrameAt = 0.0
+    private var input: AVCaptureDeviceInput?
+    // the buffers' shape against the screen's own (see followSource); used on the capture queue only
+    private var frameCount = 0
+    private var disagreed = 0
+    private var agreedOnce = false
+    private var agreedSourceWidth = 0
+    private var agreedSourceHeight = 0
+    private var agreedBufferWidth = 0
+    private var agreedBufferHeight = 0
+    private var pinnedWidth = 0
+    private var pinnedHeight = 0
+    private var warned = false
+    // "rotate": degrees clockwise the picture is turned before encoding; used on the capture queue only
+    private var rotation = 0
+    private lazy var ciContext = CIContext(options: [.cacheIntermediates: false])
+    private var turnPool: CVPixelBufferPool?
+    private var turnPoolWidth = 0
+    private var turnPoolHeight = 0
 
     init(_ o: Options) {
         self.o = o
@@ -855,6 +882,7 @@ final class Capturer: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate {
 
     func start(_ device: AVCaptureDevice) throws {
         let input = try AVCaptureDeviceInput(device: device)
+        self.input = input
         session.beginConfiguration()
         guard session.canAddInput(input) else { throw NSError(domain: "phonecap", code: 1, userInfo: [NSLocalizedDescriptionKey: "cannot add the device input"]) }
         session.addInput(input)
@@ -886,12 +914,137 @@ final class Capturer: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate {
             log("iPhone screen device disconnected")
             exit(5)
         }
+        // the phone turned (or changed its screen mode): its video port has a new format
+        NotificationCenter.default.addObserver(forName: NSNotification.Name("AVCaptureInputPortFormatDescriptionDidChangeNotification"),
+                                               object: nil, queue: nil) { [weak self] _ in
+            if let self = self, let size = self.sourceSize() { log("screen is now \(size.width)x\(size.height)") }
+        }
         session.startRunning()
         log("capturing \(device.localizedName) [\(device.uniqueID)]")
     }
 
+    /// The screen's own picture size now (the device's video port format), or nil when it doesn't say.
+    private func sourceSize() -> (width: Int, height: Int)? {
+        guard let port = input?.ports.first(where: { $0.mediaType == .video }), let format = port.formatDescription else { return nil }
+        let d = CMVideoFormatDescriptionGetDimensions(format)
+        if d.width <= 0 || d.height <= 0 { return nil }
+        return (Int(d.width), Int(d.height))
+    }
+
+    /// The buffers must have the screen's shape (wide or tall). A running session can keep handing out the size it
+    /// started with after the phone turns, the turned picture squashed into it: then the output is asked for the
+    /// screen's own size (and again whenever that changes), and if the buffers still don't follow, a session that
+    /// did agree earlier is ended (exit 8) so the server starts a new one, which takes the screen as it is now.
+    private func followSource(width w: Int, height h: Int) {
+        frameCount += 1
+        if frameCount % 15 != 0 { return }
+        guard let src = sourceSize() else { return }
+        if pinnedWidth != 0 && (pinnedWidth != src.width || pinnedHeight != src.height) {
+            pin(src.width, src.height) // the screen changed size again: keep asking for its own
+            disagreed = 0
+            return
+        }
+        if (src.width > src.height) == (w > h) {
+            agreedOnce = true
+            agreedSourceWidth = src.width
+            agreedSourceHeight = src.height
+            agreedBufferWidth = w
+            agreedBufferHeight = h
+            disagreed = 0
+            warned = false
+            return
+        }
+        disagreed += 1
+        if disagreed < 2 { return }
+        // only buffers that stood still while the screen's format changed are stuck; when it's the format that
+        // stood still (or they never agreed), the buffers are the truth and nothing is touched
+        let sourceChanged = src.width != agreedSourceWidth || src.height != agreedSourceHeight
+        let buffersChanged = w != agreedBufferWidth || h != agreedBufferHeight
+        guard agreedOnce && sourceChanged && !buffersChanged else {
+            if !warned {
+                warned = true
+                log("buffers are \(w)x\(h) though the screen's format says \(src.width)x\(src.height); keeping the buffers")
+            }
+            return
+        }
+        if pinnedWidth == 0 {
+            log("buffers stayed \(w)x\(h) after the screen turned to \(src.width)x\(src.height): asking for the screen's own size")
+            pin(src.width, src.height)
+            disagreed = 0
+            return
+        }
+        if disagreed >= 8 {
+            log("the picture kept its old shape (\(w)x\(h)) after the phone turned to \(src.width)x\(src.height); starting the capture over")
+            exit(8)
+        }
+    }
+
+    /// Ask the output for buffers of this size (off the capture queue: AVFoundation reconfigures the session).
+    private func pin(_ width: Int, _ height: Int) {
+        pinnedWidth = width
+        pinnedHeight = height
+        let settings: [String: Any] = [
+            kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
+            kCVPixelBufferWidthKey as String: width,
+            kCVPixelBufferHeightKey as String: height,
+        ]
+        let out = output
+        DispatchQueue.main.async { out.videoSettings = settings }
+    }
+
+    /// The frame turned `rotation` degrees clockwise (Core Image), or nil if it can't be.
+    private func turned(_ pb: CVPixelBuffer) -> CVPixelBuffer? {
+        let w = CVPixelBufferGetWidth(pb)
+        let h = CVPixelBufferGetHeight(pb)
+        let ow = rotation == 180 ? w : h
+        let oh = rotation == 180 ? h : w
+        if turnPool == nil || turnPoolWidth != ow || turnPoolHeight != oh {
+            let attrs: [String: Any] = [
+                kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
+                kCVPixelBufferWidthKey as String: ow,
+                kCVPixelBufferHeightKey as String: oh,
+                kCVPixelBufferIOSurfacePropertiesKey as String: [String: Any](),
+            ]
+            var made: CVPixelBufferPool?
+            guard CVPixelBufferPoolCreate(nil, nil, attrs as CFDictionary, &made) == kCVReturnSuccess, made != nil else { return nil }
+            turnPool = made
+            turnPoolWidth = ow
+            turnPoolHeight = oh
+        }
+        guard let pool = turnPool else { return nil }
+        var out: CVPixelBuffer?
+        guard CVPixelBufferPoolCreatePixelBuffer(nil, pool, &out) == kCVReturnSuccess, let dst = out else { return nil }
+        let how: CGImagePropertyOrientation = rotation == 90 ? .right : (rotation == 270 ? .left : .down)
+        var image = CIImage(cvPixelBuffer: pb).oriented(how)
+        image = image.transformed(by: CGAffineTransform(translationX: -image.extent.origin.x, y: -image.extent.origin.y))
+        ciContext.render(image, to: dst)
+        return dst
+    }
+
+    /// Called on `queue`. Turn the picture this many degrees clockwise from now on (0 = as captured).
+    func setRotation(_ degrees: Int) {
+        let d = ((degrees / 90) * 90 % 360 + 360) % 360
+        if d == rotation { return }
+        rotation = d
+        log("picture turned \(d) degrees clockwise")
+        // a still screen sends no frames: the turned picture comes from the last one
+        guard let raw = lastRaw else { return }
+        let pb = d != 0 ? (turned(raw) ?? raw) : raw
+        lastBuffer = pb
+        lastFrameAt = nowMs()
+        for id in lanes.keys.sorted() {
+            if let lane = lanes[id] {
+                lane.keyWanted = true
+                encode(lane, pb, captured: nowMs())
+            }
+        }
+    }
+
     func captureOutput(_ output: AVCaptureOutput, didOutput sb: CMSampleBuffer, from connection: AVCaptureConnection) {
-        guard let pb = CMSampleBufferGetImageBuffer(sb) else { return }
+        guard let raw = CMSampleBufferGetImageBuffer(sb) else { return }
+        followSource(width: CVPixelBufferGetWidth(raw), height: CVPixelBufferGetHeight(raw))
+        lastRaw = raw
+        let pb = rotation != 0 ? (turned(raw) ?? raw) : raw
         let wall = nowMs()
         var captured = wall
         let pts = CMSampleBufferGetPresentationTimeStamp(sb)
@@ -1157,6 +1310,11 @@ Thread.detachNewThread {
         case "unlane":
             if n >= 2, let id = Int(parts[1]) {
                 capturer.queue.async { capturer.removeLane(id) }
+            }
+        case "rotate":
+            // "rotate <0|90|180|270>": degrees clockwise
+            if n >= 2, let d = Int(parts[1]) {
+                capturer.queue.async { capturer.setRotation(d) }
             }
         default:
             break

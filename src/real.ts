@@ -1,15 +1,19 @@
 import { execFile } from 'node:child_process';
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { parseInstalled, withKnown } from './apps.js';
 import { Config } from './config.js';
-import { H264Source, helperProducer, phoneStats, StartProducer } from './h264.js';
+import { H264Info, H264Source, helperProducer, phoneStats, StartProducer } from './h264.js';
+import { imageSize } from './imgsize.js';
 import { PhonecapHost, profileFor } from './lanes.js';
 import { HidHost, hidTypable, iosMajor, toHid } from './hid.js';
 import type { InputResult } from './inputlog.js';
 import { MjpegSource } from './mjpeg.js';
-import { Backend, ControlState, H264Want, HttpError, Image, ImageFormat, InputMethods, PathPoint, PhoneInfo, ScreenInfo, StreamSettings } from './types.js';
+import { frameAgrees, Orientation, Size } from './orient.js';
+import { AppInfo, Backend, ButtonName, ControlState, H264Want, HttpError, Image, ImageFormat, InputMethods, PathPoint, PhoneInfo, ScreenInfo, StreamSettings } from './types.js';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..'); // src/ or dist/ -> project root
 // inside a minimal app bundle so macOS gives it its own Camera (TCC) entry (scripts/build-native.mjs)
@@ -22,6 +26,25 @@ const HID_SCRIPT = path.join(ROOT, 'native', 'hid', 'hid_input.py');
 // the venv RINOR_TAP_CHECK.md makes; HID_PYTHON wins
 const HID_VENV_PYTHON = path.join(os.homedir(), '.phonefarm-hid', 'bin', 'python');
 const HID_RETRY_MS = 60000;
+/** How long a picture may disagree with the phone's orientation (wide against tall) before the capture starts over. */
+const CAPTURE_SETTLE_MS = 1200;
+const CAPTURE_RESTARTS = 2;
+const APPS_FRESH_MS = 5 * 60_000;
+
+/** What to do about a capture whose picture hasn't got the phone's shape (pure; `rotate` = CAPTURE_ROTATE). */
+export function captureFix(frame: Size, o: Orientation | null, s: { rotated: number; tries: number; rotate: 'off' | 'cw' | 'ccw' }): 'ok' | 'unrotate' | 'restart' | 'rotate' | 'give-up' {
+  if (frameAgrees(frame, o)) return 'ok';
+  if (s.rotated % 180 !== 0) return 'unrotate'; // it's our own quarter turn that disagrees now
+  if (s.tries < CAPTURE_RESTARTS) return 'restart'; // a new capture session takes the screen's size as it is now
+  return s.rotate === 'off' ? 'give-up' : 'rotate';
+}
+
+interface CaptureState {
+  size?: Size;
+  timer?: NodeJS.Timeout;
+  tries: number;
+  mismatch: string | null;
+}
 
 /** The built helper's capabilities ("lanes": several encoders from one capture); none for an older build. */
 function helperCaps(): string[] {
@@ -34,9 +57,9 @@ function helperCaps(): string[] {
 }
 import { WdaError, WdaManager } from './wda.js';
 
-function run(cmd: string, args: string[]): Promise<string> {
+function run(cmd: string, args: string[], timeout = 10000): Promise<string> {
   return new Promise((resolve, reject) => {
-    execFile(cmd, args, { timeout: 10000 }, (err, stdout) => (err ? reject(err) : resolve(stdout.trim())));
+    execFile(cmd, args, { timeout, maxBuffer: 8 * 1024 * 1024 }, (err, stdout) => (err ? reject(err) : resolve(stdout.trim())));
   });
 }
 
@@ -59,9 +82,19 @@ export class RealBackend implements Backend {
   private timer: NodeJS.Timeout;
   private polling = false;
   private hid = new Map<string, HidHost>(); // CoreDevice HID live touch, per phone (iOS 27+)
+  private capture = new Map<string, CaptureState>(); // each phone's picture shape against its orientation
+  private appCache = new Map<string, { at: number; apps: AppInfo[] }>();
+  /** Set by the server: a phone's orientation or upright size changed. */
+  onOrientation?: (udid: string) => void;
 
   constructor(private cfg: Config) {
     this.wda = new WdaManager(cfg, (udid) => this.phones.get(udid)?.name ?? udid);
+    this.wda.onOrientation = (udid) => {
+      const c = this.capture.get(udid);
+      if (c) c.tries = 0; // the phone turned: a new chance for the capture to follow
+      this.captureCheck(udid);
+      this.onOrientation?.(udid);
+    };
     void this.poll();
     this.timer = setInterval(() => void this.poll(), cfg.pollMs);
   }
@@ -101,6 +134,7 @@ export class RealBackend implements Backend {
           this.closeH264(udid, 'phone unplugged');
           this.hid.get(udid)?.close();
           this.hid.delete(udid);
+          this.appCache.delete(udid);
         }
       }
     } finally {
@@ -121,6 +155,7 @@ export class RealBackend implements Backend {
         point_height: s?.height ?? null,
         width: px(s?.width),
         height: px(s?.height),
+        orientation: this.wda.orientation(p.udid),
         stats: this.stats(p.udid),
       };
     });
@@ -140,13 +175,98 @@ export class RealBackend implements Backend {
     }
     this.hosts.get(udid)?.close();
     this.hosts.delete(udid);
+    const c = this.capture.get(udid);
+    if (c?.timer) clearTimeout(c.timer);
+    this.capture.delete(udid);
+  }
+
+  // ---- orientation: the phone's (WDA) against the capture's picture ----
+
+  orientation(udid: string): Orientation | null {
+    return this.wda.orientation(udid);
+  }
+
+  refreshOrientation(udid: string, maxAgeMs?: number): Promise<Orientation | null> {
+    return this.wda.refreshOrientation(udid, maxAgeMs);
+  }
+
+  /** CAPTURE_ROTATE: off (default), cw / ccw (turn a sideways picture upright that way), or 90 / 180 / 270 (always). */
+  private rotateMode(): 'off' | 'cw' | 'ccw' | number {
+    const v = (process.env.CAPTURE_ROTATE ?? 'off').trim().toLowerCase();
+    if (v === 'cw' || v === 'ccw') return v;
+    return v === '90' || v === '180' || v === '270' ? Number(v) : 'off';
+  }
+
+  /** A lane's picture size came or changed: the phone may just have turned, so ask it, then see whether they agree. */
+  private captureInfo(udid: string, info: H264Info): void {
+    if (!(info.width > 0) || !(info.height > 0)) return;
+    let c = this.capture.get(udid);
+    if (!c) this.capture.set(udid, (c = { tries: 0, mismatch: null }));
+    c.size = { width: info.width, height: info.height };
+    void this.wda.refreshOrientation(udid, 0).then(
+      () => this.captureCheck(udid),
+      () => {},
+    );
+  }
+
+  /**
+   * Every frame goes out upright with the phone's shape. USB screen capture follows the phone as it turns, but a
+   * running capture session can keep the size it started with, so a picture that stays wide while the phone is tall
+   * (or the other way) for CAPTURE_SETTLE_MS gets a new capture session (twice at most per turn); if that doesn't
+   * put it right, CAPTURE_ROTATE says which way to turn it, else stats.capture_mismatch says what's wrong.
+   */
+  private captureCheck(udid: string): void {
+    const c = this.capture.get(udid);
+    if (!c?.size) return;
+    const host = this.hosts.get(udid);
+    const mode = this.rotateMode();
+    if (typeof mode === 'number') return; // a fixed turn: the owner's word
+    const canTurn = helperCaps().includes('rotate');
+    const state = () => ({ rotated: host?.rotated ?? 0, tries: host?.running ? c.tries : CAPTURE_RESTARTS, rotate: canTurn ? mode : ('off' as const) });
+    const tag = `[orient ${udid.slice(-8)}]`;
+    if (captureFix(c.size, this.wda.orientation(udid), state()) === 'ok') {
+      if (c.mismatch) console.log(`${tag} the picture has the phone's shape again`);
+      c.mismatch = null;
+      return;
+    }
+    if (c.timer) return;
+    c.timer = setTimeout(() => {
+      c.timer = undefined;
+      void this.wda.refreshOrientation(udid, 0).then(() => {
+        if (!c.size || this.capture.get(udid) !== c) return;
+        const o = this.wda.orientation(udid);
+        const what = `the capture is ${c.size.width}x${c.size.height} but the phone is ${o}`;
+        switch (captureFix(c.size, o, state())) {
+          case 'ok':
+            c.mismatch = null;
+            return;
+          case 'unrotate':
+            console.log(`${tag} ${what}: no longer turning the picture`);
+            host?.rotate(0);
+            return;
+          case 'restart':
+            c.tries++;
+            console.log(`${tag} ${what}: starting the capture over (${c.tries}/${CAPTURE_RESTARTS})`);
+            host?.restart('the picture kept its old shape after the phone turned; starting the capture over');
+            return;
+          case 'rotate':
+            console.log(`${tag} ${what}: turning the picture (CAPTURE_ROTATE=${mode})`);
+            host?.rotate(mode === 'ccw' ? 270 : 90);
+            return;
+          default:
+            if (c.mismatch !== what) console.log(`${tag} ${what}, and a new capture didn't change that. If the picture is sideways set CAPTURE_ROTATE=cw (or ccw) in .env`);
+            c.mismatch = what;
+        }
+      });
+    }, CAPTURE_SETTLE_MS);
+    c.timer.unref?.();
   }
 
   private stats(udid: string) {
     const m = this.sources.get(udid);
     const srcs = this.phoneSources(udid);
     const reason = this.helperProblem() ?? srcs.map((s) => s.unavailable()).find((r) => r) ?? null;
-    return phoneStats(srcs, { fps: m?.viewers ? m.meter.rate() : 0, viewers: m?.viewers ?? 0 }, reason, this.buildError());
+    return { ...phoneStats(srcs, { fps: m?.viewers ? m.meter.rate() : 0, viewers: m?.viewers ?? 0 }, reason, this.buildError()), capture_mismatch: this.capture.get(udid)?.mismatch ?? null };
   }
 
   /** The last phonecap build's error while an older helper still runs, else null. */
@@ -198,11 +318,15 @@ export class RealBackend implements Backend {
       let start: StartProducer;
       if (lanes) {
         let host = this.hosts.get(udid);
-        if (!host) this.hosts.set(udid, (host = new PhonecapHost(HELPER, args, tag)));
+        if (!host) {
+          this.hosts.set(udid, (host = new PhonecapHost(HELPER, args, tag)));
+          const fixed = this.rotateMode();
+          if (typeof fixed === 'number' && helperCaps().includes('rotate')) host.rotate(fixed);
+        }
         start = host.start;
       } else start = helperProducer(HELPER, args, tag);
       const kind = prof.thumb ? 'thumb' : prof.remote ? 'remote' : 'lan';
-      src = new H264Source(lanes ? `${tag} ${kind}` : tag, start, prof.settings, { kind });
+      src = new H264Source(lanes ? `${tag} ${kind}` : tag, start, prof.settings, { kind, onInfo: (info) => this.captureInfo(udid, info) });
       this.h264Sources.set(key, src);
     }
     const down = src.unavailable();
@@ -239,7 +363,8 @@ export class RealBackend implements Backend {
         const t = setTimeout(() => { off(); reject(new HttpError(504, 'no MJPEG frame within 5s')); }, 5000);
         const off = this.source(udid).add((f) => { clearTimeout(t); off(); resolve(f); });
       });
-      return { data: jpeg, contentType: 'image/jpeg' };
+      // an older WDA's MJPEG frames stay the panel's (sideways in landscape): its PNG route turns its own
+      if (frameAgrees(imageSize(jpeg), this.wda.orientation(udid))) return { data: jpeg, contentType: 'image/jpeg' };
     }
     const j = await this.wda.callNoSession(udid, 'GET', '/screenshot');
     return { data: Buffer.from(String(j.value), 'base64'), contentType: 'image/png' };
@@ -268,25 +393,42 @@ export class RealBackend implements Backend {
     return h;
   }
 
-  /** The phone's HID session when it can take a touch right now (portrait, screen known); else starts opening it. */
-  private hidReady(udid: string): { h: HidHost; s: ScreenInfo } | null {
+  /**
+   * The phone's HID session when it can take a touch right now, with the upright screen and the orientation its
+   * reports are turned by (HID's axes are the panel's: src/orient.ts); else why not (null: this phone never has
+   * HID), after starting to open it for the next one.
+   */
+  private hidReady(udid: string): { h: HidHost; s: ScreenInfo; o: Orientation | null } | { why: string | null } {
     const h = this.hidHost(udid);
+    if (!h) return { why: null };
     const s = this.wda.screen(udid);
-    if (!h || !s || s.width > s.height) return null; // landscape: WDA knows the orientation, HID's axes are the panel's
-    if (h.ready()) return { h, s };
+    if (!s) return { why: "HID waits for the screen size (WDA has no session yet)" };
+    let o = this.wda.orientation(udid);
+    if (o && o !== 'portrait') {
+      // HID_LANDSCAPE: on (default), off (WDA takes a turned phone), swap (the two landscapes the other way round)
+      const mode = (process.env.HID_LANDSCAPE ?? 'on').trim().toLowerCase();
+      if (mode === 'off' || mode === '0' || mode === 'false') return { why: `HID is portrait only here (HID_LANDSCAPE=off) and the phone is ${o}` };
+      if (mode === 'swap') o = o === 'landscape-left' ? 'landscape-right' : o === 'landscape-right' ? 'landscape-left' : o;
+    }
+    if (h.ready()) return { h, s, o };
     h.kick(); // open it for the next one; WDA takes this one
-    return null;
+    return { why: `HID is ${h.state}${h.reason ? ` (${h.reason})` : ''}` };
   }
 
   liveTouchReady(udid: string): boolean {
-    return !!this.phones.get(udid)?.online && !!this.hidReady(udid);
+    return !!this.phones.get(udid)?.online && 'h' in this.hidReady(udid);
+  }
+
+  liveTouchWhy(udid: string): string | null {
+    const r = this.hidReady(udid);
+    return 'h' in r ? null : r.why;
   }
 
   async liveTouch(udid: string, phase: 'down' | 'move' | 'up', x: number, y: number): Promise<InputResult> {
     this.known(udid);
     const r = this.hidReady(udid);
-    if (!r) throw new HttpError(503, 'live touch is not available on this phone now');
-    const [hx, hy] = toHid(x, y, r.s);
+    if (!('h' in r)) throw new HttpError(503, r.why ?? 'live touch is not available on this phone');
+    const [hx, hy] = toHid(x, y, r.s, r.o);
     await r.h.input(phase, { x: hx, y: hy });
     return { via: 'hid' };
   }
@@ -305,44 +447,101 @@ export class RealBackend implements Backend {
     };
   }
 
-  /** HID if its session is open (a failure falls back to WDA at once), else WDA. */
-  private async viaHid(udid: string, what: string, send: (r: { h: HidHost; s: ScreenInfo }) => Promise<unknown>): Promise<InputResult | null> {
+  /**
+   * HID if its session is open, else WDA for this one gesture, with the reason (`why`; null on a phone that never
+   * has HID). A failed HID input falls back at once, and the session reconnects by itself (src/hid.ts).
+   */
+  private async viaHid(
+    udid: string, what: string, send: (r: { h: HidHost; s: ScreenInfo; o: Orientation | null }) => Promise<unknown>,
+  ): Promise<{ done: InputResult } | { why: string | null }> {
     const r = this.hidReady(udid);
-    if (!r) return null;
+    if (!('h' in r)) return r;
     try {
       await send(r);
-      return { via: 'hid' };
+      return { done: { via: 'hid' } };
     } catch (err) {
       console.log(`[hid ${udid.slice(-8)}] ${what} failed, WDA takes it: ${(err as Error).message}`);
-      return null;
+      return { why: `HID ${what} failed (${(err as Error).message})` };
     }
   }
 
   async tap(udid: string, x: number, y: number): Promise<InputResult> {
     this.known(udid);
-    const hid = await this.viaHid(udid, 'tap', ({ h, s }) => {
-      const [hx, hy] = toHid(x, y, s);
+    const hid = await this.viaHid(udid, 'tap', ({ h, s, o }) => {
+      const [hx, hy] = toHid(x, y, s, o);
       return h.input('tap', { x: hx, y: hy });
     });
-    if (hid) return hid;
-    return { via: await this.wda.tap(udid, x, y) };
+    if ('done' in hid) return hid.done;
+    const via = await this.wda.tap(udid, x, y);
+    return hid.why ? { via, reason: hid.why } : { via };
   }
   async gesture(udid: string, points: PathPoint[]): Promise<InputResult> {
     this.known(udid);
-    const hid = await this.viaHid(udid, 'gesture', ({ h, s }) =>
-      h.input('path', { points: points.map(([x, y, t]) => [...toHid(x, y, s), Math.round(t)]) }),
+    const hid = await this.viaHid(udid, 'gesture', ({ h, s, o }) =>
+      h.input('path', { points: points.map(([x, y, t]) => [...toHid(x, y, s, o), Math.round(t)]) }),
     );
-    if (hid) return hid;
-    return { via: await this.wda.actions(udid, points) };
+    if ('done' in hid) return hid.done;
+    const via = await this.wda.actions(udid, points);
+    return hid.why ? { via, reason: hid.why } : { via };
   }
   async type(udid: string, text: string): Promise<InputResult> {
     this.known(udid);
+    let why: string | null = null;
     if (hidTypable(text)) {
       const hid = await this.viaHid(udid, 'type', ({ h }) => h.input('type', { text }));
-      if (hid) return hid;
+      if ('done' in hid) return hid.done;
+      why = hid.why;
     }
     await this.wda.call(udid, 'POST', '/wda/keys', { value: Array.from(text) });
+    return why ? { via: 'wda', reason: why } : { via: 'wda' };
+  }
+
+  // ---- what an agent needs: the UI tree, the foreground app, the apps, buttons, a frame hash ----
+
+  async uiSource(udid: string): Promise<unknown> {
+    this.known(udid);
+    return this.wda.source(udid);
+  }
+
+  async activeApp(udid: string): Promise<string | null> {
+    if (!this.phones.get(udid)?.online) return null;
+    return this.wda.activeApp(udid);
+  }
+
+  /** The phone's apps from ideviceinstaller (either version's list), kept 5 minutes, plus the well-known ones. */
+  async apps(udid: string): Promise<AppInfo[]> {
+    this.known(udid);
+    const kept = this.appCache.get(udid);
+    if (kept && Date.now() - kept.at < APPS_FRESH_MS) return kept.apps;
+    let installed: AppInfo[] | null = null;
+    for (const args of [['-u', udid, 'list', '--all'], ['-u', udid, '-l', '-o', 'list_all'], ['-u', udid, '-l']]) {
+      try {
+        const found = parseInstalled(await run('ideviceinstaller', args, 25000));
+        if (found.length) {
+          installed = found;
+          break;
+        }
+      } catch {
+        /* not installed, or this version wants the other form */
+      }
+    }
+    const apps = withKnown(installed);
+    // without the phone's list, look again sooner
+    this.appCache.set(udid, { at: installed ? Date.now() : Date.now() - APPS_FRESH_MS + 60_000, apps });
+    return apps;
+  }
+
+  async pressButton(udid: string, name: ButtonName): Promise<InputResult> {
+    this.known(udid);
+    await this.wda.pressButton(udid, name);
     return { via: 'wda' };
+  }
+
+  /** A hash of the newest MJPEG frame (WDA's screenshots: identical screens give identical bytes); null without one. */
+  async frameHash(udid: string): Promise<string | null> {
+    if (!this.phones.get(udid)?.online || this.wda.status(udid) !== 'ready') return null;
+    const f = await this.source(udid).grab(150, 1500);
+    return f ? crypto.createHash('sha1').update(f).digest('hex').slice(0, 16) : null;
   }
   async home(udid: string): Promise<InputResult> {
     this.known(udid);

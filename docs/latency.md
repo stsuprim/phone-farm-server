@@ -129,3 +129,19 @@ one frame in flight behind another. Expected over the Nepal -> UK link (~180 ms)
   grid of 10 phones costs ~2.5 Mbit/s, about one full-quality far stream.
 - **Per session numbers**: `stats.sessions[].fps` and `latencyMs` (capture -> sent on the server + half the round trip)
   replace guessing; the client's own glass-to-glass measure is still the truth.
+
+### 2026-11-15, later: touch latency, per event
+
+Every live touch event with a `seq` is acked `{ack: seq, ok, ms, via}`: `ms` is the server's receive -> injected time for
+that event, so the client's own send -> ack time minus `ms` is the network's share. `GET /phones/:udid/input` adds
+`touch: {move_avg_ms, move_p90_ms, coalesced, auto_released, fallbacks, fallback_reason}`. What to expect on the Mac:
+
+| Route | down / up | move | Notes |
+|---|---|---|---|
+| `hid` (iOS 27+) | 2-6 ms | 2-6 ms | one 58-byte report per event; moves fold while one is still going out, so `coalesced` grows on a slow phone and latency doesn't |
+| `buffered` -> `wda-fast` on `up` | ~0 ms (kept) | ~0 ms (kept) | the gesture plays when `up` arrives: 5-15 ms to queue it on the phone, then its own length |
+| `buffered` -> `wda` on `up` | ~0 ms (kept) | ~0 ms (kept) | W3C actions: 0.3-1 s on top of the gesture's length |
+
+Estimates, as the rest of this page. `fallbacks` counts gestures that should have been live and weren't; `fallback_reason`
+is the last why (HID closed or starting, a failed report, landscape with `HID_LANDSCAPE=off`). A reported action
+(`tap`, `tap-element`, `/act` steps) costs a look before and after on top: ~0.4 s, most of it the 350 ms settle.

@@ -306,7 +306,7 @@ function powerBackend() {
     assert.deepEqual([w.ok, w.locked, w.screenOn], [true, false, true]);
     const nope = await call('POST', `${pre}/nope/wake`);
     assert.equal(nope.status, 404);
-    assert.deepEqual(await nope.json(), { error: 'unknown phone' });
+    assert.deepEqual(await nope.json(), { ok: false, error: 'unknown phone' });
   }
   assert.equal((await call('GET', `/api/devices/${udid}/wake`)).status, 405);
   const devs: any[] = await (await call('GET', '/api/devices')).json();

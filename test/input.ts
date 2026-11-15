@@ -80,17 +80,37 @@ function fakeBackend(live: boolean, failLive: (phase: string) => boolean = () =>
   ok(`live touch: down, ${mv.length} folded move(s), up straight to the phone (via hid, ${st.tap_avg_ms} ms)`);
 }
 
-// ---- a live event fails: the rest is buffered and the gesture replayed whole by the other route ----
+// ---- the live down never reaches the phone: the gesture is buffered and replayed whole by the other route ----
+{
+  const { b, calls } = fakeBackend(true, (phase) => phase === 'down');
+  const c = new Control(b);
+  const d = await c.handle('P', { type: 'touch', phase: 'down', x: 10, y: 20, t: 0 });
+  assert.equal(d?.via, 'buffered');
+  assert.match(d?.reason ?? '', /live touch failed \(live down failed\)/);
+  assert.equal((await c.handle('P', { type: 'touch', phase: 'move', x: 100, y: 200, t: 50 }))?.via, 'buffered');
+  await c.handle('P', { type: 'touch', phase: 'move', x: 150, y: 300, t: 100 });
+  const r = await c.handle('P', { type: 'touch', phase: 'up', x: 200, y: 400, t: 300 });
+  assert.equal(r?.via, 'wda-fast');
+  assert.match(r?.reason ?? '', /live touch failed/, 'the fallback says why');
+  assert.deepEqual(calls, ['gesture 4']);
+  assert.equal(c.meter.stats('P').touch.fallbacks, 1);
+  ok('live touch whose down fails: the whole gesture replays through WDA, with the reason');
+}
+
+// ---- the live channel breaks mid-drag: the finger is lifted and the failure said; nothing is played twice ----
 {
   const { b, calls } = fakeBackend(true, (phase) => phase === 'move');
   const c = new Control(b);
-  await c.handle('P', { type: 'touch', phase: 'down', x: 10, y: 20, t: 0 });
-  assert.deepEqual(await c.handle('P', { type: 'touch', phase: 'move', x: 100, y: 200, t: 50 }), { via: 'buffered' });
-  await c.handle('P', { type: 'touch', phase: 'move', x: 150, y: 300, t: 100 });
-  const r = await c.handle('P', { type: 'touch', phase: 'up', x: 200, y: 400, t: 300 });
-  assert.deepEqual(r, { via: 'wda-fast' });
-  assert.deepEqual(calls, ['down 10,20', 'gesture 4']);
-  ok('live touch failing mid-drag: the whole gesture replays through WDA');
+  const told: unknown[] = [];
+  const owner = { touchReleased: (info: unknown) => told.push(info) };
+  await c.handle('P', { type: 'touch', phase: 'down', x: 10, y: 20, t: 0, seq: 1, id: 7 }, owner);
+  await assert.rejects(c.handle('P', { type: 'touch', phase: 'move', x: 100, y: 200, t: 50, seq: 2, id: 7 }, owner), /lost mid-drag \(live move failed\)/);
+  assert.deepEqual(await c.handle('P', { type: 'touch', phase: 'move', x: 150, y: 300, t: 100, seq: 3, id: 7 }, owner), { via: 'buffered', stray: true });
+  assert.deepEqual(await c.handle('P', { type: 'touch', phase: 'up', x: 200, y: 400, t: 300, seq: 4, id: 7 }, owner), { via: 'buffered', stray: true });
+  await sleep(10);
+  assert.deepEqual(calls, ['down 10,20', 'up 100,200'], 'lifted where it was, no replay');
+  assert.deepEqual(told, [{ id: 7, reason: 'lost', error: 'live move failed' }]);
+  ok('live touch lost mid-drag: lifted, its owner told, never played twice');
 }
 
 // ---- without a live channel: buffered as before (a quick still press is a tap) ----
@@ -289,7 +309,8 @@ function fakeSidecar(answer: (m: Record<string, unknown>, out: PassThrough) => v
   const prevCwd = process.cwd();
   process.chdir(fs.mkdtempSync(path.join(os.tmpdir(), 'pf-wda-'))); // data/ports.json goes here
   let mode: 'patched' | 'unpatched' | 'refuse' = 'unpatched';
-  let size = { width: 390, height: 844 };
+  const size = { width: 390, height: 844 };
+  let orient = 'PORTRAIT';
   const hits: { path: string; body: any }[] = [];
   const wda = http.createServer((req, res) => {
     let body = '';
@@ -304,6 +325,7 @@ function fakeSidecar(answer: (m: Record<string, unknown>, out: PassThrough) => v
       if (p === '/status') return json(200, { value: { ready: true }, sessionId: 'S1' });
       if (p === '/session') return json(200, { sessionId: 'S1', value: { sessionId: 'S1' } });
       if (p.endsWith('/window/size')) return json(200, { value: size });
+      if (p.endsWith('/orientation')) return json(200, { value: orient });
       if (p === '/wda/screen') return json(200, { value: { scale: 3 } });
       if (p.endsWith('/appium/settings')) return json(200, { value: {} });
       if (p === '/wda/lotus/touch') {
@@ -355,13 +377,32 @@ function fakeSidecar(answer: (m: Record<string, unknown>, out: PassThrough) => v
     assert.equal(m.fastStatus('U1'), 'no');
     assert.equal(count('/session/S1/wda/tap'), 5);
 
-    // landscape: the old route (it knows the orientation)
+    // the phone turns: WDA is asked, the screen is upright (wide), and the old route takes the touch (it turns it itself)
     mode = 'patched';
     (m as any).entries.get('U1').fast = 'unknown';
-    (m as any).entries.get('U1').screen = { width: 844, height: 390, scale: 3 };
+    assert.deepEqual([m.orientation('U1'), m.screen('U1')], ['portrait', { width: 390, height: 844, scale: 3 }]);
+    const turns: string[] = [];
+    m.onOrientation = (u) => turns.push(`${u} ${m.orientation(u)}`);
+    orient = 'LANDSCAPE';
+    assert.equal(await m.refreshOrientation('U1', 60_000), 'portrait', 'asked a moment ago: not again yet');
+    assert.equal(await m.refreshOrientation('U1', 0), 'landscape-left');
+    assert.deepEqual(m.screen('U1'), { width: 844, height: 390, scale: 3 });
+    assert.deepEqual(turns, ['U1 landscape-left']);
     const before = count('/wda/lotus/touch');
     assert.equal(await m.tap('U1', 1, 1), 'wda');
     assert.equal(count('/wda/lotus/touch'), before);
+    // WDA_FAST_LANDSCAPE=1: the fast route too, the touch turned onto the panel for XCTest's portrait record
+    process.env.WDA_FAST_LANDSCAPE = '1';
+    assert.equal(await m.tap('U1', 1, 1), 'wda-fast');
+    assert.deepEqual(hits.filter((h) => h.path === '/wda/lotus/touch').pop()!.body, { points: [[389, 1, 0]], hold: 50, orientation: 1 });
+    delete process.env.WDA_FAST_LANDSCAPE;
+    orient = 'UIA_DEVICE_ORIENTATION_LANDSCAPERIGHT';
+    assert.equal(await m.refreshOrientation('U1', 0), 'landscape-right');
+    orient = 'PORTRAIT';
+    assert.equal(await m.refreshOrientation('U1', 0), 'portrait');
+    assert.deepEqual(m.screen('U1'), { width: 390, height: 844, scale: 3 });
+    assert.equal(turns.length, 3);
+    assert.equal(hits.filter((h) => h.path.endsWith('/appium/settings')).pop()!.body.settings.mjpegFixOrientation, true, 'MJPEG frames are turned upright by WDA');
   } finally {
     console.log = origLog;
     m.shutdown();
@@ -369,7 +410,7 @@ function fakeSidecar(answer: (m: Record<string, unknown>, out: PassThrough) => v
     wda.close();
     process.chdir(prevCwd);
   }
-  ok('WDA: fast route when patched (answered when queued), old route when unpatched (asked once), refused x3, or landscape');
+  ok('WDA: fast route when patched (answered when queued), old route when unpatched (asked once), refused x3, or landscape; orientation followed');
 }
 
 // ---- the server: acks and HTTP answers say how it went; GET /phones/:udid/input ----

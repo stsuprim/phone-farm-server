@@ -3,7 +3,8 @@ import fs from 'node:fs';
 import http from 'node:http';
 import path from 'node:path';
 import { Config } from './config.js';
-import { ControlState, HttpError, PathPoint, ScreenInfo, StreamSettings } from './types.js';
+import { isLandscape, Orientation, orientationFromWda, portraitSize, uprightSize, uprightToPanel } from './orient.js';
+import { ButtonName, ControlState, HttpError, PathPoint, ScreenInfo, StreamSettings } from './types.js';
 
 export type WdaStatus = 'starting' | 'ready' | 'failed' | 'stopped';
 
@@ -38,7 +39,12 @@ interface Entry {
   recovering?: Promise<void>;
   checking: boolean;
   lastOk: number;
+  /** The screen in points as held in portrait (short side across), with the pixel scale. */
   screen?: ScreenInfo;
+  /** How the phone is turned (WDA's /orientation: the foreground app's), when it was last asked, and an ask in flight. */
+  orientation: Orientation | null;
+  orientAt: number;
+  orientP?: Promise<Orientation | null>;
   tapRoute: 0 | 1 | 2; // 0: /wda/tap, 1: /wda/tap/0 (older WDA), 2: W3C actions
   /** The patched WDA's /wda/lotus/touch (scripts/patch-wda.mjs): yes, no (an unpatched build), or not tried yet. */
   fast: 'yes' | 'no' | 'unknown';
@@ -96,6 +102,8 @@ export class WdaManager {
   private entries = new Map<string, Entry>();
   private ports: Record<string, number> = {};
   private health: NodeJS.Timeout;
+  /** Called when a phone's orientation (or its screen size, once known) changed. */
+  onOrientation?: (udid: string) => void;
 
   constructor(
     private cfg: Config,
@@ -138,8 +146,13 @@ export class WdaManager {
     if (e.status !== 'ready') return 'down';
     return e.control;
   }
+  /** The screen in points, upright: as the phone is turned now (844 x 390 in landscape). */
   screen(udid: string): ScreenInfo | null {
-    return this.entries.get(udid)?.screen ?? null;
+    const e = this.entries.get(udid);
+    return e?.screen ? { ...uprightSize(e.screen, e.orientation), scale: e.screen.scale } : null;
+  }
+  orientation(udid: string): Orientation | null {
+    return this.entries.get(udid)?.orientation ?? null;
   }
   mjpegPort(udid: string): number {
     const e = this.entries.get(udid);
@@ -153,7 +166,8 @@ export class WdaManager {
     const n = this.slot(udid);
     e ??= {
       udid, wdaPort: this.cfg.wdaBasePort + n, mjpegPort: this.cfg.mjpegBasePort + n, status: 'starting', control: 'recovering',
-      wanted: true, procs: [], restarts: 0, checking: false, lastOk: 0, tapRoute: 0, fast: 'unknown', fastFails: 0, mjpeg: { ...DEFAULT_MJPEG }, agent: newAgent(),
+      wanted: true, procs: [], restarts: 0, checking: false, lastOk: 0, orientation: null, orientAt: 0, tapRoute: 0, fast: 'unknown', fastFails: 0,
+      mjpeg: { ...DEFAULT_MJPEG }, agent: newAgent(),
     };
     e.wanted = true;
     this.entries.set(udid, e);
@@ -386,17 +400,67 @@ export class WdaManager {
     return id;
   }
 
-  /** Screen size in points (window size) and scale (/wda/screen), cached per session. */
+  /**
+   * Screen size in points (window size), scale (/wda/screen) and orientation, read with each new session. WDA's
+   * window size is the foreground app's, so it's wide when the phone is in landscape at that moment: it's kept as
+   * held in portrait, and `screen()` turns it by the orientation, which is asked again as the phone turns
+   * (refreshOrientation). Before this the size was kept as it came, for the whole session: a phone that was (or
+   * went) landscape had a list size, a clamp and an HID check for the wrong shape.
+   */
   private async readScreen(e: Entry, sid: string): Promise<void> {
-    const [size, scr] = await Promise.allSettled([
+    const [size, scr, orient] = await Promise.allSettled([
       this.raw(e, 'GET', `/session/${sid}/window/size`, undefined, 5000),
       this.raw(e, 'GET', '/wda/screen', undefined, 5000),
+      this.readOrientation(e, sid),
     ]);
     const w = size.status === 'fulfilled' ? Number(size.value?.value?.width) : NaN;
     const h = size.status === 'fulfilled' ? Number(size.value?.value?.height) : NaN;
     const s = scr.status === 'fulfilled' ? Number(scr.value?.value?.scale) : NaN;
-    if (w > 0 && h > 0) e.screen = { width: w, height: h, scale: s > 0 ? s : e.screen?.scale ?? null };
+    const before = JSON.stringify([e.screen, e.orientation]);
+    if (w > 0 && h > 0) e.screen = { ...portraitSize({ width: w, height: h }), scale: s > 0 ? s : e.screen?.scale ?? null };
     else if (s > 0 && e.screen) e.screen.scale = s;
+    // WDA without /orientation: the window's shape still says wide or tall
+    const shape: Orientation | null = w > 0 && h > 0 ? (w > h ? (isLandscape(e.orientation) ? e.orientation : 'landscape-left') : isLandscape(e.orientation) || !e.orientation ? 'portrait' : e.orientation) : null;
+    const o = (orient.status === 'fulfilled' ? orient.value : null) ?? shape;
+    if (o) {
+      e.orientation = o;
+      e.orientAt = Date.now();
+    }
+    if (JSON.stringify([e.screen, e.orientation]) !== before) this.onOrientation?.(e.udid);
+  }
+
+  private async readOrientation(e: Entry, sid: string): Promise<Orientation | null> {
+    try {
+      return orientationFromWda((await this.raw(e, 'GET', `/session/${sid}/orientation`, undefined, 4000))?.value);
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * How the phone is turned, asked again unless it was within `maxAgeMs` (one ask at a time per phone). Never
+   * recovers WDA: an ask that fails keeps what was known.
+   */
+  refreshOrientation(udid: string, maxAgeMs = 1500): Promise<Orientation | null> {
+    const e = this.entries.get(udid);
+    if (!e) return Promise.resolve(null);
+    if (e.orientP) return e.orientP;
+    if (e.status !== 'ready' || !e.sessionId || e.recovering || Date.now() - e.orientAt < maxAgeMs) return Promise.resolve(e.orientation);
+    const sid = e.sessionId;
+    e.orientP = this.readOrientation(e, sid)
+      .then((o) => {
+        e.orientAt = Date.now();
+        if (o && o !== e.orientation) {
+          this.log(e, `orientation ${e.orientation ?? 'unknown'} -> ${o}`);
+          e.orientation = o;
+          this.onOrientation?.(e.udid);
+        }
+        return e.orientation;
+      })
+      .finally(() => {
+        e.orientP = undefined;
+      });
+    return e.orientP;
   }
 
   private async applySettings(e: Entry, sid: string): Promise<void> {
@@ -407,6 +471,8 @@ export class WdaManager {
       mjpegServerFramerate: e.mjpeg.fps,
       mjpegServerScreenshotQuality: e.mjpeg.quality,
       mjpegScalingFactor: e.mjpeg.scale,
+      // WDA's MJPEG frames are the panel's (portrait) unless told to turn them: a landscape phone came out sideways
+      mjpegFixOrientation: true,
     };
     try {
       await this.raw(e, 'POST', `/session/${sid}/appium/settings`, { settings }, 5000);
@@ -552,6 +618,38 @@ export class WdaManager {
     return this.withRecovery(udid, (e) => this.raw(e, method, p, body, timeout));
   }
 
+  /** A read that never triggers a recovery (a slow /source on a heavy screen must not restart WDA). */
+  private async read(udid: string, p: string, timeout: number): Promise<any> {
+    const e = await this.usable(udid);
+    try {
+      const r = await this.raw(e, 'GET', p, undefined, timeout);
+      e.lastOk = Date.now();
+      return r;
+    } catch (err) {
+      throw this.named(e, err);
+    }
+  }
+
+  /** What's on screen: WDA's accessibility tree as JSON (src/ui.ts flattens it). */
+  async source(udid: string): Promise<unknown> {
+    return (await this.read(udid, '/source?format=json', 25000))?.value ?? null;
+  }
+
+  /** The foreground app's bundle id, or null. */
+  async activeApp(udid: string): Promise<string | null> {
+    try {
+      const v = (await this.read(udid, '/wda/activeAppInfo', 6000))?.value;
+      return typeof v?.bundleId === 'string' && v.bundleId ? v.bundleId : null;
+    } catch {
+      return null;
+    }
+  }
+
+  /** A hardware button (XCUIDevice's: volumeUp, volumeDown, home). */
+  async pressButton(udid: string, name: ButtonName | 'home'): Promise<void> {
+    await this.call(udid, 'POST', '/wda/pressButton', { name });
+  }
+
   /** Whether this phone's WDA has the fast touch route (unknown until the first touch tries it). */
   fastStatus(udid: string): 'yes' | 'no' | 'unknown' {
     return this.entries.get(udid)?.fast ?? 'unknown';
@@ -560,14 +658,23 @@ export class WdaManager {
   /**
    * The patched WDA's fast route (docs/BEST_METHOD.md, plan item 1b): one touch path built at absolute coordinates
    * with no active-app lookup, queued on the phone and answered before XCTest plays it (the phone keeps the order).
-   * False when this WDA build hasn't got it, or the screen is landscape (the old route knows the orientation).
+   * False when this WDA build hasn't got it, or the phone isn't in portrait (the old routes turn the touch themselves;
+   * WDA_FAST_LANDSCAPE=1 sends it here too, turned onto the panel as XCTest's portrait event record expects).
    */
   private async fast(udid: string, body: { points: PathPoint[]; hold?: number }): Promise<boolean> {
     const e = this.entries.get(udid);
     if (!e || e.fast === 'no' || process.env.WDA_FAST === '0') return false;
-    if (e.screen && e.screen.width > e.screen.height) return false;
+    const turned = !!e.orientation && e.orientation !== 'portrait';
+    if (turned && (process.env.WDA_FAST_LANDSCAPE !== '1' || !e.screen)) return false;
     try {
-      const points = body.points.map(([x, y, t]) => [Math.round(x * 10) / 10, Math.round(y * 10) / 10, Math.round(t)]);
+      const up = e.screen ? uprightSize(e.screen, e.orientation) : null;
+      const points = body.points.map(([x, y, t]) => {
+        if (turned && up && e.screen) {
+          const [px, py] = uprightToPanel(x / up.width, y / up.height, e.orientation);
+          [x, y] = [px * e.screen.width, py * e.screen.height];
+        }
+        return [Math.round(x * 10) / 10, Math.round(y * 10) / 10, Math.round(t)];
+      });
       await this.callNoSession(udid, 'POST', FAST_TOUCH_ROUTE, { ...body, points, orientation: 1 }, 5000);
       if (e.fast !== 'yes') this.log(e, 'fast touch route answers (patched WDA)');
       e.fast = 'yes';

@@ -75,6 +75,8 @@ const realSpawn: Spawn = (bin, args) => spawn(bin, args, { stdio: ['pipe', 'pipe
 export class PhonecapHost {
   private proc?: ChildProcess;
   private lanes = new Map<number, ProducerHooks>();
+  /** Turn the picture this many degrees clockwise before encoding (a helper with the "rotate" cap; 0 = as captured). */
+  private rotation = 0;
 
   constructor(private bin: string, private args: string[], private label: string, private spawnFn: Spawn = realSpawn) {}
 
@@ -132,9 +134,34 @@ export class PhonecapHost {
     if (stdin?.writable) stdin.write(`${line}\n`);
   }
 
+  /**
+   * Start the capture over (a new capture session takes the screen's size as it is now): every lane hears the
+   * helper stop and its source starts it again. For a picture that kept its old shape after the phone turned.
+   */
+  restart(why: string): void {
+    const p = this.proc;
+    if (!p) return;
+    this.died(p, why);
+    if (p.stdin?.writable) p.stdin.write('quit\n');
+    p.kill('SIGTERM');
+    setTimeout(() => p.kill('SIGKILL'), 1500).unref();
+  }
+
+  /** Turn the picture `deg` (0, 90, 180, 270) clockwise before encoding; kept for the helper's next start too. */
+  rotate(deg: number): void {
+    const d = ((Math.round(deg / 90) * 90) % 360 + 360) % 360;
+    if (d === this.rotation) return;
+    this.rotation = d;
+    this.write(`rotate ${d}`);
+  }
+  get rotated(): number {
+    return this.rotation;
+  }
+
   private spawn(want: H264Settings): void {
     const p = this.spawnFn(this.bin, [...this.args, ...helperArgs(want)]);
     this.proc = p;
+    if (this.rotation) this.write(`rotate ${this.rotation}`);
     const tail: string[] = [];
     const parser = new RecordParser((r) => this.lanes.get(r.lane ?? 0)?.record(r));
     p.stdout?.on('data', (c: Buffer) => {

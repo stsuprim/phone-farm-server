@@ -2,12 +2,14 @@ import crypto from 'node:crypto';
 import http from 'node:http';
 import os from 'node:os';
 import { WebSocket, WebSocketServer } from 'ws';
+import { ackExtra, Agent } from './agent.js';
 import { bitrateAsk, DEFAULT_CEILING_BPS, RateControl, REMOTE_START_BPS, WsFlow } from './congestion.js';
-import { Control } from './control.js';
+import { Control, touchAck, TouchOwner } from './control.js';
 import { H264Viewer, RateMeter, REMOTE_DROP_BYTES, Transport, wsMessage } from './h264.js';
 import { IdleLock } from './idle.js';
-import type { InputResult } from './inputlog.js';
+import { imageSize } from './imgsize.js';
 import { THUMB_DEFAULT_FPS, THUMB_MAX_FPS, THUMB_MIN_FPS } from './lanes.js';
+import { frameAgrees, Size } from './orient.js';
 import type { WdaResigner, WdaSignStatus } from './resign.js';
 import { isRemote, pathKind, rtcSignaling } from './rtc.js';
 import { SettingsStore } from './settings.js';
@@ -126,19 +128,11 @@ export function streamSettings(q: URLSearchParams, remote = false): StreamSettin
   return s;
 }
 
-/**
- * The extra fields an ack carries about an injected action (old clients ignore them): how it reached the phone and
- * the server's receive -> injected time.
- */
-export function ackExtra(r: InputResult | void, t0: number): Record<string, unknown> {
-  return r ? { via: r.via, ms: Math.round((performance.now() - t0) * 10) / 10 } : {};
-}
+export { ackExtra };
 
-function errorText(err: unknown): string {
-  if (err instanceof HttpError) return err.message;
-  console.error(err);
-  return 'internal error';
-}
+const flag = (v: string | null | undefined) => /^(1|true|yes)$/i.test(v ?? '');
+/** How often a watched phone is asked how it's turned (ms). The picture's own size change asks at once. */
+const ORIENT_POLL_MS = 3000;
 
 export function createServer(backend: Backend, token: string, updater?: Updater, extras: ServerExtras = {}): http.Server {
   const settings = extras.settings ?? new SettingsStore();
@@ -154,7 +148,68 @@ export function createServer(backend: Backend, token: string, updater?: Updater,
 
   const wss = new WebSocketServer({ noServer: true, maxPayload: 1_000_000 });
   const control = new Control(backend);
-  control.onInput = (udid) => idle.activity(udid);
+  control.onInput = (udid, discrete) => idle.activity(udid, discrete);
+  if (idle.supported) control.power = { lock: (u) => idle.lock(u), wake: (u) => idle.wake(u) };
+  const agent = new Agent(backend, control);
+
+  // ---- orientation: every open view of a phone hears when it turns (or its picture changes size) ----
+  /** The phone as it's turned now: orientation and the upright screen in points and pixels. */
+  const view = (udid: string) => {
+    const s = backend.screen(udid);
+    const px = (v: number) => (s?.scale ? Math.round(v * s.scale) : null);
+    return {
+      orientation: backend.orientation?.(udid) ?? null,
+      point_width: s?.width ?? null, point_height: s?.height ?? null,
+      screen_width: s ? px(s.width) : null, screen_height: s ? px(s.height) : null,
+    };
+  };
+  /** `{type: "orientation", ...}` for a view whose picture is `frame` (none: the screen's own pixels). */
+  const orientMsg = (udid: string, frame?: Size | null) => {
+    const v = view(udid);
+    return { type: 'orientation', udid, ...v, width: frame?.width ?? v.screen_width, height: frame?.height ?? v.screen_height };
+  };
+  const turned = new Map<string, Set<() => void>>();
+  const onTurn = (udid: string, fn: () => void): (() => void) => {
+    let set = turned.get(udid);
+    if (!set) turned.set(udid, (set = new Set()));
+    const mine = set;
+    mine.add(fn);
+    return () => {
+      mine.delete(fn);
+      if (!mine.size && turned.get(udid) === mine) turned.delete(udid);
+    };
+  };
+  backend.onOrientation = (udid) => {
+    for (const fn of [...(turned.get(udid) ?? [])]) {
+      try {
+        fn();
+      } catch {
+        /* a closed socket */
+      }
+    }
+  };
+  // a phone someone is watching is asked how it's turned every few seconds
+  const watched = new Map<string, { n: number; timer: NodeJS.Timeout }>();
+  const watch = (udid: string): (() => void) => {
+    let w = watched.get(udid);
+    if (!w) {
+      const timer = setInterval(() => void backend.refreshOrientation?.(udid, ORIENT_POLL_MS - 500).catch(() => {}), ORIENT_POLL_MS);
+      timer.unref();
+      watched.set(udid, (w = { n: 0, timer }));
+      void backend.refreshOrientation?.(udid, 1000).catch(() => {});
+    }
+    const mine = w;
+    mine.n++;
+    let done = false;
+    return () => {
+      if (done) return;
+      done = true;
+      if (--mine.n <= 0) {
+        clearInterval(mine.timer);
+        if (watched.get(udid) === mine) watched.delete(udid);
+      }
+    };
+  };
 
   // every open live view, per phone, for stats.sessions
   type Live = { id: string; info: () => Omit<SessionStats, 'id'> | null };
@@ -216,7 +271,10 @@ export function createServer(backend: Backend, token: string, updater?: Updater,
       if (req.method === 'GET' && (path === '/phones' || path === '/api/devices')) {
         const lan = lanUrls(port);
         const tailnet = lanUrls(port, 'tailnet');
-        return send(res, 200, (await backend.list()).map((p) => phoneView(p, lan, tailnet)));
+        const list = await backend.list();
+        // keep each phone's orientation roughly fresh for whoever lists them (not awaited: the list never waits on a phone)
+        for (const p of list) if (p.online && p.ready) void backend.refreshOrientation?.(p.udid, 10_000).catch(() => {});
+        return send(res, 200, list.map((p) => phoneView(p, lan, tailnet)));
       }
       if (path === '/api/status' || path === '/status') {
         if (req.method !== 'GET') throw new HttpError(405, 'use GET');
@@ -255,7 +313,7 @@ export function createServer(backend: Backend, token: string, updater?: Updater,
         return send(res, 200, await updater.now());
       }
 
-      const m = /^\/(?:phones|api\/devices)\/([^/]+)\/(screenshot|tap|swipe|path|hold|touch|type|home|launch|recover|input|wake|lock)$/.exec(path);
+      const m = /^\/(?:phones|api\/devices)\/([^/]+)\/(screenshot|tap|swipe|path|hold|touch|type|key|home|launch|recover|input|wake|lock|ui|apps|orientation|tap-element|act)$/.exec(path);
       if (!m) return send(res, 404, { error: 'not found' });
       const udid = decodeURIComponent(m[1]!);
       const action = m[2]!;
@@ -277,9 +335,35 @@ export function createServer(backend: Backend, token: string, updater?: Updater,
         if (req.method !== 'GET') throw new HttpError(405, 'use GET');
         const f = url.searchParams.get('format') ?? 'png';
         if (f !== 'png' && f !== 'jpeg') throw new HttpError(400, 'format must be png or jpeg');
+        await backend.refreshOrientation?.(udid, 2000).catch(() => null);
         const img = await backend.screenshot(udid, f);
-        res.writeHead(200, { 'content-type': img.contentType, 'content-length': img.data.length, 'cache-control': 'no-store' });
+        const size = imageSize(img.data);
+        res.writeHead(200, {
+          'content-type': img.contentType, 'content-length': img.data.length, 'cache-control': 'no-store',
+          // the picture is upright: how the phone is turned and the picture's own size
+          ...(backend.orientation?.(udid) ? { 'x-orientation': backend.orientation(udid)! } : {}),
+          ...(size ? { 'x-width': String(size.width), 'x-height': String(size.height) } : {}),
+        });
         return void res.end(img.data);
+      }
+
+      // ---- the AI control API: read the screen, act on what it says, hear what changed ----
+      if (action === 'ui') {
+        if (req.method !== 'GET') throw new HttpError(405, 'use GET');
+        const q = url.searchParams;
+        const max = q.has('max') && Number.isFinite(Number(q.get('max'))) ? Number(q.get('max')) : undefined;
+        return send(res, 200, { ok: true, ...(await agent.ui(udid, { all: flag(q.get('all')), max, fresh: flag(q.get('fresh')) })) });
+      }
+      if (action === 'apps') {
+        if (req.method !== 'GET') throw new HttpError(405, 'use GET');
+        return send(res, 200, { ok: true, udid, apps: await agent.apps(udid) });
+      }
+      if (action === 'orientation') {
+        if (req.method !== 'GET') throw new HttpError(405, 'use GET');
+        await phoneFor(udid);
+        await backend.refreshOrientation?.(udid, 500).catch(() => null);
+        const v = view(udid);
+        return send(res, 200, { ok: true, udid, ...v, width: v.screen_width, height: v.screen_height });
       }
 
       if (action === 'input') {
@@ -291,12 +375,24 @@ export function createServer(backend: Backend, token: string, updater?: Updater,
       if (action === 'recover') return send(res, 200, { ok: true, control: await control.recover(udid) });
       const body = await readJson(req);
       const t0 = performance.now();
-      const r = await control.handle(udid, { ...body, type: action });
-      send(res, 200, { ok: true, ...ackExtra(r, t0) });
+      if (action === 'tap-element') return send(res, 200, await agent.inOrder(udid, () => agent.tapElement(udid, body)));
+      if (action === 'act') return send(res, 200, await agent.inOrder(udid, () => agent.batch(udid, body)));
+      const msg = { ...body, type: action };
+      if (action === 'touch') {
+        // one live touch event (the fallback when the socket can't open): the same ack fields
+        const r = await control.handle(udid, msg);
+        return send(res, 200, { ok: true, ...ackExtra(r, t0), ...(touchAck(msg, t0, r) ?? {}) });
+      }
+      if (body.fast === true || flag(url.searchParams.get('fast'))) {
+        // just the action: no look before and after (a client that draws the picture itself)
+        const r = await control.handle(udid, msg);
+        return send(res, 200, { ok: true, ...ackExtra(r, t0) });
+      }
+      send(res, 200, await agent.inOrder(udid, () => agent.action(udid, msg)));
     } catch (err) {
-      if (err instanceof HttpError) return send(res, err.status, { error: err.message });
+      if (err instanceof HttpError) return send(res, err.status, { ok: false, error: err.message });
       console.error(err);
-      send(res, 500, { error: 'internal error' });
+      send(res, 500, { ok: false, error: 'internal error' });
     }
   });
 
@@ -325,6 +421,7 @@ export function createServer(backend: Backend, token: string, updater?: Updater,
       // an opened live view is activity: the phone wakes, and isn't idle-locked while it's open
       const releaseIdle = idle.viewer(udid);
       ws.on('close', releaseIdle);
+      ws.on('close', watch(udid));
       const sess: Sess = { profile, tier: tierOf(url.searchParams), net };
       if (codec === 'h264') void h264Socket(ws, udid, url.searchParams, remote, sess);
       else mjpegSocket(ws, udid, streamSettings(url.searchParams, remote), codec === 'mjpeg' ? { codec: 'mjpeg' } : {}, remote, sess);
@@ -349,8 +446,22 @@ export function createServer(backend: Backend, token: string, updater?: Updater,
     const flow = WsFlow.of(ws, { onAck: () => !writing && flush() });
     // a frame held back while the link was full goes once it has room, even if the next pong is slow to come
     const retry = setInterval(() => !writing && waiting && flush(), 100);
+    // the picture's real size (and whether it's upright) comes with the frames: said once known and whenever it changes
+    let dims: Size | null = null;
+    const sayTurn = () => {
+      if (ws.readyState !== WebSocket.OPEN) return;
+      const m = orientMsg(udid, dims);
+      // an older WDA's frames stay the panel's in landscape: `turn` is how far clockwise to turn them upright
+      const turn = dims && !frameAgrees(dims, m.orientation) ? (m.orientation === 'landscape-left' ? 270 : 90) : 0;
+      ws.send(JSON.stringify(turn ? { ...m, turn } : m));
+    };
     const push = (frame: Buffer): void => {
       if (ws.readyState !== WebSocket.OPEN) return;
+      const size = imageSize(frame);
+      if (size && (!dims || dims.width !== size.width || dims.height !== size.height)) {
+        dims = size;
+        sayTurn();
+      }
       if (writing || ws.bufferedAmount > (remote ? REMOTE_DROP_BYTES : 1024 * 1024) || !flow.canSend(frame.length)) {
         waiting = frame;
         return;
@@ -376,10 +487,15 @@ export function createServer(backend: Backend, token: string, updater?: Updater,
       path: 'mjpeg', transport: 'mjpeg-ws', net: sess?.net ?? null, profile: prof, quality: sess?.tier ?? 'full', lane: null,
       fps: meter.rate(), latencyMs: null, reason: typeof extra.reason === 'string' ? extra.reason : null, since,
     }));
+    const v = view(udid);
+    const est = (px: number | null) => (px ? Math.round((px * sub.scale) / 100) : null);
     ws.send(JSON.stringify({
       type: 'hello', ...extra, udid, path: 'mjpeg', profile: prof, quality_tier: sess?.tier ?? 'full',
       contentType: sub.contentType, fps: sub.fps, scale: sub.scale, quality: sub.quality,
+      // upright; the frames' real size follows in an "orientation" message with the first frame
+      ...v, width: est(v.screen_width), height: est(v.screen_height),
     }));
+    const unturn = onTurn(udid, sayTurn);
     ws.on('message', (data, isBinary) => {
       const msg = isBinary ? null : parseObject(data);
       if (msg?.type === 'ping') ws.send(JSON.stringify({ type: 'pong', t: msg.t ?? null, server_time: Date.now() }));
@@ -388,6 +504,7 @@ export function createServer(backend: Backend, token: string, updater?: Updater,
       clearInterval(retry);
       sub.unsubscribe();
       unlist();
+      unturn();
     };
     ws.on('close', done);
     ws.on('error', done);
@@ -442,10 +559,16 @@ export function createServer(backend: Backend, token: string, updater?: Updater,
         };
         viewer = new H264Viewer(transport, src);
         ws.send(JSON.stringify({
-          type: 'hello', codec: 'h264', path: 'h264', udid, width: info.width, height: info.height, fps: info.fps, scale: info.scale,
+          type: 'hello', codec: 'h264', path: 'h264', udid, ...view(udid), width: info.width, height: info.height, fps: info.fps, scale: info.scale,
           lane: h.kind, profile: remote ? 'remote' : 'lan', quality_tier: want.tier ?? 'full',
           bitrate_kbps: Math.round(rc.bps / 1000), max_kbps: Math.round(rc.max / 1000), server_time: Date.now(),
         }));
+        // the phone turned, or its picture changed size (a new config and keyframe follow): say so
+        const sayTurn = () => {
+          if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(orientMsg(udid, h.info ?? info)));
+        };
+        const unturn = onTurn(udid, sayTurn);
+        const uninfo = h.onInfo(sayTurn);
         const since = Date.now();
         const vv = viewer;
         const unlist = addLive(udid, () => {
@@ -468,6 +591,8 @@ export function createServer(backend: Backend, token: string, updater?: Updater,
           clearInterval(tick);
           h.remove(v);
           unlist();
+          unturn();
+          uninfo();
         };
         ws.on('close', done);
         ws.on('error', done);
@@ -488,7 +613,12 @@ export function createServer(backend: Backend, token: string, updater?: Updater,
     const reply = (msg: unknown) => {
       if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(msg));
     };
-    const rtc = rtcSignaling(backend, control, udid, reply, remote);
+    // whose touches these are: told when the server lifts one itself (no "up" in time, or the live channel broke)
+    const owner: TouchOwner = { touchReleased: (info) => reply({ type: 'touch-released', ...info }) };
+    const rtc = rtcSignaling(backend, control, udid, reply, remote, {
+      dispatch: (msg, who) => agent.dispatch(udid, msg, who),
+      view: () => view(udid),
+    });
     // an open live view: keep the phone's live touch channel (HID session) open so the first tap doesn't pay for it
     const releaseInput = backend.warmInput?.(udid);
     // ...and it's activity: the phone wakes and isn't idle-locked while the view is open
@@ -497,29 +627,28 @@ export function createServer(backend: Backend, token: string, updater?: Updater,
       const i = rtc.info();
       return i ? { path: 'h264' as const, transport: 'webrtc' as const, ...i } : null;
     });
-    reply({ type: 'hello', udid, profile: remote ? 'remote' : 'lan' });
+    const v0 = view(udid);
+    reply({ type: 'hello', udid, profile: remote ? 'remote' : 'lan', ...v0, width: v0.screen_width, height: v0.screen_height });
+    // the phone turned: the picture's size is the WebRTC view's when one runs here, else the screen's own
+    const unturn = onTurn(udid, () => reply(orientMsg(udid, rtc.frame())));
+    const unwatch = watch(udid);
     ws.on('message', (data, isBinary) => {
       if (isBinary) return;
       const msg = parseObject(data);
       if (!msg) return reply({ type: 'ack', id: null, ok: false, error: 'message must be a JSON object' });
       if (msg.type === 'ping') return reply({ type: 'pong', t: msg.t ?? null, server_time: Date.now() });
       if (rtc.handle(msg)) return;
-      const id = msg.id ?? null;
-      const t0 = performance.now();
-      control.handle(udid, msg, ws).then(
-        (r) => {
-          if (id !== null) reply({ type: 'ack', id, ok: true, ...ackExtra(r, t0) });
-        },
-        // touches without an id still hear about a failed gesture
-        (err) => reply({ type: 'ack', id, ok: false, error: errorText(err) }),
-      );
+      // actions answer {type: "ack", id, ...}; a live touch with `seq` answers {ack: seq, ok, ms}
+      void agent.dispatch(udid, msg, owner).then((answer) => answer && reply(answer));
     });
     const done = () => {
-      control.release(ws);
+      control.release(owner);
       rtc.close();
       releaseInput?.();
       releaseIdle();
       unlist();
+      unturn();
+      unwatch();
     };
     ws.on('close', done);
     ws.on('error', done);
