@@ -51,6 +51,10 @@ interface Entry {
   fastFails: number; // the fast route refused touches in a row (3: given up until WDA restarts)
   mjpeg: StreamSettings; // wanted MJPEG settings
   mjpegApplied?: string; // JSON of the settings last applied to the current session
+  /** This WDA's /status names its session (so a /status without ours means ours is gone). */
+  statusNamesSession?: boolean;
+  /** When a quiet call last had the session remade (at most one such remake every few seconds). */
+  goneAt?: number;
   agent: http.Agent; // keep-alive connections to WDA (through iproxy): no new usbmux connection per touch
 }
 
@@ -64,7 +68,7 @@ const DEFAULT_MJPEG: StreamSettings = { fps: 60, quality: 50, scale: 50 };
 const CAPS = { shouldWaitForQuiescence: false, waitForIdleTimeout: 0, shouldUseCompactResponses: true, maxTypingFrequency: 60 };
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 /** The fast route's tap: press, then lift this long after (a finger's quick tap). */
-const FAST_TAP_HOLD_MS = 50;
+export const FAST_TAP_HOLD_MS = 50;
 /** The route scripts/patch-wda.mjs adds to WebDriverAgent (keep the two in step). */
 export const FAST_TOUCH_ROUTE = '/wda/lotus/touch';
 
@@ -376,6 +380,7 @@ export class WdaManager {
         /* not JSON */
       }
       const sid = j?.sessionId ?? j?.value?.sessionId;
+      if (typeof sid === 'string' && sid) e.statusNamesSession = true;
       return { ok: r.status >= 200 && r.status < 300, sessionId: typeof sid === 'string' && sid ? sid : undefined };
     } catch {
       return { ok: false };
@@ -432,9 +437,46 @@ export class WdaManager {
   private async readOrientation(e: Entry, sid: string): Promise<Orientation | null> {
     try {
       return orientationFromWda((await this.raw(e, 'GET', `/session/${sid}/orientation`, undefined, 4000))?.value);
-    } catch {
+    } catch (err) {
+      this.sessionGone(e, sid, err);
       return null;
     }
+  }
+
+  /**
+   * A quiet session call (orientation, settings) was told its session is gone: make a new one now, in the background
+   * (it reads the screen and applies the settings again), rather than leaving it to the next action or health check.
+   */
+  private sessionGone(e: Entry, sid: string, err: unknown): void {
+    if (!(err instanceof WdaError) || err.kind !== 'session' || e.sessionId !== sid || e.recovering || e.status !== 'ready') return;
+    if (e.goneAt && Date.now() - e.goneAt < 5000) return; // a WDA that refuses every session: the health check's job
+    e.goneAt = Date.now();
+    this.log(e, `the session expired (${err.message}); making a new one`);
+    e.sessionId = undefined;
+    e.mjpegApplied = undefined;
+    void this.session(e).then(
+      () => {
+        e.control = 'ready';
+      },
+      () => {},
+    );
+  }
+
+  /**
+   * After WDA refused a session call (a 4xx that didn't name the session): whether our session is no longer WDA's
+   * (the runner restarted on the phone, or something else made a session, which ends ours). Asks /status, whose
+   * `sessionId` is the one WDA has now; ours is dropped when it isn't that one.
+   */
+  private async sessionExpired(e: Entry, sid: string): Promise<boolean> {
+    if (e.sessionId !== sid) return true; // dropped meanwhile (the health check, another call)
+    const st = await this.ping(e, 2500);
+    if (!st.ok || st.sessionId === sid) return false;
+    if (!st.sessionId && !e.statusNamesSession) return false; // a WDA whose /status never names a session: can't tell
+    if (e.sessionId === sid) {
+      e.sessionId = undefined;
+      e.mjpegApplied = undefined;
+    }
+    return true;
   }
 
   /**
@@ -479,6 +521,7 @@ export class WdaManager {
       e.mjpegApplied = key;
     } catch (err) {
       this.log(e, `settings not applied: ${(err as Error).message}`);
+      this.sessionGone(e, sid, err); // a new session applies them
     }
   }
 
@@ -609,9 +652,39 @@ export class WdaManager {
     return this.state(udid);
   }
 
-  /** Call a session-scoped WDA endpoint; on a WDA failure recover (new session / restarted runner) and retry once. */
+  /**
+   * Call a session-scoped WDA endpoint; on a WDA failure recover (new session / restarted runner) and retry once. A
+   * refusal (a 4xx) that doesn't name the session is checked too: when WDA's session is no longer ours, ours expired
+   * without WDA saying so in that answer, so a new one is made and the call asked once more.
+   */
   call(udid: string, method: string, sub: string, body?: unknown, timeout = 30000): Promise<any> {
-    return this.withRecovery(udid, async (e) => this.raw(e, method, `/session/${await this.session(e)}${sub}`, body, timeout));
+    return this.withRecovery(udid, async (e) => {
+      const sid = await this.session(e);
+      try {
+        return await this.raw(e, method, `/session/${sid}${sub}`, body, timeout);
+      } catch (err) {
+        if (!(err instanceof WdaError) || err.down || !(await this.sessionExpired(e, sid))) throw err;
+        this.log(e, `the session expired (${err.message}); making a new one`);
+        const r = await this.raw(e, method, `/session/${await this.session(e)}${sub}`, body, timeout);
+        e.control = 'ready';
+        return r;
+      }
+    });
+  }
+
+  /**
+   * A quick read for the detail card: null unless WDA is up and not recovering right now; never waits for a start,
+   * never recovers, never throws. `session`: a session route (asked only when a session exists).
+   */
+  async peek(udid: string, p: string, timeout = 2500, session = false): Promise<unknown> {
+    const e = this.entries.get(udid);
+    if (!e || !e.wanted || e.status !== 'ready' || e.recovering) return null;
+    if (session && !e.sessionId) return null;
+    try {
+      return (await this.raw(e, 'GET', session ? `/session/${e.sessionId}${p}` : p, undefined, timeout))?.value ?? null;
+    } catch {
+      return null;
+    }
   }
 
   callNoSession(udid: string, method: string, p: string, body?: unknown, timeout = 30000): Promise<any> {

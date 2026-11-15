@@ -16,6 +16,11 @@ export interface InputResult {
   coalesced?: boolean;
   /** A move or up with no touch to belong to (its touch already ended): nothing was injected. */
   stray?: boolean;
+  /**
+   * It was answered when it was queued on the phone, which plays it for about this long yet (ms): the phone's next
+   * action waits for it, and a report looks at the screen after it.
+   */
+  play_ms?: number;
 }
 
 export interface InputSample {

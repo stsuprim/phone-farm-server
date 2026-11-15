@@ -118,3 +118,100 @@ U=<UDID of the phone we test with>   # from: curl -s -H "$H" $B/api/devices | py
    orientation names matched or were swapped; screenshot and live picture upright in both landscapes or not; any
    `CAPTURE_ROTATE` needed); step 5 (`via` and `verified` per side; which `HID_LANDSCAPE` / `WDA_FAST_LANDSCAPE` ended
    up in `.env`); step 6 (`/ui` times, anything that failed with its `error`); step 7's numbers. Never include the token.
+
+---
+
+## 2026-11-16: detail cards, fast open, reliability (steps 9-12)
+
+Same rules as above (never print the token, don't edit the source, don't push). Read `README.md` sections "Device info
+(the detail card)" and "Opening a view fast" first. Nothing native changed: `phonecap` is **not** rebuilt (no Camera
+prompt) and WDA does **not** need a rebuild. Set `B`, `H`, `J`, `U` as at the top.
+
+9. **Get the code, build, test.** `ls src/info.ts test/info.ts test/connect.ts test/reliability.ts` lists all four (else
+   `curl -s -X POST -H "$H" $B/update/now`, wait 60 s). `npm install && npm run build`, then `npm test`: the last three
+   suites must say `all 4 info checks passed`, `all 4 connect checks passed`, `all 9 reliability checks passed`.
+   `which idevicediagnostics || brew install libimobiledevice` (the temperature comes from it). Then
+   `launchctl kickstart -k gui/$(id -u)/com.lotus.phonefarm`, wait 30 s.
+
+10. **The detail card** (phone unlocked, on its home screen):
+    ```sh
+    time curl -s -H "$H" "$B/api/devices/$U/info?fresh=1" | python3 -m json.tool
+    ```
+    -> `battery.level` between 0 and 1 and equal to the phone's own percentage, `charging: true` (it's on USB),
+    `temperatureC` a believable number (about 20-45), `app` `com.apple.springboard` / `"Home Screen"`, `model`, `ios`,
+    `wda.daysLeft` and `wda.state`, `thermal: "nominal"`. `uptimeSec` and `bootedAt` are `null`: expected (stock WDA
+    doesn't say when the phone booted). Note the `time` (it should be about a second or less).
+    - Open Settings on the phone, ask again with `?fresh=1` -> `app: {"bundleId":"com.apple.Preferences","name":"Settings"}`.
+    - Without `?fresh=1`, twice in a row: the second answers at once with the same `at` (kept ~15 s).
+    - The list carries it:
+      `curl -s -H "$H" $B/api/devices | python3 -c 'import sys,json; [print(p["name"], p["info"]["battery"], p["info"]["temperatureC"], p["info"]["app"], p["info"]["fresh"]) for p in json.load(sys.stdin)]'`
+      (run it twice, a few seconds apart: the first may say `fresh False` with only the level, the second has it all).
+    - `temperatureC` is `null`: show me
+      `idevicediagnostics -u $U ioregentry AppleSmartBattery 2>&1 | grep -A1 -E '<key>(Temperature|IsCharging|CurrentCapacity|MaxCapacity)</key>' | head -12`
+      (or its error line). `battery.level` is `null`: show me `ideviceinfo -u $U -q com.apple.mobile.battery 2>&1 | head`.
+
+11. **Opening a view fast.** This shell function opens the H.264 stream as Lotus does and prints how long the picture
+    took (it reads the token from the environment and never prints it):
+    ```sh
+    open_view() { U="$U" TOKEN="$API_TOKEN" PORT="${PORT:-8787}" node -e '
+      const WebSocket = require("ws");
+      const ws = new WebSocket(`ws://localhost:${process.env.PORT}/api/devices/${process.env.U}/stream?codec=h264&fps=60&scale=50&bitrate=4000`, { headers: { authorization: `Bearer ${process.env.TOKEN}` } });
+      ws.on("message", (d, bin) => { if (bin) return; const m = JSON.parse(d.toString());
+        if (m.type === "hello") console.log("hello", m.codec, "connectMs", m.connectMs, "warm", m.warm, m.reason || "");
+        if (m.type === "first-frame") { console.log("first-frame", m.transport, "connectMs", m.connectMs); setTimeout(() => ws.close(), 500); } });
+      ws.on("error", (e) => console.log("error", e.message)); setTimeout(() => process.exit(0), 12000);'; }
+    ```
+    - **Cold.** Nobody has had this phone open for over 2 minutes (`grep -E 'no viewers for a while' server.log | tail -2`
+      shows its capture stopped; else wait). `open_view` -> `hello h264 connectMs <N> warm false`. Note N (a second or
+      two is normal: the capture starting).
+    - **Warm.** `open_view` again right away -> `warm true` and `connectMs` under ~100. Note it.
+    - **Started ahead.** Wait until the capture stopped again (over 2 minutes; the same grep), then
+      `curl -s -X POST -H "$H" $B/api/devices/$U/warm` -> `"capture":"starting"`; 4 s later the same call ->
+      `"capture":"warm"`; then `open_view` -> `warm true`, `connectMs` small. `grep -E '\[h264 .*thumb\]' server.log | tail -3`
+      shows the small lane it started.
+    - **In Lotus.** I (or SUPRIM) open the phone's live view, close it, open another phone, come back within two minutes.
+      While it's open:
+      `curl -s -H "$H" $B/api/devices | python3 -c 'import sys,json; [print(p["name"], [(s["transport"], s.get("connectMs")) for s in p["stats"]["sessions"]]) for p in json.load(sys.stdin)]'`
+      -> each session's `connectMs`. Tell me how it felt (the picture there at once, or a wait).
+    - With nobody watching a warm phone: `ps -axo %cpu,command | grep -i '[p]honecap'` -> note the CPU. If a warm capture
+      costs too much, set `CAPTURE_WARM_SECONDS=30` in `.env` (`10` is the old behaviour) and kickstart; tell me.
+    - `hello mjpeg ... <reason>` instead of `h264`: the capture isn't working at all (not this update): show me the reason.
+
+12. **Reliability** (phone unlocked, upright):
+    - **A session that expired.** Make a second WDA session behind the server's back, which ends the server's own.
+      The phone's WDA port: `grep -E "wda ${U: -8}\] starting" server.log | tail -1` -> `(wda :81xx, ...)`. Then:
+      ```sh
+      curl -s -X POST -H "$J" -d '{"capabilities":{"alwaysMatch":{}}}' http://localhost:<that port>/session > /dev/null
+      curl -s -X POST -H "$H" -H "$J" -d '{"name":"Settings","verify":{"app":"Settings"}}' $B/api/devices/$U/launch
+      grep -E 'session expired|recovering|recovered|session was replaced' server.log | tail -5
+      ```
+      -> the launch answers `ok:true, verified:true` (one try, a second or two slower), and the log shows the session
+      being remade. `control` in `/api/devices` is `ready` afterwards.
+    - **A batch with no waits of its own**, five times (each step reads the screen after the one before, waits for
+      the transition to end and for its element to arrive):
+      ```sh
+      for i in 1 2 3 4 5; do curl -s -X POST -H "$H" -H "$J" -d '{"steps":[{"type":"launch","name":"Settings"},{"type":"tap-element","label":"General"},{"type":"tap-element","label":"About"},{"type":"wait","text":"Name","timeoutMs":4000},{"type":"key","key":"home"}],"verify":{"app":"com.apple.springboard"}}' $B/api/devices/$U/act | python3 -c 'import sys,json; d=json.load(sys.stdin); print(d["ok"], d["done"], d.get("error",""), [round(s.get("total_ms", s.get("ms", 0))) for s in d["steps"]])'; done
+      ```
+      -> `True 5` five times. A failure: show me the line (its `error` says what the screen did say). Settings opens
+      where it was left, so from the second run on it may already be inside General or About and `General` isn't
+      there to tap: that's Settings, not a bug. Go back to Settings' first page on the phone between runs, or say so.
+    - **An id from a screen that changed.** On the home screen:
+      `curl -s -H "$H" "$B/api/devices/$U/ui?fresh=1" | python3 -c 'import sys,json; [print(e["id"], e["type"], repr(e["label"])) for e in json.load(sys.stdin)["elements"] if e["type"]=="Icon"][:8]'`
+      -> pick one icon's `id` and `label`. Open Settings on the phone, then
+      `curl -s -X POST -H "$H" -H "$J" -d '{"id":"<that id>","label":"<that label>"}' $B/api/devices/$U/tap-element`
+      -> HTTP 409 `the screen changed since it was read: ...` and **nothing is pressed** in Settings.
+    - **iOS 27+ phones only (HID).** A long hold with a tap right behind it:
+      ```sh
+      curl -s -X POST -H "$H" -H "$J" -d '{"x":0.5,"y":0.5,"ms":7000,"unit":"norm","fast":true}' $B/api/devices/$U/hold
+      time curl -s -X POST -H "$H" -H "$J" -d '{"x":0.5,"y":0.12,"unit":"norm","fast":true}' $B/api/devices/$U/tap
+      grep -E '\[hid ' server.log | tail -6
+      ```
+      -> the hold answers at once (`via: "hid"`), the tap about 7 s later with `ok:true, via:"hid"` (it waited for the
+      hold; it used to time out after 5 s), and the log has no `timed out` and no new `touch session open` line.
+      Then typing: tap into Settings' search field on the phone, and
+      `time curl -s -X POST -H "$H" -H "$J" -d '{"text":"hello world"}' $B/api/devices/$U/type` -> `via: "hid"`, `ms`
+      about 600-900 (the typing itself, answered when the last key is in), and the field holds exactly `hello world`.
+
+    **Report back** for steps 9-12, per phone: the three suites' last lines; step 10's JSON (the whole answer; it has no
+    secrets) and its time, and any `null` that shouldn't be; step 11's cold, warm and warmed-ahead `connectMs`, how it
+    felt in Lotus, the idle `phonecap` CPU; step 12's four answers and the log lines. Never include the token.

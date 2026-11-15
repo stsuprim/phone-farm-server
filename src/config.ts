@@ -23,6 +23,11 @@ export interface Config {
   hidPython: string;
   /** Seconds without a viewer or input before a phone's touch session closes (frees its camera/mic). */
   hidIdleSeconds: number;
+  /**
+   * Seconds a phone's capture keeps running after its last viewer left (and after a warm-up nobody joined), so
+   * coming back to a phone shows its picture at once.
+   */
+  captureWarmSeconds: number;
   /** The server's config dir (settings.json, wda-sign.json, ports.json): data/ under the working directory. */
   dataDir: string;
   /** The Apple Team ID WDA is signed with (scripts/build-wda.sh's first argument), for the 6-day re-sign. */
@@ -79,6 +84,7 @@ export function loadConfig(envFile = '.env'): Config {
     hidInput: /^(on|off)$/i.test(e.HID_INPUT ?? '') ? (e.HID_INPUT!.toLowerCase() as 'on' | 'off') : 'auto',
     hidPython: expand(e.HID_PYTHON || 'python3'),
     hidIdleSeconds: Math.max(10, num(e.HID_IDLE_SECONDS, 120)),
+    captureWarmSeconds: Math.min(3600, Math.max(10, num(e.CAPTURE_WARM_SECONDS, 120))),
     dataDir: 'data', // relative to the working directory, like data/ports.json (launchd's WorkingDirectory)
     wdaTeamId: (e.WDA_TEAM_ID ?? '').trim(),
     wdaResign: bool(e.WDA_RESIGN, true),

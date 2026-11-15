@@ -5,15 +5,16 @@ import { WebSocket, WebSocketServer } from 'ws';
 import { ackExtra, Agent } from './agent.js';
 import { bitrateAsk, DEFAULT_CEILING_BPS, RateControl, REMOTE_START_BPS, WsFlow } from './congestion.js';
 import { Control, touchAck, TouchOwner } from './control.js';
-import { H264Viewer, RateMeter, REMOTE_DROP_BYTES, Transport, wsMessage } from './h264.js';
+import { H264Viewer, KIND, RateMeter, REMOTE_DROP_BYTES, Transport, wsMessage } from './h264.js';
 import { IdleLock } from './idle.js';
 import { imageSize } from './imgsize.js';
+import { InfoCache, WdaSigning } from './info.js';
 import { THUMB_DEFAULT_FPS, THUMB_MAX_FPS, THUMB_MIN_FPS } from './lanes.js';
 import { frameAgrees, Size } from './orient.js';
 import type { WdaResigner, WdaSignStatus } from './resign.js';
 import { isRemote, pathKind, rtcSignaling } from './rtc.js';
 import { SettingsStore } from './settings.js';
-import { Backend, H264Want, HttpError, PhoneInfo, Profile, QualityTier, SessionStats, StreamSettings } from './types.js';
+import { Backend, H264Want, HttpError, PhoneInfo, Profile, QualityTier, SessionStats, StreamSettings, WarmState } from './types.js';
 import type { Updater } from './updater.js';
 
 /** What createServer can be given besides the backend (index.ts passes all of them; tests some). */
@@ -133,6 +134,10 @@ export { ackExtra };
 const flag = (v: string | null | undefined) => /^(1|true|yes)$/i.test(v ?? '');
 /** How often a watched phone is asked how it's turned (ms). The picture's own size change asks at once. */
 const ORIENT_POLL_MS = 3000;
+/** An MJPEG hello waits this long at most for the first frame (so it can say `connectMs`), then goes without it. */
+const MJPEG_HELLO_WAIT_MS = 1500;
+/** A warm-up keeps the phone's live touch channel open this long for the viewer that's about to come. */
+const WARM_INPUT_MS = 20_000;
 
 export function createServer(backend: Backend, token: string, updater?: Updater, extras: ServerExtras = {}): http.Server {
   const settings = extras.settings ?? new SettingsStore();
@@ -242,13 +247,41 @@ export function createServer(backend: Backend, token: string, updater?: Updater,
       input: { ...control.meter.stats(udid), methods: backend.inputMethods?.(udid) },
     };
   };
-  /** A phone as GET /phones and /api/devices list it: with its lock state and last activity. */
+  /**
+   * A phone as GET /phones and /api/devices list it: with its lock state, last activity and its detail card's data
+   * (`info`: what was last gathered, never waited for here; a gathering starts when it's over ~15 s old).
+   */
   const phoneView = (p: PhoneInfo, lan: string[], tailnet: string[]) => {
     const pw = idle.state(p.udid);
-    return { ...p, lan, tailnet, locked: pw.locked, screenOn: pw.screenOn, lastActive: pw.lastActive, stats: withInput(p.udid, p.stats) };
+    return { ...p, lan, tailnet, locked: pw.locked, screenOn: pw.screenOn, lastActive: pw.lastActive, stats: withInput(p.udid, p.stats), info: info.peek(p) };
   };
   const wdaStatus = (): WdaSignStatus | { state: 'unavailable'; lastError: string } =>
     resigner ? resigner.status() : { state: 'unavailable', lastError: backend.mock ? 'mock mode' : 'the WDA re-sign scheduler is off' };
+  /** WDA's signing as the detail card shows it. */
+  const wdaSigning = (): WdaSigning => {
+    const w = wdaStatus();
+    return { expiresAt: 'expiresAt' in w ? w.expiresAt ?? null : null, daysLeft: 'daysLeft' in w ? w.daysLeft ?? null : null, state: w.state };
+  };
+  // the detail cards' data: gathered from the phone at most every ~15 s, off to the side of everything live
+  const info = new InfoCache((udid) => (backend.facts ? backend.facts(udid) : Promise.reject(new Error('this backend has no device facts'))), wdaSigning);
+  /**
+   * Get a phone ready for a viewer that's about to open it: its capture starts (or stays up), its live touch channel
+   * opens, and it wakes. Opening the live view then finds a picture at once.
+   */
+  const warmUp = (udid: string, wake = true): WarmState => {
+    let state: WarmState;
+    try {
+      state = backend.warm?.(udid) ?? { capture: 'unavailable', reason: 'this backend starts its capture with the first viewer' };
+    } catch (err) {
+      state = { capture: 'unavailable', reason: err instanceof HttpError ? err.message : 'the capture could not be started' };
+    }
+    if (wake) {
+      const release = backend.warmInput?.(udid);
+      if (release) setTimeout(release, WARM_INPUT_MS).unref();
+      if (idle.supported) void idle.wake(udid, true).catch(() => {});
+    }
+    return state;
+  };
   /** 404 {error: "unknown phone"} or 503 offline, before a wake or lock. */
   const phoneFor = async (udid: string): Promise<PhoneInfo> => {
     const p = (await backend.list()).find((x) => x.udid === udid);
@@ -313,7 +346,7 @@ export function createServer(backend: Backend, token: string, updater?: Updater,
         return send(res, 200, await updater.now());
       }
 
-      const m = /^\/(?:phones|api\/devices)\/([^/]+)\/(screenshot|tap|swipe|path|hold|touch|type|key|home|launch|recover|input|wake|lock|ui|apps|orientation|tap-element|act)$/.exec(path);
+      const m = /^\/(?:phones|api\/devices)\/([^/]+)\/(screenshot|tap|swipe|path|hold|touch|type|key|home|launch|recover|input|wake|lock|ui|apps|orientation|tap-element|act|info|warm)$/.exec(path);
       if (!m) return send(res, 404, { error: 'not found' });
       const udid = decodeURIComponent(m[1]!);
       const action = m[2]!;
@@ -329,6 +362,19 @@ export function createServer(backend: Backend, token: string, updater?: Updater,
           if (err instanceof HttpError) throw err;
           throw new HttpError(502, `${action} failed: ${(err as Error).message}`);
         }
+      }
+
+      if (action === 'info') {
+        // the detail card: battery, temperature, the app in front, uptime, model, iOS, WDA's signing (kept ~15 s)
+        if (req.method !== 'GET') throw new HttpError(405, 'use GET');
+        const p = (await backend.list()).find((x) => x.udid === udid);
+        if (!p) throw new HttpError(404, 'unknown phone');
+        return send(res, 200, { ok: true, udid, ...(await info.get(p, flag(url.searchParams.get('fresh')))) });
+      }
+      if (action === 'warm') {
+        if (req.method !== 'POST') throw new HttpError(405, 'use POST');
+        await phoneFor(udid);
+        return send(res, 200, { ok: true, udid, ...warmUp(udid), input: backend.inputMethods?.(udid) ?? null });
       }
 
       if (action === 'screenshot') {
@@ -352,7 +398,7 @@ export function createServer(backend: Backend, token: string, updater?: Updater,
         if (req.method !== 'GET') throw new HttpError(405, 'use GET');
         const q = url.searchParams;
         const max = q.has('max') && Number.isFinite(Number(q.get('max'))) ? Number(q.get('max')) : undefined;
-        return send(res, 200, { ok: true, ...(await agent.ui(udid, { all: flag(q.get('all')), max, fresh: flag(q.get('fresh')) })) });
+        return send(res, 200, { ok: true, ...(await agent.ui(udid, { all: flag(q.get('all')), max, fresh: flag(q.get('fresh')), settle: flag(q.get('settle')) })) });
       }
       if (action === 'apps') {
         if (req.method !== 'GET') throw new HttpError(405, 'use GET');
@@ -397,6 +443,7 @@ export function createServer(backend: Backend, token: string, updater?: Updater,
   });
 
   server.on('upgrade', (req, socket, head) => {
+    const t0 = performance.now(); // the request: `connectMs` counts from here to the first frame
     const url = new URL(req.url ?? '/', 'http://x');
     const m = /^\/(?:phones|api\/devices)\/([^/]+)\/(stream|control)\/?$/.exec(url.pathname);
     // browsers can't set headers on WebSocket, so ?token= is accepted as well
@@ -422,17 +469,21 @@ export function createServer(backend: Backend, token: string, updater?: Updater,
       const releaseIdle = idle.viewer(udid);
       ws.on('close', releaseIdle);
       ws.on('close', watch(udid));
-      const sess: Sess = { profile, tier: tierOf(url.searchParams), net };
+      const sess: Sess = { profile, tier: tierOf(url.searchParams), net, t0 };
       if (codec === 'h264') void h264Socket(ws, udid, url.searchParams, remote, sess);
       else mjpegSocket(ws, udid, streamSettings(url.searchParams, remote), codec === 'mjpeg' ? { codec: 'mjpeg' } : {}, remote, sess);
     });
   });
 
   /** Old behaviour (no `codec`), `codec=mjpeg`, and the fallback when H.264 isn't available (`extra` has the reason). */
-  type Sess = { profile: Profile; tier: QualityTier; net: string | null };
+  type Sess = { profile: Profile; tier: QualityTier; net: string | null; t0: number };
   function mjpegSocket(ws: WebSocket, udid: string, want: StreamSettings, extra: Record<string, unknown>, remote = false, sess?: Sess): void {
     const meter = new RateMeter();
     const prof: Profile = sess?.profile ?? (remote ? 'remote' : 'lan');
+    const t0 = sess?.t0 ?? performance.now();
+    let connectMs: number | null = null;
+    let said = false; // the hello went
+    let firstSent = false;
     // Latest frame only: while one frame is being written, or earlier ones still wait on the way to the viewer
     // (flow control: a slow link never builds a queue of old frames), newer ones replace the waiting one. One more frame
     // may follow one still on its way, so a far link isn't idle for a round trip after every frame.
@@ -449,7 +500,7 @@ export function createServer(backend: Backend, token: string, updater?: Updater,
     // the picture's real size (and whether it's upright) comes with the frames: said once known and whenever it changes
     let dims: Size | null = null;
     const sayTurn = () => {
-      if (ws.readyState !== WebSocket.OPEN) return;
+      if (ws.readyState !== WebSocket.OPEN || !said) return; // after the hello: the first frame says the size anyway
       const m = orientMsg(udid, dims);
       // an older WDA's frames stay the panel's in landscape: `turn` is how far clockwise to turn them upright
       const turn = dims && !frameAgrees(dims, m.orientation) ? (m.orientation === 'landscape-left' ? 270 : 90) : 0;
@@ -457,6 +508,8 @@ export function createServer(backend: Backend, token: string, updater?: Updater,
     };
     const push = (frame: Buffer): void => {
       if (ws.readyState !== WebSocket.OPEN) return;
+      if (connectMs === null) connectMs = Math.round(performance.now() - t0);
+      hello(); // it waited for this frame, to say how long the picture took
       const size = imageSize(frame);
       if (size && (!dims || dims.width !== size.width || dims.height !== size.height)) {
         dims = size;
@@ -473,27 +526,45 @@ export function createServer(backend: Backend, token: string, updater?: Updater,
         flush();
       });
       flow.sent(frame.length);
+      if (!firstSent) {
+        firstSent = true;
+        ws.send(JSON.stringify({ type: 'first-frame', udid, transport: 'mjpeg-ws', connectMs }));
+      }
     };
-    let sub: ReturnType<Backend['subscribe']>;
+    let sub: ReturnType<Backend['subscribe']> | undefined;
+    /**
+     * The hello goes with the first frame, so it says `connectMs` (the request -> that frame); when no frame comes
+     * within MJPEG_HELLO_WAIT_MS it goes without (`connectMs: null`; the "first-frame" message says it later).
+     */
+    const hello = (): void => {
+      if (said || !sub || ws.readyState !== WebSocket.OPEN) return;
+      said = true;
+      clearTimeout(helloTimer);
+      const v = view(udid);
+      const scale = sub.scale;
+      const est = (px: number | null) => (px ? Math.round((px * scale) / 100) : null);
+      ws.send(JSON.stringify({
+        type: 'hello', ...extra, udid, path: 'mjpeg', profile: prof, quality_tier: sess?.tier ?? 'full',
+        contentType: sub.contentType, fps: sub.fps, scale: sub.scale, quality: sub.quality,
+        // upright; the frames' real size follows in an "orientation" message with the first frame
+        ...v, width: est(v.screen_width), height: est(v.screen_height), connectMs,
+      }));
+    };
+    const helloTimer = setTimeout(hello, MJPEG_HELLO_WAIT_MS);
     try {
       sub = backend.subscribe(udid, push, want);
     } catch (err) {
       clearInterval(retry);
+      clearTimeout(helloTimer);
       ws.close(1011, err instanceof HttpError ? err.message.slice(0, 100) : 'error');
       return;
     }
+    const mine = sub;
+    if (connectMs !== null) hello(); // a backend that gave a frame inside subscribe()
     const since = Date.now();
     const unlist = addLive(udid, () => ({
       path: 'mjpeg', transport: 'mjpeg-ws', net: sess?.net ?? null, profile: prof, quality: sess?.tier ?? 'full', lane: null,
-      fps: meter.rate(), latencyMs: null, reason: typeof extra.reason === 'string' ? extra.reason : null, since,
-    }));
-    const v = view(udid);
-    const est = (px: number | null) => (px ? Math.round((px * sub.scale) / 100) : null);
-    ws.send(JSON.stringify({
-      type: 'hello', ...extra, udid, path: 'mjpeg', profile: prof, quality_tier: sess?.tier ?? 'full',
-      contentType: sub.contentType, fps: sub.fps, scale: sub.scale, quality: sub.quality,
-      // upright; the frames' real size follows in an "orientation" message with the first frame
-      ...v, width: est(v.screen_width), height: est(v.screen_height),
+      fps: meter.rate(), latencyMs: null, reason: typeof extra.reason === 'string' ? extra.reason : null, since, connectMs,
     }));
     const unturn = onTurn(udid, sayTurn);
     ws.on('message', (data, isBinary) => {
@@ -502,7 +573,8 @@ export function createServer(backend: Backend, token: string, updater?: Updater,
     });
     const done = () => {
       clearInterval(retry);
-      sub.unsubscribe();
+      clearTimeout(helloTimer);
+      mine.unsubscribe();
       unlist();
       unturn();
     };
@@ -524,9 +596,12 @@ export function createServer(backend: Backend, token: string, updater?: Updater,
       ws.close(1011, err instanceof HttpError ? err.message.slice(0, 100) : 'error');
       return;
     }
+    const t0 = sess?.t0 ?? performance.now();
     if (typeof src === 'string') reason = src;
     else {
       try {
+        // warm: its capture already has a picture (it ran for another viewer, or was kept or started ahead)
+        const warm = src.ready;
         const info = await src.open();
         if (ws.readyState !== WebSocket.OPEN) return;
         const h = src;
@@ -544,6 +619,7 @@ export function createServer(backend: Backend, token: string, updater?: Updater,
         };
         const flow = WsFlow.of(ws, { onAck: adjust, targetMs: remote ? 300 : 250 });
         const tick = setInterval(adjust, 500);
+        let connectMs: number | null = null;
         const transport: Transport = {
           kind: 'ws',
           buffered: () => ws.bufferedAmount,
@@ -552,6 +628,11 @@ export function createServer(backend: Backend, token: string, updater?: Updater,
             const m = wsMessage(r);
             ws.send(m);
             flow.sent(m.length);
+            if (connectMs === null && r.kind === KIND.KEY) {
+              // the first picture left: the request -> this, for the viewer's "opened in N ms"
+              connectMs = Math.round(performance.now() - t0);
+              ws.send(JSON.stringify({ type: 'first-frame', udid, transport: 'h264-ws', connectMs, warm }));
+            }
           },
           fail: (why) => ws.close(1011, why.slice(0, 120)),
           congested: () => flow.congested(),
@@ -562,6 +643,8 @@ export function createServer(backend: Backend, token: string, updater?: Updater,
           type: 'hello', codec: 'h264', path: 'h264', udid, ...view(udid), width: info.width, height: info.height, fps: info.fps, scale: info.scale,
           lane: h.kind, profile: remote ? 'remote' : 'lan', quality_tier: want.tier ?? 'full',
           bitrate_kbps: Math.round(rc.bps / 1000), max_kbps: Math.round(rc.max / 1000), server_time: Date.now(),
+          // the keyframe follows this message at once: the request -> the first frame, and whether the capture was up
+          connectMs: Math.round(performance.now() - t0), warm,
         }));
         // the phone turned, or its picture changed size (a new config and keyframe follow): say so
         const sayTurn = () => {
@@ -576,7 +659,7 @@ export function createServer(backend: Backend, token: string, updater?: Updater,
           const oneWay = (flow.baseRtt() + flow.lastQueueMs()) / 2;
           return {
             path: 'h264', transport: 'h264-ws', net: sess?.net ?? null, profile: remote ? 'remote' : 'lan', quality: want.tier ?? 'full',
-            lane: st.lane, fps: st.fps, latencyMs: st.latencyMs === null ? null : Math.round(st.latencyMs + oneWay), since,
+            lane: st.lane, fps: st.fps, latencyMs: st.latencyMs === null ? null : Math.round(st.latencyMs + oneWay), since, connectMs,
           };
         });
         h.setTarget(viewer, rc.bps);
@@ -623,6 +706,8 @@ export function createServer(backend: Backend, token: string, updater?: Updater,
     const releaseInput = backend.warmInput?.(udid);
     // ...and it's activity: the phone wakes and isn't idle-locked while the view is open
     const releaseIdle = idle.viewer(udid);
+    // ...and its picture is about to be asked for (the rtc-offer follows): the capture starts now, not then
+    warmUp(udid, false);
     const unlist = addLive(udid, () => {
       const i = rtc.info();
       return i ? { path: 'h264' as const, transport: 'webrtc' as const, ...i } : null;

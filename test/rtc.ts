@@ -103,6 +103,9 @@ try {
   const hello = inbox.find((m) => m.type === 'rtc-hello');
   assert.equal(hello.codec, 'h264');
   for (const k of ['width', 'height', 'fps', 'scale', 'server_time']) assert.equal(typeof hello[k], 'number');
+  // how long the picture took from the offer, and whether the capture was already up (the control socket warms it)
+  assert.ok(Number.isInteger(hello.connectMs) && hello.connectMs >= 0 && hello.connectMs < 5000, `rtc-hello connectMs ${hello.connectMs}`);
+  assert.equal(typeof hello.warm, 'boolean');
   ok(`signaling: rtc-offer -> rtc-answer (PT 125, playout-delay, host only), trickle ICE, rtc-hello ${hello.width}x${hello.height}`);
   await until('rtc-path', () => inbox.some((m) => m.type === 'rtc-path'));
   const rpath = inbox.find((m) => m.type === 'rtc-path');
@@ -115,6 +118,12 @@ try {
   // ---- media ----
   await until('RTP video', () => nals.some((n) => n.nal === 5) && nals.some((n) => n.nal === 1));
   clearInterval(iceTimer);
+  // the first picture left on the track: the offer -> that, on the control socket
+  await until('first-frame', () => inbox.some((m) => m.type === 'first-frame'));
+  const ff = inbox.find((m) => m.type === 'first-frame');
+  assert.deepEqual([ff.transport, ff.udid, ff.warm], ['webrtc', udid, hello.warm]);
+  assert.ok(Number.isInteger(ff.connectMs) && ff.connectMs >= hello.connectMs, `first-frame connectMs ${ff.connectMs} >= the hello's ${hello.connectMs}`);
+  assert.equal(inbox.filter((m) => m.type === 'first-frame').length, 1, 'said once');
   assert.ok(nals.every((n) => n.pt === 125));
   const firstSps = nals.findIndex((n) => n.nal === 7);
   const firstIdr = nals.findIndex((n) => n.nal === 5);

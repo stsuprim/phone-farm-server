@@ -8,12 +8,13 @@ import { parseInstalled, withKnown } from './apps.js';
 import { Config } from './config.js';
 import { H264Info, H264Source, helperProducer, phoneStats, StartProducer } from './h264.js';
 import { imageSize } from './imgsize.js';
-import { PhonecapHost, profileFor } from './lanes.js';
-import { HidHost, hidTypable, iosMajor, toHid } from './hid.js';
+import { basicFacts, mergeBattery, parseActiveApp, parseBatteryDomain, parseDeviceInfo, parseIoreg, parseWdaBattery } from './info.js';
+import { PhonecapHost, profileFor, THUMB_DEFAULT_FPS } from './lanes.js';
+import { HidHost, HidPartial, hidPlayMs, HidTimeout, hidTypable, iosMajor, toHid } from './hid.js';
 import type { InputResult } from './inputlog.js';
 import { MjpegSource } from './mjpeg.js';
 import { frameAgrees, Orientation, Size } from './orient.js';
-import { AppInfo, Backend, ButtonName, ControlState, H264Want, HttpError, Image, ImageFormat, InputMethods, PathPoint, PhoneInfo, ScreenInfo, StreamSettings } from './types.js';
+import { AppInfo, Backend, ButtonName, ControlState, H264Want, HttpError, Image, ImageFormat, InputMethods, PathPoint, PhoneFacts, PhoneInfo, ScreenInfo, StreamSettings, WarmState } from './types.js';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..'); // src/ or dist/ -> project root
 // inside a minimal app bundle so macOS gives it its own Camera (TCC) entry (scripts/build-native.mjs)
@@ -55,7 +56,7 @@ function helperCaps(): string[] {
     return [];
   }
 }
-import { WdaError, WdaManager } from './wda.js';
+import { FAST_TAP_HOLD_MS, WdaError, WdaManager } from './wda.js';
 
 function run(cmd: string, args: string[], timeout = 10000): Promise<string> {
   return new Promise((resolve, reject) => {
@@ -84,6 +85,8 @@ export class RealBackend implements Backend {
   private hid = new Map<string, HidHost>(); // CoreDevice HID live touch, per phone (iOS 27+)
   private capture = new Map<string, CaptureState>(); // each phone's picture shape against its orientation
   private appCache = new Map<string, { at: number; apps: AppInfo[] }>();
+  private seen = new Map<string, number>(); // when each phone was last plugged in (Date.now())
+  private playFails = new Map<string, { at: number; error: string }>(); // a queued HID gesture that failed while playing
   /** Set by the server: a phone's orientation or upright size changed. */
   onOrientation?: (udid: string) => void;
 
@@ -118,6 +121,7 @@ export class RealBackend implements Backend {
           prev?.ios ? prev.ios : info(udid, ['-k', 'ProductVersion']),
           info(udid, ['-q', 'com.apple.mobile.battery', '-k', 'BatteryCurrentCapacity']),
         ]);
+        if (!prev?.online) this.seen.set(udid, Date.now());
         const paired = !!name; // empty output = not trusted/paired yet
         const b = Number.parseInt(batt, 10);
         this.phones.set(udid, {
@@ -326,13 +330,77 @@ export class RealBackend implements Backend {
         start = host.start;
       } else start = helperProducer(HELPER, args, tag);
       const kind = prof.thumb ? 'thumb' : prof.remote ? 'remote' : 'lan';
-      src = new H264Source(lanes ? `${tag} ${kind}` : tag, start, prof.settings, { kind, onInfo: (info) => this.captureInfo(udid, info) });
+      // kept running a while after its last viewer (CAPTURE_WARM_SECONDS): coming back to a phone shows it at once
+      src = new H264Source(lanes ? `${tag} ${kind}` : tag, start, prof.settings, {
+        kind, onInfo: (info) => this.captureInfo(udid, info), idleMs: (this.cfg.captureWarmSeconds ?? 120) * 1000,
+      });
       this.h264Sources.set(key, src);
     }
     const down = src.unavailable();
     if (down) return down;
     src.setWant(prof.settings);
     return src;
+  }
+
+  /**
+   * Start the phone's capture ahead of its first viewer. The slow part of opening a live view is the capture itself
+   * (the helper starting, the phone's screen showing up as a capture device); with a lanes helper that's one process
+   * per phone whatever the lane, so a thumbnail lane (the cheapest encoder) started now means the viewer's own lane
+   * is only added to a running capture. It stops by itself after the warm time unless a viewer came.
+   */
+  warm(udid: string): WarmState {
+    this.known(udid);
+    const problem = this.helperProblem();
+    if (problem) return { capture: 'unavailable', reason: problem };
+    if (!helperCaps().includes('lanes')) {
+      // one shared encoder, set by its first viewer: starting it here would fix that viewer's size
+      const s = this.h264Sources.get(udid);
+      if (s?.ready) s.warm();
+      return s?.ready ? { capture: 'warm' } : { capture: 'unavailable', reason: 'this capture helper is an older build (no lanes): it starts with the first viewer' };
+    }
+    const was = this.phoneSources(udid).some((s) => s.ready);
+    const src = this.h264(udid, { tier: 'thumb', fps: THUMB_DEFAULT_FPS, scale: 100, quality: null });
+    if (typeof src === 'string') return { capture: 'unavailable', reason: src };
+    src.warm();
+    return { capture: was ? 'warm' : 'starting' };
+  }
+
+  // ---- the detail card (src/info.ts) ----
+
+  /**
+   * Battery and charging from lockdown's battery domain, the temperature from the IORegistry's AppleSmartBattery
+   * (both through libimobiledevice, so they work while WDA is down), the app in front and iOS's thermal state from
+   * WDA when it's up (quick reads that never wait for it or recover it). Whatever doesn't answer is null.
+   */
+  async facts(udid: string): Promise<PhoneFacts> {
+    const p = this.phones.get(udid);
+    if (!p) throw new HttpError(404, `unknown phone ${udid}`);
+    const basic: PhoneFacts = { ...basicFacts(p), connectedAt: p.online ? this.seen.get(udid) ?? null : null };
+    if (!p.online) return basic;
+    const quiet = (cmd: string, args: string[], ms: number) => run(cmd, args, ms).catch(() => '');
+    const [lockdown, ioreg, app, dev] = await Promise.all([
+      quiet('ideviceinfo', ['-u', udid, '-q', 'com.apple.mobile.battery'], 4000),
+      quiet('idevicediagnostics', ['-u', udid, 'ioregentry', 'AppleSmartBattery'], 5000),
+      this.wda.peek(udid, '/wda/activeAppInfo', 2500),
+      this.wda.peek(udid, '/wda/device/info', 2500),
+    ]);
+    let batt = mergeBattery(parseBatteryDomain(lockdown), parseIoreg(ioreg));
+    if (batt.level === null || batt.charging === null) batt = mergeBattery(batt, parseWdaBattery(await this.wda.peek(udid, '/wda/batteryInfo', 2500, true)));
+    const d = parseDeviceInfo(dev, Date.now());
+    return {
+      ...basic,
+      battery: { level: batt.level ?? basic.battery.level, charging: batt.charging },
+      temperatureC: batt.temperatureC,
+      app: parseActiveApp(app, this.appCache.get(udid)?.apps ?? null),
+      uptimeSec: d.uptimeSec,
+      bootedAt: d.bootedAt,
+      thermal: d.thermal,
+    };
+  }
+
+  playFailure(udid: string, since: number): string | null {
+    const f = this.playFails.get(udid);
+    return f && f.at >= since ? f.error : null;
   }
 
   screen(udid: string): ScreenInfo | null {
@@ -387,7 +455,13 @@ export class RealBackend implements Backend {
     let h = this.hid.get(udid);
     if (!h) {
       const python = process.env.HID_PYTHON ? this.cfg.hidPython : fs.existsSync(HID_VENV_PYTHON) ? HID_VENV_PYTHON : this.cfg.hidPython;
-      h = new HidHost(udid, { python, script: HID_SCRIPT, idleMs: this.cfg.hidIdleSeconds * 1000, retryMs: HID_RETRY_MS });
+      h = new HidHost(udid, {
+        python, script: HID_SCRIPT, idleMs: this.cfg.hidIdleSeconds * 1000, retryMs: HID_RETRY_MS,
+        // a path or text answered "queued" that then failed on the phone: the report of that action says so
+        onDone: (op, reply) => {
+          if (!reply.ok) this.playFails.set(udid, { at: Date.now(), error: `the ${op === 'type' ? 'text' : 'gesture'} broke off on the phone (HID: ${reply.error ?? 'unknown'})` });
+        },
+      });
       this.hid.set(udid, h);
     }
     return h;
@@ -449,7 +523,9 @@ export class RealBackend implements Backend {
 
   /**
    * HID if its session is open, else WDA for this one gesture, with the reason (`why`; null on a phone that never
-   * has HID). A failed HID input falls back at once, and the session reconnects by itself (src/hid.ts).
+   * has HID). A failed HID input falls back at once, and the session reconnects by itself (src/hid.ts). Not when the
+   * outcome isn't known (no answer in time) or it broke off partway (text half typed): doing it again through WDA
+   * could tap twice or type the text twice, so that's an error that says to look at the screen first.
    */
   private async viaHid(
     udid: string, what: string, send: (r: { h: HidHost; s: ScreenInfo; o: Orientation | null }) => Promise<unknown>,
@@ -460,8 +536,13 @@ export class RealBackend implements Backend {
       await send(r);
       return { done: { via: 'hid' } };
     } catch (err) {
+      const f = hidFailure(what, err);
+      if (f instanceof HttpError) {
+        console.log(`[hid ${udid.slice(-8)}] ${f.message}`);
+        throw f;
+      }
       console.log(`[hid ${udid.slice(-8)}] ${what} failed, WDA takes it: ${(err as Error).message}`);
-      return { why: `HID ${what} failed (${(err as Error).message})` };
+      return { why: f };
     }
   }
 
@@ -471,24 +552,30 @@ export class RealBackend implements Backend {
       const [hx, hy] = toHid(x, y, s, o);
       return h.input('tap', { x: hx, y: hy });
     });
-    if ('done' in hid) return hid.done;
+    // both quick routes answer at the press; the lift follows a moment later
+    if ('done' in hid) return { ...hid.done, play_ms: hidPlayMs('tap', {}) };
     const via = await this.wda.tap(udid, x, y);
-    return hid.why ? { via, reason: hid.why } : { via };
+    const play = via === 'wda-fast' ? { play_ms: FAST_TAP_HOLD_MS } : {};
+    return hid.why ? { via, reason: hid.why, ...play } : { via, ...play };
   }
   async gesture(udid: string, points: PathPoint[]): Promise<InputResult> {
     this.known(udid);
     const hid = await this.viaHid(udid, 'gesture', ({ h, s, o }) =>
       h.input('path', { points: points.map(([x, y, t]) => [...toHid(x, y, s, o), Math.round(t)]) }),
     );
-    if ('done' in hid) return hid.done;
+    // HID and the fast WDA route answer once the gesture is queued; the phone then plays it for its length
+    const length = Math.max(0, points[points.length - 1]![2]); // its times count from the gesture's start
+    if ('done' in hid) return { ...hid.done, play_ms: length };
     const via = await this.wda.actions(udid, points);
-    return hid.why ? { via, reason: hid.why } : { via };
+    const play = via === 'wda-fast' ? { play_ms: length } : {};
+    return hid.why ? { via, reason: hid.why, ...play } : { via, ...play };
   }
   async type(udid: string, text: string): Promise<InputResult> {
     this.known(udid);
     let why: string | null = null;
     if (hidTypable(text)) {
-      const hid = await this.viaHid(udid, 'type', ({ h }) => h.input('type', { text }));
+      // answered when the last key is typed (not when it's queued): what follows finds the whole text there
+      const hid = await this.viaHid(udid, 'type', ({ h }) => h.input('type', { text }, { done: true }));
       if ('done' in hid) return hid.done;
       why = hid.why;
     }
@@ -613,7 +700,7 @@ export class RealBackend implements Backend {
     set.add(mine);
     const eff = this.streamSettings(udid);
     void this.wda.setMjpeg(udid, eff);
-    const off = this.source(udid).add(onFrame);
+    const off = this.source(udid).add(onFrame, true);
     return {
       contentType: 'image/jpeg',
       ...eff,
@@ -631,6 +718,22 @@ export class RealBackend implements Backend {
     for (const h of this.hid.values()) h.close();
     this.wda.shutdown();
   }
+}
+
+/**
+ * What a failed HID input means for its action. A refusal (nothing reached the phone) is a reason: WDA does it
+ * instead. No answer in time, or a text or gesture that broke off partway, is an error and WDA does NOT do it again:
+ * it may have happened (or half of it has), and a repeat would tap twice or type the text twice.
+ */
+export function hidFailure(what: string, err: unknown): HttpError | string {
+  const message = (err as Error)?.message ?? String(err);
+  if (err instanceof HidTimeout) {
+    return new HttpError(504, `the phone didn't confirm the ${what} in time (HID: ${message}); it may or may not have happened, so it was not repeated: look at the screen before trying again`);
+  }
+  if (err instanceof HidPartial) {
+    return new HttpError(502, `the ${what} broke off partway on the phone (HID: ${message}); part of it may be there, so it was not repeated: look at the screen before trying again`);
+  }
+  return `HID ${what} failed (${message})`;
 }
 
 /** The first line of a build log that is a real compiler error ("error:"), else its first non-empty line. */

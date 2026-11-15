@@ -1,11 +1,12 @@
 import crypto from 'node:crypto';
 import { withKnown } from './apps.js';
 import { H264Source, phoneStats, RateMeter } from './h264.js';
+import { appName } from './info.js';
 import { mockProducer } from './h264mock.js';
 import { isLandscape, Orientation } from './orient.js';
 import { encodePng } from './png.js';
 import type { InputResult } from './inputlog.js';
-import { AppInfo, Backend, ButtonName, ControlState, H264Want, HttpError, Image, ImageFormat, InputMethods, PathPoint, PhoneInfo, ScreenInfo, StreamSettings } from './types.js';
+import { AppInfo, Backend, ButtonName, ControlState, H264Want, HttpError, Image, ImageFormat, InputMethods, PathPoint, PhoneFacts, PhoneInfo, ScreenInfo, StreamSettings, WarmState } from './types.js';
 
 const MOCK: InputResult = { via: 'mock' };
 
@@ -16,6 +17,10 @@ export interface MockOptions {
   h264IdleMs?: number;
   /** true = the mock phones take live touch (down/move/up as they come), like CoreDevice HID. Default false. */
   live?: boolean;
+  /** The mock capture's first picture comes this long after it starts (a real one takes a second or two). Default 0. */
+  h264StartMs?: number;
+  /** A mock phone's gestures and text are answered at once and "play" this long, like HID's queued ones. Default 0. */
+  playMs?: number;
 }
 
 /** The mock home screen's apps (GET /ui shows them as buttons; tapping one opens it). */
@@ -77,6 +82,9 @@ export class MockBackend implements Backend {
   private streams = new Set<NodeJS.Timeout>();
   private h264Sources = new Map<string, H264Source>();
   private mjpeg = new Map<string, { viewers: number; meter: RateMeter }>();
+  private born = Date.now();
+  /** How often each phone's facts were gathered (tests: the ~15 s cache). */
+  readonly factsAsked = new Map<string, number>();
   /** Set by the server: a phone's orientation or upright size changed. */
   onOrientation?: (udid: string) => void;
 
@@ -145,13 +153,63 @@ export class MockBackend implements Backend {
     if (this.opts.h264 === false) return 'H.264 is turned off in this mock';
     let src = this.h264Sources.get(udid);
     if (!src) {
-      src = new H264Source(udid.slice(0, 12), mockProducer(() => p), { fps: want.fps, scale: want.scale, bitrate: 0 }, {
+      const make = mockProducer(() => p);
+      const slow = this.opts.h264StartMs ?? 0;
+      // a capture that takes a moment to give its first picture, like the real helper's start
+      const start: typeof make = !slow
+        ? make
+        : (w, hooks) => {
+            let inner: ReturnType<typeof make> | undefined;
+            let stopped = false;
+            const t = setTimeout(() => {
+              if (!stopped) inner = make(w, hooks);
+            }, slow);
+            return {
+              key: () => inner?.key(),
+              stop: () => {
+                stopped = true;
+                clearTimeout(t);
+                inner?.stop();
+              },
+            };
+          };
+      src = new H264Source(udid.slice(0, 12), start, { fps: want.fps, scale: want.scale, bitrate: 0 }, {
         idleMs: this.opts.h264IdleMs ?? 10_000,
         log: () => {},
       });
       this.h264Sources.set(udid, src);
     }
     return src;
+  }
+
+  /** Start the mock capture ahead of a viewer (it stops after the idle time unless one comes). */
+  warm(udid: string): WarmState {
+    const src = this.h264(udid, { fps: 60, scale: 100, quality: null });
+    if (typeof src === 'string') return { capture: 'unavailable', reason: src };
+    const was = src.ready;
+    src.warm();
+    return { capture: was ? 'warm' : 'starting' };
+  }
+
+  /** The detail card's facts of a mock phone (the 2nd one doesn't say its temperature or uptime: nulls). */
+  async facts(udid: string): Promise<PhoneFacts> {
+    const p = this.phones.get(udid);
+    if (!p) throw new HttpError(404, `unknown phone ${udid}`);
+    this.factsAsked.set(udid, (this.factsAsked.get(udid) ?? 0) + 1);
+    const i = [...this.phones.keys()].indexOf(udid);
+    const quiet = i === 1;
+    const bootedAt = quiet ? null : this.born - (i + 1) * 3_600_000;
+    return {
+      battery: { level: p.info.battery === null ? null : Math.round(p.info.battery) / 100, charging: p.info.online ? i % 2 === 0 : null },
+      temperatureC: quiet || !p.info.online ? null : 29.5 + i,
+      app: p.info.online ? { bundleId: p.app, name: appName(p.app, HOME_APPS.map(([name, bundleId]) => ({ name, bundleId, installed: true }))) } : { bundleId: null, name: null },
+      uptimeSec: bootedAt === null ? null : Math.round((Date.now() - bootedAt) / 1000),
+      model: p.info.model,
+      ios: p.info.ios,
+      bootedAt,
+      thermal: p.info.online && !quiet ? 'nominal' : null,
+      connectedAt: p.info.online ? this.born : null,
+    };
   }
 
   screen(udid: string): ScreenInfo | null {
@@ -297,7 +355,7 @@ export class MockBackend implements Backend {
     const b = points[points.length - 1]!;
     p.marks.push({ x: a[0], y: a[1], x2: b[0], y2: b[1], at: Date.now() });
     p.log.push(`gesture ${points.length}`);
-    return MOCK;
+    return this.opts.playMs ? { ...MOCK, play_ms: this.opts.playMs } : MOCK;
   }
   async type(udid: string, text: string): Promise<InputResult> {
     const p = this.live(udid);

@@ -10,6 +10,12 @@ const STILL_PT = 4; // ...and "still" means it never strayed more than this many
 const STALE_TOUCH_MS = 60000; // a buffered touch (nothing on the phone yet) never lifted is forgotten after this
 /** A live touch (a finger down on the phone) with no event for this long is lifted: no stuck fingers. */
 export const TOUCH_RELEASE_MS = 1500;
+/**
+ * A live touch stays down at least this long. A quick tap whose down waited in the phone's queue (the phone waking,
+ * a gesture still playing) would otherwise be pressed and lifted in the same instant, which iOS can take for nothing.
+ */
+export const MIN_CONTACT_MS = 30;
+const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
 /** The keys POST /key (and `{type: "key"}`) takes. */
 export const KEYS = ['home', 'lock', 'volumeUp', 'volumeDown', 'enter', 'delete'] as const;
@@ -100,6 +106,8 @@ interface Touch {
   timer?: NodeJS.Timeout;
   /** Its down went straight to the phone (HID live touch): moves and the up follow live. */
   live: boolean;
+  /** When its down reached the phone (performance.now()). */
+  downAt?: number;
   /** The live down never reached the phone: the gesture is buffered and played whole on "up" by the other route. */
   liveFailed: boolean;
   /** Why it isn't live (the ack's and the meter's `reason`). */
@@ -155,6 +163,7 @@ export function touchAck(msg: Record<string, unknown>, t0: number, r: Result, er
 export class Control {
   private queues = new Map<string, { tail: Promise<unknown>; waiting: number }>();
   private touches = new Map<string, Touch>();
+  private acted = new Map<string, number>(); // when each phone last had an action start, end or finish playing
   private releaseMs: number;
   readonly meter: InputMeter;
   /**
@@ -290,6 +299,14 @@ export class Control {
     return this.touches.has(udid);
   }
 
+  /**
+   * When the phone last had input (performance.now(); -Infinity: never): an action's start, its end, and the end of
+   * a gesture the phone was still playing. What was read from the screen before that may be stale (src/agent.ts).
+   */
+  lastAction(udid: string): number {
+    return this.acted.get(udid) ?? -Infinity;
+  }
+
   // ---- coordinates ----
 
   /** Coordinate pairs of one message, in its unit -> upright points, clamped to the screen. */
@@ -345,6 +362,7 @@ export class Control {
         if (waking && opts.discrete) await waking;
       }
       const tStart = performance.now();
+      this.acted.set(udid, tStart);
       try {
         let r = await fn();
         if (opts.reason && r && !r.reason) r = { ...r, reason: opts.reason };
@@ -353,10 +371,18 @@ export class Control {
       } catch (err) {
         if (tRecv !== null) this.record(udid, type, tRecv, tStart, null, false, (err as Error)?.message);
         throw err;
+      } finally {
+        this.acted.set(udid, performance.now());
       }
     });
+    // An action answered when it was queued on the phone (HID's paths, the fast WDA route) is still playing there:
+    // its sender has its answer, but the phone's next action waits until it's through, so a Home press or a tap by
+    // another route never lands in the middle of a swipe.
     queue.tail = p.then(
-      () => undefined,
+      (r) => {
+        const play = r && typeof r.play_ms === 'number' && r.play_ms > 0 ? Math.min(r.play_ms, MAX_GESTURE_MS) : 0;
+        return play ? sleep(play).then(() => void this.acted.set(udid, performance.now())) : undefined;
+      },
       () => undefined,
     );
     void queue.tail.then(() => {
@@ -411,7 +437,12 @@ export class Control {
         ng.reason = this.backend.liveTouchWhy?.(udid) ?? undefined;
         return Promise.resolve({ via: 'buffered', reason: ng.reason ?? 'no live touch on this phone: the gesture plays on "up"' });
       }
-      return this.run(udid, 'touch-down', tRecv, () => liveTouch(udid, 'down', x, y), { discrete: true, must: true }).catch((err): Result => {
+      const press = async () => {
+        const r = await liveTouch(udid, 'down', x, y);
+        ng.downAt = performance.now();
+        return r;
+      };
+      return this.run(udid, 'touch-down', tRecv, press, { discrete: true, must: true }).catch((err): Result => {
         // nothing reached the phone: the rest is buffered and "up" plays the whole gesture by the other route
         ng.liveFailed = true;
         ng.reason = `live touch failed (${(err as Error)?.message ?? 'unknown'}): the gesture plays on "up"`;
@@ -471,6 +502,8 @@ export class Control {
           const r = await this.play(udid, g);
           return r ? { ...r, reason: g.reason } : r;
         }
+        const held = g.downAt === undefined ? Infinity : performance.now() - g.downAt;
+        if (held < MIN_CONTACT_MS) await sleep(MIN_CONTACT_MS - held);
         return liveTouch(udid, 'up', x, y);
       }, { must: true }).catch((err) => {
         if (played) throw err;

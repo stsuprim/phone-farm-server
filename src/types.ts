@@ -36,6 +36,45 @@ export interface PhoneInfo {
   screenOn?: boolean | null;
   /** Last input or viewer on this phone, ms since the epoch (null = none since the server started). */
   lastActive?: number | null;
+  /** The detail card's data (src/info.ts), as it was last gathered (at most ~15 s old while someone lists the phones). */
+  info?: DeviceInfo;
+}
+
+/**
+ * What a phone's detail card shows (GET /phones/:udid/info, and `info` on each phone in GET /phones). Anything the
+ * phone (or its tools) couldn't say is null.
+ */
+export interface DeviceInfo {
+  /** `level` 0..1; `charging` true while it takes charge. */
+  battery: { level: number | null; charging: boolean | null };
+  /** The battery's temperature in degrees Celsius (IORegistry AppleSmartBattery Temperature / 100). */
+  temperatureC: number | null;
+  /** The app in front. */
+  app: { bundleId: string | null; name: string | null };
+  /** Seconds since the phone booted, and when that was (ms since the epoch); null when the phone doesn't say. */
+  uptimeSec: number | null;
+  /** The product type ("iPhone14,5") and the iOS version ("18.1"). */
+  model: string | null;
+  ios: string | null;
+  bootedAt: number | null;
+  /** WebDriverAgent's signing: when it expires (ISO 8601, as GET /api/wda) and the days left. */
+  wda: { expiresAt: string | null; daysLeft: number | null; state: string | null };
+  /** iOS's own word on heat (WDA's device info): nominal, fair, serious, critical. */
+  thermal: 'nominal' | 'fair' | 'serious' | 'critical' | null;
+  /** When the server first saw the phone connected (ms since the epoch; since the server started). */
+  connectedAt: number | null;
+  /** When this was gathered (ms since the epoch); `fresh` false = the quick answer from what the list already knew. */
+  at: number;
+  fresh: boolean;
+}
+
+/** The phone's own part of DeviceInfo, as a backend gathers it (the server adds `wda`, `at`, `fresh`). */
+export type PhoneFacts = Omit<DeviceInfo, 'wda' | 'at' | 'fresh'>;
+
+/** How ready a phone's capture is for a viewer (POST /warm): running with a picture, starting, or why it can't. */
+export interface WarmState {
+  capture: 'warm' | 'starting' | 'unavailable';
+  reason?: string;
 }
 
 /** Which way a viewer is connected: lan = full quality + live HID touch; remote = adaptive lane, swipes as one command. */
@@ -61,6 +100,8 @@ export interface SessionStats {
   /** Why it's on MJPEG (when the H.264 path wasn't available). */
   reason?: string | null;
   since: number;
+  /** The request (the stream's upgrade, the rtc-offer) -> its first frame sent, ms; null until that frame. */
+  connectMs?: number | null;
 }
 
 /** Per-phone live view stats in GET /phones. Timings are averages in ms; null when unknown. */
@@ -220,6 +261,18 @@ export interface Backend {
   frameHash?(udid: string): Promise<string | null>;
   /** Restart the phone's WDA runner (reinstalls a freshly signed build). */
   restartWda?(udid: string): void;
+  /** The detail card's facts, asked from the phone now (never throws for a known phone: unknown parts are null). */
+  facts?(udid: string): Promise<PhoneFacts>;
+  /**
+   * Start the phone's capture ahead of its first viewer (it then runs for the warm time unless one comes): opening a
+   * live view finds a picture at once.
+   */
+  warm?(udid: string): WarmState;
+  /**
+   * A gesture or text that was answered when it was queued on the phone and then failed while playing, since `since`
+   * (Date.now()): what went wrong, else null.
+   */
+  playFailure?(udid: string, since: number): string | null;
   /** Drop the WDA session, restart the runner if WDA doesn't answer, make a new warm session. */
   recover(udid: string): Promise<ControlState>;
   /** Subscribe to image frames. Returns unsubscribe and the settings actually used. Throws HttpError if unknown/not ready. */

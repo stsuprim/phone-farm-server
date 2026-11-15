@@ -20,6 +20,13 @@ const VERIFY_MS = 3000;
 const VERIFY_MAX_MS = 20000;
 const MAX_STEPS = 50;
 const MAX_WAIT_MS = 15000;
+/** Input this recent may still be changing the screen (a push, a sheet, an app opening). */
+const TRANSITION_MS = 1500;
+/** After recent input, an element that isn't there yet is waited for this long even when no `timeoutMs` was given. */
+const GRACE_MS = 1000;
+/** Waiting for the picture to stop changing: two looks this far apart that are the same, for at most STILL_MAX_MS. */
+const STILL_STEP_MS = 150;
+const STILL_MAX_MS = 900;
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const round1 = (v: number) => Math.round(v * 10) / 10;
 
@@ -103,8 +110,17 @@ function queryOf(o: Record<string, unknown>): ElementQuery {
   return q;
 }
 
+/** Whether an element still says what the caller read at its id (`label`, `name` or `text` given beside the `id`). */
+function says(el: UiElement, q: ElementQuery): boolean {
+  if (q.type && el.type.toLowerCase() !== q.type.replace(/^XCUIElementType/i, '').toLowerCase()) return false;
+  if (q.label && lower(el.label) !== lower(q.label)) return false;
+  if (q.name && lower(el.name) !== lower(q.name)) return false;
+  if (q.text && ![el.label, el.value, el.name].some((f) => f !== null && lower(f).includes(lower(q.text)))) return false;
+  return true;
+}
+
 export class Agent {
-  private uiCache = new Map<string, { at: number; p: Promise<UiSnapshot> }>();
+  private uiCache = new Map<string, { at: number; t0: number; p: Promise<UiSnapshot> }>();
   private lane = new Map<string, Promise<void>>();
 
   constructor(private backend: Backend, private control: Control) {
@@ -128,14 +144,20 @@ export class Agent {
 
   // ---- reading ----
 
-  /** GET /ui: the screen as elements and strings; an answer under 300 ms old is given again (`fresh` asks anew). */
-  ui(udid: string, opts: { all?: boolean; max?: number; fresh?: boolean } = {}): Promise<UiSnapshot> {
+  /**
+   * GET /ui: the screen as elements and strings; an answer under 300 ms old is given again (`fresh` asks anew), but
+   * never one read before the phone's last input: that may be the screen the input replaced. `settle` waits for the
+   * picture to stop changing first (a transition to end).
+   */
+  ui(udid: string, opts: { all?: boolean; max?: number; fresh?: boolean; settle?: boolean } = {}): Promise<UiSnapshot> {
     const key = `${udid}|${opts.all ? 'all' : 'seen'}|${opts.max ?? ''}`;
     const kept = this.uiCache.get(key);
-    if (kept && !opts.fresh && (kept.at === 0 || Date.now() - kept.at < UI_FRESH_MS)) {
+    const current = !!kept && kept.t0 >= this.control.lastAction(udid);
+    if (kept && current && !opts.fresh && !opts.settle && (kept.at === 0 || Date.now() - kept.at < UI_FRESH_MS)) {
       return kept.p.then((s) => (kept.at === 0 ? s : { ...s, cached: true }));
     }
-    const entry = { at: 0, p: this.snapshot(udid, opts) }; // at 0 = still on its way: everyone asking meanwhile shares it
+    // at 0 = still on its way: everyone asking meanwhile shares it
+    const entry = { at: 0, t0: performance.now(), p: opts.settle ? this.still(udid).then(() => this.snapshot(udid, opts)) : this.snapshot(udid, opts) };
     this.uiCache.set(key, entry);
     entry.p.then(
       () => {
@@ -155,11 +177,16 @@ export class Agent {
     const source = this.backend.uiSource?.bind(this.backend);
     if (!source) throw new HttpError(501, 'this backend cannot read the UI');
     const t0 = performance.now();
-    const [tree, app] = await Promise.all([
-      source(udid),
-      this.app(udid),
-      this.backend.refreshOrientation?.(udid, 500).catch(() => null), // the tree's rectangles are upright: so must the screen be
-    ]);
+    const read = () =>
+      Promise.all([
+        source(udid),
+        this.app(udid),
+        this.backend.refreshOrientation?.(udid, 500).catch(() => null), // the tree's rectangles are upright: so must the screen be
+      ]);
+    let [tree, app] = await read();
+    // the phone had input while the tree was being read (a big screen takes a second): the tree may show either side
+    // of it, so it's read once more
+    if (this.control.lastAction(udid) > t0) [tree, app] = await read();
     const s = this.backend.screen(udid);
     const flat = flattenUi(tree, s, opts);
     const px = (v: number | undefined) => (s?.scale && v ? Math.round(v * s.scale) : null);
@@ -205,6 +232,25 @@ export class Agent {
     }
   }
 
+  /**
+   * Wait for the picture to stop changing: two looks STILL_STEP_MS apart that are the same, for at most `maxMs`
+   * (a video never stops). True when it's still; false when it kept moving or the backend has no picture to compare.
+   */
+  async still(udid: string, maxMs = STILL_MAX_MS): Promise<boolean> {
+    const hash = this.backend.frameHash?.bind(this.backend);
+    if (!hash) return false;
+    const until = performance.now() + maxMs;
+    let prev = await hash(udid).catch(() => null);
+    while (prev !== null) {
+      await sleep(STILL_STEP_MS);
+      const now = await hash(udid).catch(() => null);
+      if (now === prev) return true;
+      if (performance.now() >= until) break;
+      prev = now;
+    }
+    return false;
+  }
+
   private settle(msg: Record<string, unknown>, asked: unknown): number {
     if (typeof asked === 'number' && Number.isFinite(asked)) return Math.min(5000, Math.max(0, asked));
     return msg.type === 'launch' ? SETTLE_LAUNCH_MS : SETTLE_MS;
@@ -220,10 +266,15 @@ export class Agent {
     const verify = parseVerify(opts.verify ?? msg.verify);
     const before = await this.look(udid);
     const tAct = performance.now();
+    const since = Date.now();
     const r = (await this.control.handle(udid, msg, owner)) as InputResult | void;
     const ms = round1(performance.now() - tAct);
-    const wait = this.settle(msg, opts.settleMs ?? msg.settleMs);
+    // a gesture answered when it was queued is still playing on the phone: the look after comes after it
+    const play = r && typeof r.play_ms === 'number' && r.play_ms > 0 ? Math.min(r.play_ms, 60_000) : 0;
+    const wait = this.settle(msg, opts.settleMs ?? msg.settleMs) + play;
     if (wait > 0) await sleep(wait);
+    const broke = this.backend.playFailure?.(udid, since);
+    if (broke) throw new HttpError(502, `${broke}; look at the screen before trying again`);
     const [after, v] = await Promise.all([before ? this.look(udid) : null, verify ? this.verify(udid, verify) : null]);
     return {
       ok: true, ms, total_ms: round1(performance.now() - t0),
@@ -285,10 +336,16 @@ export class Agent {
    * POST /tap-element `{id | label | name | text, index?, timeoutMs?, verify?}`: find the element on the screen as it
    * is now (waiting up to `timeoutMs` for it to appear) and tap its middle.
    */
-  async tapElement(udid: string, body: Record<string, unknown>, owner?: object): Promise<ActionReport & { element: UiElement; matches: number }> {
+  async tapElement(udid: string, body: Record<string, unknown>, owner?: object): Promise<ActionReport & { element: UiElement; matches: number; moved?: boolean }> {
     const q = queryOf(body);
     if (!q.id && !q.label && !q.name && !q.text) throw new HttpError(400, 'say which element: "id" (from GET /ui), "label", "name" or "text"');
-    const wait = typeof body.timeoutMs === 'number' && Number.isFinite(body.timeoutMs) ? Math.min(MAX_WAIT_MS, Math.max(0, body.timeoutMs)) : 0;
+    // The phone just had input: the screen may still be arriving (a push, a sheet sliding in, an app opening). An
+    // element read mid-way is tapped where it was, not where it ends up, so the picture is waited for to stop moving
+    // first, and an element that isn't there yet gets a moment to appear even when no `timeoutMs` was given.
+    const recent = performance.now() - this.control.lastAction(udid) < TRANSITION_MS;
+    const asked = typeof body.timeoutMs === 'number' && Number.isFinite(body.timeoutMs);
+    const wait = asked ? Math.min(MAX_WAIT_MS, Math.max(0, body.timeoutMs as number)) : recent ? GRACE_MS : 0;
+    if (recent && body.settle !== false) await this.still(udid);
     const until = Date.now() + wait;
     let found: UiElement[] = [];
     let snap: UiSnapshot;
@@ -305,10 +362,28 @@ export class Agent {
       throw new HttpError(404, `no element matches ${describeQuery(q)}${says ? `; the screen says: ${says}` : ' (the screen has no readable text)'}`);
     }
     if (i >= found.length) throw new HttpError(404, `only ${found.length} element(s) match ${describeQuery({ ...q, index: undefined })}, so there is no index ${i}`);
-    const el = found[i]!;
+    let el = found[i]!;
+    let moved = false;
+    if (q.id && (q.label || q.name || q.text) && !says(el, q)) {
+      // An id is a place in the tree: after the screen changed, another element sits there. The caller also said what
+      // it read at that id, so the element that says it now is the one meant (wherever it is), else nothing is tapped.
+      const now = findElements(snap.elements, { ...q, id: undefined });
+      const again = now[q.index ?? 0] ?? now[0];
+      if (!again) {
+        throw new HttpError(409, `the screen changed since it was read: ${q.id} is now ${el.type} ${JSON.stringify(el.label ?? el.name ?? el.value ?? '')}, not ${describeQuery({ ...q, id: undefined })}; read the screen again`);
+      }
+      el = again;
+      moved = true;
+    }
+    const cx = el.x + el.w / 2;
+    const cy = el.y + el.h / 2;
+    if (!(el.w > 0) || !(el.h > 0) || cx < 0 || cx > 1 || cy < 0 || cy > 1) {
+      // its middle would be clamped to the screen's edge, and something else pressed there
+      throw new HttpError(409, `${el.type} ${JSON.stringify(el.label ?? el.name ?? el.id)} is off the screen (its middle is at ${cx.toFixed(2)}, ${cy.toFixed(2)}): scroll it into view first`);
+    }
     const [x, y] = centerOf(el);
     const report = await this.action(udid, { type: 'tap', x, y, unit: 'norm' }, { verify: body.verify, settleMs: body.settleMs }, owner);
-    return { ...report, element: el, matches: found.length };
+    return { ...report, element: el, matches: found.length, ...(moved ? { moved } : {}) };
   }
 
   /**

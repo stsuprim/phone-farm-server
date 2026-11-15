@@ -25,9 +25,11 @@ recovering) or `WDA refused the request on <name>: ...` (WDA answered but said n
 | Method | Path | Body / query | Result |
 |---|---|---|---|
 | GET | `/health` | - | `{ok, mock}` (no auth) |
-| GET | `/phones` | - | `[{udid, name, model, ios, battery, online, ready, control, scale, point_width, point_height, width, height, orientation}]`: `battery` 0-100 or null; `model` the product type (`iPhone14,5`); `ready` = WDA running; `control` = `"ready"` (session warm), `"recovering"` (WDA starting or session being remade) or `"down"`; `orientation` how the phone is turned now (`portrait`, `landscape-left`, `landscape-right`, `portrait-upside-down`; null until WDA has said; see [Orientation and coordinates](#orientation-and-coordinates)); `scale` from WDA (`/wda/screen`); `point_width`/`point_height` the screen in points **as it's turned now** (390 x 844 upright, 844 x 390 on its side), null until known; `width`/`height` the same in pixels (points x scale); `stats` the live view numbers (see [Live view](#live-view-webrtc-h264-mjpeg)); `lan` the Mac's own base URLs on its LAN (private IPv4 only, `["http://192.168.1.20:8787", ...]`, same for every phone); `tailnet` its Tailscale ones (100.64/10), listed apart because a Tailscale address is not a local path |
+| GET | `/phones` | - | `[{udid, name, model, ios, battery, online, ready, control, scale, point_width, point_height, width, height, orientation}]`: `battery` 0-100 or null; `model` the product type (`iPhone14,5`); `ready` = WDA running; `control` = `"ready"` (session warm), `"recovering"` (WDA starting or session being remade) or `"down"`; `orientation` how the phone is turned now (`portrait`, `landscape-left`, `landscape-right`, `portrait-upside-down`; null until WDA has said; see [Orientation and coordinates](#orientation-and-coordinates)); `scale` from WDA (`/wda/screen`); `point_width`/`point_height` the screen in points **as it's turned now** (390 x 844 upright, 844 x 390 on its side), null until known; `width`/`height` the same in pixels (points x scale); `stats` the live view numbers (see [Live view](#live-view-webrtc-h264-mjpeg)); `lan` the Mac's own base URLs on its LAN (private IPv4 only, `["http://192.168.1.20:8787", ...]`, same for every phone); `tailnet` its Tailscale ones (100.64/10), listed apart because a Tailscale address is not a local path; `info` the detail card's data as it was last gathered (see [Device info](#device-info-the-detail-card)) |
+| GET | `/phones/:udid/info` | `?fresh=1` (ask the phone now) | `{ok, udid, battery: {level, charging}, temperatureC, app: {bundleId, name}, uptimeSec, model, ios, bootedAt, wda: {expiresAt, daysLeft, state}, thermal, connectedAt, at, fresh}`: the detail card, kept ~15 s; anything unknown is `null`. See [Device info](#device-info-the-detail-card) |
+| POST | `/phones/:udid/warm` | `{}` | `{ok, udid, capture: "warm"\|"starting"\|"unavailable", reason?, input}`: gets the phone ready for a viewer that's about to open it (capture started, live touch channel opened, phone woken). See [Opening a view fast](#opening-a-view-fast) |
 | GET | `/phones/:udid/screenshot` | `?format=png` (default) or `jpeg` | image bytes, always upright at the screen's true shape (`jpeg` = latest MJPEG frame, or a PNG when that frame isn't the phone's shape; mock always returns PNG, check `Content-Type`). Headers `x-orientation`, `x-width`, `x-height` (the picture's own size) |
-| WS | `/phones/:udid/stream` | `?codec=` (`h264` or `mjpeg`; absent = MJPEG as before), `?fps=` (1-60, default 60), `?quality=`, `?scale=` (10-100 %; MJPEG default 50, H.264 default 100) | MJPEG: first a text message `{"type":"hello", udid, contentType, fps, scale, quality, orientation, point_width, point_height, screen_width, screen_height, width, height}` with the settings actually used, then `{"type":"orientation", ...}` with the frames' real size (and again whenever the phone turns), then one binary message per frame (JPEG from WDA's MJPEG server in real mode, PNG in mock); latest frame only. H.264: see [Live view](#live-view-webrtc-h264-mjpeg) |
+| WS | `/phones/:udid/stream` | `?codec=` (`h264` or `mjpeg`; absent = MJPEG as before), `?fps=` (1-60, default 60), `?quality=`, `?scale=` (10-100 %; MJPEG default 50, H.264 default 100) | MJPEG: first a text message `{"type":"hello", udid, contentType, fps, scale, quality, orientation, point_width, point_height, screen_width, screen_height, width, height, connectMs}` with the settings actually used, then `{"type":"orientation", ...}` with the frames' real size (and again whenever the phone turns), then one binary message per frame (JPEG from WDA's MJPEG server in real mode, PNG in mock); latest frame only. H.264: see [Live view](#live-view-webrtc-h264-mjpeg). Every hello says `connectMs` (the request -> the first frame, ms) and a `{"type":"first-frame", udid, transport, connectMs}` follows the first frame: see [Opening a view fast](#opening-a-view-fast) |
 | WS | `/phones/:udid/control` | JSON text messages, see below | low-latency control over one connection |
 | POST | `/phones/:udid/tap` | `{x, y, unit?}` | the [action report](#action-reports) `{ok, ms, total_ms, via, reason?, changed, app, orientation, verified?, error?}`: `via` how it reached the phone (`hid`, `wda-fast`, `wda`; see [Input](#input-taps-swipes-typing)), `ms` the server's receive -> injected time. Every action below answers with it; with `"fast": true` in the body (or `?fast=1`) it answers just `{ok:true, via, ms}`, without the look before and after |
 | GET | `/phones/:udid/input` | - | input latency on the server: `{udid, via, tap_avg_ms, tap_p90_ms, last, samples, touch: {move_avg_ms, move_p90_ms, coalesced, auto_released, fallbacks, fallback_reason}, methods: {hid, hid_reason, wda_fast}, recent: [{at, type, via, ok, wait_ms, inject_ms, total_ms, reason?, error?}]}` (the last 50 actions; `touch` = live touch: move latency, moves folded into a newer one, touches the server lifted itself, gestures that took a slower route and why) |
@@ -39,10 +41,10 @@ recovering) or `WDA refused the request on <name>: ...` (WDA answered but said n
 | POST | `/phones/:udid/key` | `{key}`: `home`, `lock`, `volumeUp`, `volumeDown`, `enter`, `delete` | the report (`lock` locks the phone: the next action wakes it first) |
 | POST | `/phones/:udid/home` | `{}` | the report |
 | POST | `/phones/:udid/launch` | `{bundleId}` or `{name}` (as `GET .../apps` lists it: `"Settings"`, `"TikTok"`) | the report; 404 with nearby names when no app has that name |
-| GET | `/phones/:udid/ui` | `?all=1` (every node, hidden ones and containers too), `?max=` (elements, default 400), `?fresh=1` (skip the 300 ms cache) | the screen as an agent reads it, see [AI control](#ai-control-read-the-screen-act-verify) |
+| GET | `/phones/:udid/ui` | `?all=1` (every node, hidden ones and containers too), `?max=` (elements, default 400), `?fresh=1` (skip the 300 ms cache), `?settle=1` (wait for the picture to stop changing first) | the screen as an agent reads it, see [AI control](#ai-control-read-the-screen-act-verify) |
 | GET | `/phones/:udid/apps` | - | `{ok, udid, apps: [{bundleId, name, installed}]}`: installed apps (`ideviceinstaller`, cached 5 min) plus well-known ones (`installed: null` = not confirmed on this phone) |
 | GET | `/phones/:udid/orientation` | - | `{ok, udid, orientation, point_width, point_height, screen_width, screen_height, width, height}`, asked from WDA now |
-| POST | `/phones/:udid/tap-element` | `{id \| label \| name \| text, index?, timeoutMs?, verify?}` | finds the element and taps its middle: the report + `element`, `matches`; 404 says what the screen does say |
+| POST | `/phones/:udid/tap-element` | `{id \| label \| name \| text, index?, timeoutMs?, settle?, verify?}` | finds the element and taps its middle: the report + `element`, `matches`, `moved?`; 404 says what the screen does say; 409 when the screen changed under an `id` or the element is off the screen |
 | POST | `/phones/:udid/act` | `{steps: [...], verify?, continueOnError?}` | a batch in order: the report + `steps`, `done`, `failedAt?` |
 | POST | `/phones/:udid/recover` | `{}` | drops the WDA session, restarts the runner if `/status` fails, makes a new warm session (in the phone's queue, after any waiting actions): `{ok:true, control}`, or 502 `{error}` naming WDA |
 | POST | `/phones/:udid/swipe` | `{points: [[x, y, t], ...], duration, unit?}` (a whole drag in one command; `t` ms, `duration` ms optional) | the report: replayed on the server as ONE smooth gesture (resampled every 8 ms; `duration` stretches the client's timing). The `remote` profile sends drags this way, never per point |
@@ -60,6 +62,68 @@ How taps, swipes and typing reach the phone: see [Input](#input-taps-swipes-typi
 the control socket or a data channel, goes through one queue per phone, so they run in the order they arrived and never
 overlap (at most 50 waiting, then 503; a touch's `down` and `up` are never refused). **A locked or dark phone is woken
 first, inside the queue, and then the action runs**: a tap on a sleeping phone is never lost and nothing overtakes it.
+
+### Device info (the detail card)
+
+`GET /phones/:udid/info` (also `/api/devices/:udid/info`), and `info` on every phone in `GET /phones` / `/api/devices`:
+
+```json
+{"ok":true,"udid":"...","battery":{"level":0.87,"charging":true},"temperatureC":30.2,
+ "app":{"bundleId":"com.zhiliaoapp.musically","name":"TikTok"},"uptimeSec":null,"model":"iPhone14,5","ios":"18.1",
+ "bootedAt":null,"wda":{"expiresAt":"2026-11-21T03:12:40.000Z","daysLeft":5.4,"state":"ok"},
+ "thermal":"nominal","connectedAt":1794000000000,"at":1794000123456,"fresh":true}
+```
+
+| Field | What | From |
+|---|---|---|
+| `battery.level` | 0..1 | lockdown's battery domain (`ideviceinfo -q com.apple.mobile.battery`: `BatteryCurrentCapacity`), else the IORegistry, else WDA's `/wda/batteryInfo` |
+| `battery.charging` | `true` while it's on power and charging (or full on the charger) | `BatteryIsCharging` / `FullyCharged` + `ExternalConnected`, else the IORegistry's `IsCharging`, else WDA |
+| `temperatureC` | the battery's temperature, degrees Celsius, one decimal | `idevicediagnostics ioregentry AppleSmartBattery`: `Temperature` / 100 |
+| `app` | the app in front: `{bundleId, name}` | WDA `/wda/activeAppInfo`; the name from the phone's app list or the well-known apps when WDA gives none (`"Home Screen"` for SpringBoard) |
+| `uptimeSec`, `bootedAt` | seconds since the phone booted, and when that was (ms since the epoch) | **`null` on stock WDA**: neither lockdown nor WDA's `/wda/device/info` says when an iPhone booted. They're read when a WDA build adds `uptime` / `systemUptime` (seconds) or `bootTime` to `/wda/device/info` |
+| `model`, `ios` | the product type (`iPhone14,5`) and the iOS version | `ideviceinfo` `ProductType`, `ProductVersion` |
+| `wda` | WebDriverAgent's signing: `expiresAt` (ISO 8601), `daysLeft`, `state` (as `GET /api/wda`; `"unavailable"` in mock mode or with the re-sign off) | the re-sign scheduler |
+| `thermal` | iOS's own word on heat: `nominal`, `fair`, `serious`, `critical` | WDA `/wda/device/info` `thermalState` |
+| `connectedAt` | when the server last saw the phone plugged in (ms since the epoch) | the server |
+| `at`, `fresh` | when this was gathered (ms), and whether it's a gathered answer under ~15 s old (`false`: the quick answer from what the list already knew, or an older one) | the server |
+
+- **Anything the phone (or its tools) can't say is `null`**; the shape never changes (`battery`, `app` and `wda` are always
+  objects). A part that doesn't answer once (WDA busy with a long gesture) keeps its last value for a minute.
+- **Kept ~15 s.** `GET .../info` asks the phone when what's kept is older (one asking at a time per phone, shared by
+  everyone waiting; about 0.3-1 s), `?fresh=1` asks now anyway. **The list never waits**: `info` there is what's kept,
+  and a gathering starts in the background for the next list when that's over ~15 s old (the first list after a start
+  carries `fresh: false` with only what the list itself knows: battery level, model, iOS).
+- It never touches the live view or the input: lockdown and the IORegistry are read through libimobiledevice (they work
+  while WDA is down), and the WDA reads are quick ones (2.5 s at most) that never wait for WDA to start and never
+  recover it.
+- 404 `{"ok":false,"error":"unknown phone"}`; an unplugged phone answers 200 with what was last known.
+
+### Opening a view fast
+
+The slow part of opening a live view is the capture: `phonecap` starting and the phone's screen showing up as a capture
+device takes a second or two; everything after it is a few ms.
+
+- **Kept warm.** A phone's capture keeps running for `CAPTURE_WARM_SECONDS` (default 120; it was 10) after its last
+  viewer left, so going back to a phone (one phone at a time, switching between them) shows its picture at once.
+- **Started ahead.** `POST /phones/:udid/warm` starts the capture (a thumbnail lane: the cheapest encoder, the same one
+  capture process the viewer's own lane is then added to), opens the live touch channel and wakes the phone; call it
+  when a phone is selected, before its view opens. Opening the control socket does the same for the capture, so it's
+  starting while the `rtc-offer` is still on its way. A warm-up nobody joins stops by itself after the warm time.
+  `capture`: `"warm"` (a picture is at hand), `"starting"`, or `"unavailable"` with `reason` (no H.264 helper, an older
+  helper without lanes: it starts with the first viewer).
+- **A keyframe at once.** A joining viewer gets the cached config + keyframe immediately and a fresh one is asked from
+  the encoder; an MJPEG viewer joining a running stream gets its newest frame without waiting for the next.
+- **`connectMs`** = the request (the stream's upgrade, the `rtc-offer`) -> the first frame, in ms, and **`warm`** =
+  the capture already had a picture when the request came:
+  - H.264 WebSocket hello: `{..., "connectMs": 12, "warm": true}` (the keyframe follows the hello at once).
+  - MJPEG hello: `connectMs` too; the hello goes out with the first frame (when none comes within 1.5 s it goes
+    without, `connectMs: null`).
+  - `rtc-hello`: `connectMs` = the offer -> the capture has a picture to send, and `warm`.
+  - After the first frame is actually sent, every transport says `{"type":"first-frame", udid, transport:
+    "webrtc"|"h264-ws"|"mjpeg-ws", connectMs, warm}` (on the control socket for WebRTC: there it includes ICE and DTLS,
+    so it's the real time the view took to open).
+  - `stats.sessions[].connectMs` keeps it per open view.
+- The WebRTC library loads when the server starts, not under the first offer.
 
 ### Orientation and coordinates
 
@@ -116,6 +180,9 @@ Every action over HTTP (`tap`, `swipe`, `path`, `hold`, `type`, `key`, `home`, `
   (the action itself went).
 - `"fast": true` (or `?fast=1`) skips all of it: `{ok:true, via, ms}` (for a viewer that sees the picture anyway). The
   report costs ~0.4 s on top of the action.
+- A gesture answered when it was queued on the phone (`hid`, `wda-fast`) is still playing there: the look after comes
+  after it has played (`total_ms` includes it; `ms` stays receive -> injected), and if it broke off on the phone the
+  answer is 502 `{"ok":false,"error":"the gesture broke off on the phone (HID: ...); look at the screen before trying again"}`.
 
 Reported actions for one phone run one at a time, in the order they arrived (each owns its look before and after).
 
@@ -137,14 +204,32 @@ Reported actions for one phone run one at a time, in the order they arrived (eac
   is `x + w/2, y + h/2`); `hittable` = on screen, visible and enabled. Strings are cut at 200 characters.
 - `text`/`lines`: every visible string, top to bottom, left to right (at most 6000 characters). `total`: nodes in the
   tree; `truncated`: more than `max` (400) elements matched; `hash`: changes when the screen's content does.
-- `?all=1`: hidden elements and containers too; `?fresh=1`: not the answer from the last 300 ms.
+- `?all=1`: hidden elements and containers too; `?fresh=1`: not the answer from the last 300 ms; `?settle=1`: wait for
+  the picture to stop changing first (at most ~0.9 s), then read.
 - A big screen can take WDA a second or more; the same question asked meanwhile shares the one answer.
+- **Never a stale screen.** An answer read before the phone's last input is never given again, however recent (a tap,
+  then `/ui` 10 ms later, is a new read), and a read that an input overtook is read once more before it's answered.
 
 `POST /phones/:udid/tap-element` `{id | label | name | text, index?, timeoutMs?, verify?}`: `id` from `/ui`; `label` /
 `name` match the whole string first, then its start, then any part (case-insensitive); `text` looks in label, value and
 name. Hittable matches come first, then reading order; `index` picks another one (0-based). `timeoutMs` (max 15000)
 waits for the element to appear. It taps the element's middle and answers the report plus `element` (the one tapped)
 and `matches`. No match: 404 `{"ok":false,"error":"no element matches label \"Buy now\"; the screen says: Settings | Back | ..."}`.
+
+What keeps a tap on the right thing:
+
+- **Transitions.** When the phone had input in the last 1.5 s (the step before, a launch, someone's touch), the picture
+  is waited for to stop changing first (two looks 150 ms apart that are the same; at most ~0.9 s, so a video never
+  blocks), and an element that isn't there yet is waited for up to 1 s even without `timeoutMs`: a button is tapped
+  where it comes to rest, not where it was while its screen slid in. `"settle": false` skips the wait; `"timeoutMs": 0`
+  means "now or 404".
+- **Ids from a screen that changed.** An `id` is a place in the tree, so after the screen changed something else sits
+  there. Send what you read at that id beside it (`{"id":"0.2.1","label":"Buy now"}`; `name` or `text` work too): if
+  the element at that id no longer says so, the one that does is tapped instead (`"moved": true` in the answer), and
+  when nothing on screen does, nothing is tapped: 409 `{"ok":false,"error":"the screen changed since it was read:
+  0.2.1 is now Button \"Delete\", not label \"Buy now\"; read the screen again"}`. An `id` alone taps whatever is there.
+- **Off the screen.** An element whose middle is outside the screen isn't tapped at the screen's edge: 409
+  `"... is off the screen (its middle is at 0.35, 1.15): scroll it into view first"`.
 
 `POST /phones/:udid/act` runs steps in order and stops at the first that fails (or whose `verify` doesn't come), unless
 `continueOnError: true`:
@@ -242,6 +327,8 @@ an event for a touch the server no longer has (lifted by the timeout, replaced b
   `{"type":"touch-released", id, reason:"lost", error}`; the gesture is not replayed (that would play it twice). HID
   reconnects by itself (after 1, 2, 5, 15, 30 s, then every minute; at once when its session just closed).
 - **A locked or dark phone**: the `down` (or the tap) wakes it first, then goes.
+- **A finger stays down at least 30 ms.** A quick tap whose `down` waited in the phone's queue (the phone waking, a
+  gesture still playing) is not pressed and lifted in the same instant.
 
 One-command drags stay: `{type:"swipe", points: [[x, y, t], ...], duration}` is replayed on the server as one smooth
 gesture (the `remote` profile's way).
@@ -267,6 +354,22 @@ the ~1.2 s tap on the LAN. It was replaced, not tuned. Each action takes the fir
 3. **`wda`: the old routes**: `/wda/tap` (or `/wda/tap/0`, or a pointer tap), W3C actions for gestures, `/wda/keys` for
    text. Also `home` and `launch` always.
 
+What the two quick routes mean for order and for failures:
+
+- **A gesture still playing holds the next action.** `hid` and `wda-fast` answer when a swipe, path or hold is queued on
+  the phone, which then plays it for its length. Its sender has its ack at once, but the phone's next action starts
+  only when it's through, so a Home press or a tap by another route never lands in the middle of a swipe. (The HID
+  sidecar plays one thing at a time; an input sent behind a long hold used to time out after 5 s and kill the sidecar
+  in the middle of the gesture. It now gets that much longer.)
+- **Text is answered when it's typed.** `type` through HID answers after the last key (about 50-70 ms a key), not when
+  it's queued, so a tap or Enter sent next finds the whole text there.
+- **An input whose outcome isn't known is never repeated.** A HID input that the phone refused (nothing reached it)
+  goes through WDA instead, as before. One that got no answer in time, or text that broke off partway, does not: it
+  may have happened (or half of it has), and doing it again would tap twice or type the text twice. The action fails
+  with 504 `"the phone didn't confirm the tap in time (HID: ...); it may or may not have happened, so it was not
+  repeated: look at the screen before trying again"` (502 for text or a gesture that broke off partway), and the HID
+  session reconnects by itself.
+
 `GET /phones/:udid/input` and the server log (`[input xxxxxxxx] tap via hid: wait 0 ms + inject 3 ms = 3 ms`, one line
 per action, `INPUT_LOG=0` turns them off) give receive -> injected per action. `methods` says what each phone has:
 `hid` (`ready`, `starting`, `off`, `failed` with `hid_reason`, or `unsupported` with why) and `wda_fast` (`yes`, `no` =
@@ -282,7 +385,7 @@ does (CoreMediaIO's `kCMIOHardwarePropertyAllowScreenCaptureDevices`, then the i
 matched by UDID, then name), at up to 60 fps, encodes it with VideoToolbox H.264 in real time (low-latency rate control,
 Constrained Baseline, no B-frames, keyframe at least every 2 s, 8 Mbps by default, optional downscale in the capture
 pipeline), and writes framed Annex B NAL units to stdout. The server runs one helper per phone on demand, shared by all
-viewers, stops it 10 s after the last viewer leaves, restarts it on a crash with backoff (after 3 failed starts it gives up
+viewers, stops it `CAPTURE_WARM_SECONDS` (120) after the last viewer leaves (see [Opening a view fast](#opening-a-view-fast)), restarts it on a crash with backoff (after 3 failed starts it gives up
 for 60 s and viewers get MJPEG), and caches the latest SPS/PPS and keyframe so a new viewer sees a picture at once (then
 gets a fresh IDR). It does not need WDA, so the picture works even while WDA restarts.
 
@@ -292,8 +395,8 @@ Signaling over the authenticated control WebSocket:
 
 - client -> `{type:"rtc-offer", sdp, want:{fps, scale, quality?}}` (the client makes the offer: a recvonly video
   transceiver and two data channels, below)
-- server -> `{type:"rtc-answer", sdp}`, then `{type:"rtc-hello", codec:"h264", width, height, fps, scale, server_time, orientation, point_width, point_height, screen_width, screen_height}` once
-  frames flow, or `{type:"rtc-error", reason}` (H.264 unavailable, bad offer, WebRTC library missing) -> fall back
+- server -> `{type:"rtc-answer", sdp}`, then `{type:"rtc-hello", codec:"h264", width, height, fps, scale, server_time, orientation, point_width, point_height, screen_width, screen_height, connectMs, warm}` once
+  frames flow (then `{type:"first-frame", transport:"webrtc", connectMs}` when the first one left on the track), or `{type:"rtc-error", reason}` (H.264 unavailable, bad offer, WebRTC library missing) -> fall back
 - trickle ICE both ways: `{type:"rtc-ice", candidate, mid}` (the server's candidates come without the `a=` prefix);
   `{type:"rtc-close"}` ends the session (closing the control socket does too). A new offer replaces the old session.
 
@@ -327,7 +430,7 @@ prebuilt binary). If it can't load, the server still runs and answers offers wit
 1-100 maps to 2-12 Mbps; default 8 Mbps). A viewer that isn't on the LAN gets a far lane (see below); `full=1` opts out.
 
 1. Text: `{type:"hello", codec:"h264", udid, width, height, fps, scale, server_time, orientation, point_width, point_height,
-   screen_width, screen_height}`. If H.264 isn't available the hello is
+   screen_width, screen_height, connectMs, warm}`. If H.264 isn't available the hello is
    `{type:"hello", codec:"mjpeg", reason, udid, contentType, fps, scale, quality}` and MJPEG frames follow instead.
 2. Binary, one per message: 1 byte kind (`1` config = SPS+PPS, `2` keyframe, `3` delta), 8 bytes capture time (float64
    big-endian, ms since the epoch on the server's clock), then the Annex B payload (start codes included).
@@ -426,6 +529,12 @@ don't wait for animations, and the MJPEG settings applied). On a WDA failure (co
 makes a new session, restarts the phone's WDA runner if `/status` doesn't answer, and retries the action once. Every ~10 s
 each idle phone gets a `/status` check that recovers the same way before anyone notices. `GET /phones` shows it in `control`.
 
+**A session that expired** is remade and the call asked once more, however WDA says it: the standard 404 `invalid session
+id`; any other refusal (a 4xx, a bare 404) on a session call, which is checked against `/status` (its `sessionId` is the
+session WDA has now: when that isn't ours, ours is gone); and the quiet calls that used to fail silently until the next
+health check (the orientation poll, the MJPEG settings), which now have the session remade right then. A refusal on a
+session that is still ours is the phone's answer: it's passed on, not retried.
+
 ## Idle lock, WDA re-sign, profiles and thumbnails (2026-11-15)
 
 - **Idle lock** (`src/idle.ts`): after `idleLockMinutes` (GET/PUT `/api/settings`, default 10, 0 = off) with no input and
@@ -512,7 +621,7 @@ After `git pull`/code changes run `npm run build` and `launchctl kickstart -k gu
 
 `npm run check` type-checks. `npm test` runs `test/h264.ts` (helper framing, config-before-key, latest-only drop to keyframe,
 helper restarts, offer/RTCP parsing), `test/input.ts` (live touch straight to the phone and its fallbacks, the HID sidecar's
-protocol, the WDA patch, latency metering, acks' `via`/`ms`), `test/orient.ts` (upright -> device mapping in all four orientations, units, the capture check, orientation in the list, hellos and on change), `test/touch.ts` (order, coalescing, acks, auto-release, wake first, fallbacks with a reason), `test/ui.ts` (UI tree flattening, the element finder, apps by name, `/ui`, `/tap-element`, `/type`, `/key`, `/launch`, `/act`, reports and verify), `test/rtc.ts` (WebRTC in mock mode with a node-datachannel client: signaling, ICE,
+protocol, the WDA patch, latency metering, acks' `via`/`ms`), `test/orient.ts` (upright -> device mapping in all four orientations, units, the capture check, orientation in the list, hellos and on change), `test/touch.ts` (order, coalescing, acks, auto-release, wake first, fallbacks with a reason), `test/ui.ts` (UI tree flattening, the element finder, apps by name, `/ui`, `/tap-element`, `/type`, `/key`, `/launch`, `/act`, reports and verify), `test/info.ts` (the detail card: the battery / IORegistry / WDA parsers, the ~15 s cache, `GET /info`, `info` in the list, WDA's quiet read), `test/connect.ts` (a capture warmed ahead and kept warm, a keyframe at once on join, `connectMs` and `first-frame`, `POST /warm`), `test/reliability.ts` (an expired WDA session remade on a 4xx, never a stale UI tree, the settle wait and ids from a changed screen, a playing gesture holding the next action, HID inputs that time out or break off, HID reconnect), `test/rtc.ts` (WebRTC in mock mode with a node-datachannel client: signaling, ICE,
 RTP, PLI -> IDR, data channels and acks, stats, rtc-error) and `test/smoke.ts` (a mock server: auth, every endpoint, MJPEG,
 H.264 WebSocket, the MJPEG fallback, ping/pong). Mock mode's H.264 is a real, decodable stream (a tiny built-in encoder:
 Constrained Baseline 208x448, I_PCM keyframes and skip-coded deltas), so clients can test decoding against it.
@@ -522,7 +631,8 @@ Against a live server: `URL=http://<mac>:8787 API_TOKEN=<token> npm test` (needs
 
 `API_TOKEN`, `HOST`, `PORT`, `MOCK`, `MOCK_PHONES`, `WDA_PROJECT`, `WDA_DERIVED_DATA` (default `~/wda-build`),
 `WDA_BASE_PORT` (8100), `MJPEG_BASE_PORT` (9100), `POLL_MS` (5000), `AUTOSTART_WDA` (true), `AUTO_UPDATE_SECONDS` (10, 0 = off),
-`H264` (true), `H264_BITRATE_MBPS` (8), `PHONECAP_PATH` (default `native/phonecap/build/phonecap`).
+`H264` (true), `H264_BITRATE_MBPS` (8), `PHONECAP_PATH` (default `native/phonecap/build/phonecap`),
+`CAPTURE_WARM_SECONDS` (120: how long a phone's capture keeps running after its last viewer, 10-3600; `10` is the old behaviour).
 Input: `HID_INPUT` (`auto` = iOS 27+ phones, `on` = try every phone, `off`), `HID_PYTHON` (the Python with pymobiledevice3;
 default `~/.phonefarm-hid/bin/python` if it exists, else `python3`), `HID_IDLE_SECONDS` (120), `HID_TUNNEL` (`auto`,
 `userspace`, `native`, `tunneld`), `WDA_FAST` (`0` = never try the fast route), `INPUT_LOG` (`0` = no per-action lines), `HID_LANDSCAPE` (`on` default, `swap`, `off`), `WDA_FAST_LANDSCAPE` (`1` = the fast route in landscape too), `CAPTURE_ROTATE` (`off` default; `cw`/`ccw` turn a sideways picture upright; `90`/`180`/`270` always turn it);
@@ -541,3 +651,4 @@ playout-delay 0/0 again.
 - `type` sends keystrokes via WDA; a keyboard must be focused on the phone.
 - Rotation, landscape touch and the UI tree were written against WDA's documented behaviour and a mock phone, without a Mac: [docs/MAC_STEPS_2026-11-15b.md](docs/MAC_STEPS_2026-11-15b.md) is the on-Mac check, with the knobs to flip if a landscape tap lands mirrored or a picture stays sideways.
 - `/apps` needs `ideviceinstaller` (`brew install ideviceinstaller`); without it only well-known apps are listed, unconfirmed.
+- `/info`'s temperature needs `idevicediagnostics` (part of libimobiledevice); `uptimeSec` / `bootedAt` are `null` on stock WDA (an iPhone doesn't say its boot time to lockdown or WDA). The detail card, the warm capture and the reliability fixes of 2026-11-16 were written against the mock and fake WDA / HID sidecars: [docs/MAC_STEPS_2026-11-15b.md](docs/MAC_STEPS_2026-11-15b.md) steps 9-12 are their on-Mac check.

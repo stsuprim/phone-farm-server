@@ -337,6 +337,10 @@ export class H264Source {
   get running(): boolean {
     return !!this.producer;
   }
+  /** A picture is at hand: a viewer joining now gets a keyframe at once (the capture is warm). */
+  get ready(): boolean {
+    return !!this.info && !!this.key;
+  }
   get viewers(): number {
     return this.sinks.size;
   }
@@ -354,7 +358,11 @@ export class H264Source {
   /** Make sure the helper runs; resolves once a keyframe (and the size) is known. */
   open(): Promise<H264Info> {
     this.cancelIdle();
-    if (this.info && this.key) return Promise.resolve(this.info);
+    if (this.info && this.key) {
+      // warm: the caller's viewer (add) cancels this; a caller that never adds one doesn't leave it running for good
+      this.maybeIdle();
+      return Promise.resolve(this.info);
+    }
     const p = new Promise<H264Info>((resolve, reject) => {
       const w = {
         resolve,
@@ -371,9 +379,18 @@ export class H264Source {
     return p;
   }
 
+  /**
+   * Start the capture ahead of a viewer: it then runs for the idle (warm) time and stops unless one came. Never
+   * rejects (a capture that can't start says so to the viewer that asks for it).
+   */
+  warm(): void {
+    this.open().catch(() => {}); // already warm: a whole warm time more from now
+  }
+
   add(v: H264Viewer): void {
     this.sinks.add(v);
     this.cancelIdle();
+    if (!this.producer && !this.restartTimer) this.start(); // it stopped between its open and this (it never should)
     const stale = this.deltasSinceKey > 0;
     v.prime(this.config, this.key, stale);
     if (stale || !this.key) this.requestKey(true);
@@ -534,13 +551,16 @@ export class H264Source {
         this.gotKey = true;
         this.failures = 0;
         this.meter.tick();
-        if (this.info) {
+        if (this.info && this.waiters.length) {
           const ws = this.waiters;
           this.waiters = [];
           for (const w of ws) {
             clearTimeout(w.timer);
             w.resolve(this.info);
           }
+          // whoever waited adds its viewer now (which cancels this); a capture nobody joins (a warm-up, a viewer
+          // that left while it started) stops after the idle time instead of running on unwatched
+          this.maybeIdle();
         }
         this.fanOut(r);
         return;

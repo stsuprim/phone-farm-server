@@ -5,7 +5,7 @@ import { IdleLock } from './idle.js';
 import { MockBackend } from './mock.js';
 import { RealBackend } from './real.js';
 import { buildWdaRunner, WdaResigner } from './resign.js';
-import { rtcCleanup } from './rtc.js';
+import { loadRtc, rtcCleanup } from './rtc.js';
 import { createServer } from './server.js';
 import { SettingsStore } from './settings.js';
 import { createUpdater } from './updater.js';
@@ -43,6 +43,8 @@ const server = createServer(backend, cfg.token, updater, { settings, idle, resig
 server.listen(cfg.port, cfg.host, () => {
   console.log(`phone-farm-server listening on http://${cfg.host}:${cfg.port} (${cfg.mock ? 'MOCK' : 'real'} mode)`);
 });
+// the WebRTC library (a native module) loads now rather than under the first viewer's offer
+void loadRtc();
 
 const shutdown = () => {
   server.close();

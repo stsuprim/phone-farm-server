@@ -200,6 +200,10 @@ export class RtcSession {
   private tier: QualityTier = 'full';
   private uninfo?: () => void;
   readonly since = Date.now();
+  /** When the offer came (performance.now()), and the offer -> first frame sent on the track (ms; null until then). */
+  private tOffer = 0;
+  private connectMs: number | null = null;
+  private warm = false;
 
   constructor(
     private backend: Backend,
@@ -241,6 +245,7 @@ export class RtcSession {
   }
 
   async start(sdp: string, wantRaw: unknown): Promise<void> {
+    this.tOffer = performance.now();
     const ndc = await loadRtc();
     if (this.closed) return;
     if (!ndc) throw new Error(`WebRTC is unavailable on this server (${libError})`);
@@ -253,6 +258,10 @@ export class RtcSession {
     const src = this.backend.h264(this.udid, want);
     if (typeof src === 'string') throw new Error(src);
     this.src = src;
+    // the capture starts now (when it isn't up already), while the peer connection is put together and ICE runs
+    this.warm = src.ready;
+    const opening = src.open();
+    opening.catch(() => {}); // heard below; this only keeps a failure from going unheard if the setup throws first
 
     const pc = new ndc.PeerConnection(`phone-${this.udid.slice(-8)}`, { iceServers: [] }); // host candidates only
     this.pc = pc;
@@ -317,13 +326,15 @@ export class RtcSession {
     for (const [c, mid] of this.pendingIce) this.addIce(c, mid);
     this.pendingIce = [];
 
-    src.open().then(
+    opening.then(
       (info) => {
         if (this.closed) return;
         this.ready = true;
         this.signal({
           type: 'rtc-hello', codec: 'h264', ...(this.hooks.view?.() ?? {}), width: info.width, height: info.height, fps: info.fps, scale: info.scale,
           lane: src.kind, server_time: Date.now(),
+          // the offer -> the capture has a picture to send (the first frame leaves once ICE connects: "first-frame")
+          connectMs: Math.round(performance.now() - this.tOffer), warm: this.warm,
         });
         // the picture changed size (the phone turned): a new config and keyframe follow, and the client hears the size
         this.uninfo = src.onInfo((i) => {
@@ -336,9 +347,9 @@ export class RtcSession {
   }
 
   /** This session for `stats.sessions` (null until its video runs). */
-  info(): { profile: Profile; quality: QualityTier; net: string | null; fps: number; latencyMs: number | null; lane: 'lan' | 'remote' | 'thumb' | null; since: number } | null {
+  info(): { profile: Profile; quality: QualityTier; net: string | null; fps: number; latencyMs: number | null; lane: 'lan' | 'remote' | 'thumb' | null; since: number; connectMs: number | null } | null {
     if (!this.viewer || this.closed) return null;
-    return { profile: this.remote ? 'remote' : 'lan', quality: this.tier, net: this.path, ...this.viewer.sessionStats(), since: this.since };
+    return { profile: this.remote ? 'remote' : 'lan', quality: this.tier, net: this.path, ...this.viewer.sessionStats(), since: this.since, connectMs: this.connectMs };
   }
 
   addIce(candidate: unknown, mid: unknown): void {
@@ -445,6 +456,11 @@ export class RtcSession {
     } catch (err) {
       this.close(`send failed: ${errText(err)}`);
       return;
+    }
+    if (this.connectMs === null && r.kind === KIND.KEY) {
+      // the first picture left on the track: the offer -> this is how long the view took to open
+      this.connectMs = Math.round(performance.now() - this.tOffer);
+      this.signal({ type: 'first-frame', udid: this.udid, transport: 'webrtc', connectMs: this.connectMs, warm: this.warm });
     }
     // about once a second: which RTP timestamp is which capture time (ms since the epoch, server clock),
     // so the client can measure glass-to-glass latency with the ping/pong clock offset

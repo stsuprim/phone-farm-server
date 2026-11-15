@@ -93,9 +93,15 @@ export class MjpegSource {
     });
   }
 
-  add(cb: (f: Buffer) => void): () => void {
+  /** `replay`: a viewer joining a running stream gets its newest frame at once instead of waiting for the next. */
+  add(cb: (f: Buffer) => void, replay = false): () => void {
     this.subs.add(cb);
     if (this.subs.size === 1) this.connect();
+    else if (replay && this.last && Date.now() - this.lastAt < 1000) {
+      // on the next turn of the loop: after the caller has said its hello
+      const f = this.last;
+      setImmediate(() => this.subs.has(cb) && cb(f));
+    }
     return () => {
       this.subs.delete(cb);
       if (!this.subs.size) this.stop();

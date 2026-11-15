@@ -19,6 +19,8 @@ export interface HidReply {
   error?: string;
   /** Receive -> report written, measured inside the sidecar. */
   ms?: number;
+  /** This is a queued path's or text's end on the phone (the sidecar's {"ev": "done"}), not its "queued" answer. */
+  done?: boolean;
 }
 
 export type HidSpawn = (cmd: string, args: string[]) => ChildProcess;
@@ -39,6 +41,8 @@ export interface HidOptions {
   log?: (m: string) => void;
   /** A queued path/type finished on the phone (its own receive -> done time). */
   onDone?: (op: string, reply: HidReply) => void;
+  /** How long one input may take to be answered (default 5 s; tests shorten it). */
+  inputTimeoutMs?: number;
 }
 
 const OPEN_TIMEOUT_MS = 30000;
@@ -70,6 +74,30 @@ interface Pending {
   resolve: (r: HidReply) => void;
   reject: (e: Error) => void;
   timer: NodeJS.Timeout;
+  /** Its answer is the sidecar's {"ev": "done"} (the path or text finished on the phone), not the "queued" one. */
+  done: boolean;
+}
+
+/** No answer came in time: the input may or may not have reached the phone. */
+export class HidTimeout extends Error {}
+/** A queued path or text broke off while the phone was playing it: part of it happened. */
+export class HidPartial extends Error {}
+
+/** The sidecar's typing pace: three reports and 50 ms a key, 20 ms more with Shift (native/hid/hid_input.py). */
+const TYPE_MS_PER_KEY = 70;
+
+/**
+ * How long the phone plays an input after the sidecar answered "queued" (ms): a path its last point's time, text its
+ * keys, a tap its short hold; the sidecar does one thing at a time, so whatever is sent next waits that long.
+ */
+export function hidPlayMs(op: string, fields: Record<string, unknown>): number {
+  if (op === 'path' && Array.isArray(fields.points)) {
+    const last = fields.points[fields.points.length - 1] as unknown;
+    const t = Array.isArray(last) ? Number(last[2]) : 0;
+    return Number.isFinite(t) && t > 0 ? Math.min(t, 120_000) : 0;
+  }
+  if (op === 'type' && typeof fields.text === 'string') return fields.text.length * TYPE_MS_PER_KEY;
+  return op === 'tap' ? 40 : 0;
 }
 
 export class HidHost {
@@ -92,6 +120,10 @@ export class HidHost {
   private holders = 0;
   private idleTimer?: NodeJS.Timeout;
   private closed = false;
+  /** Until when the sidecar is playing what it was already given (Date.now()): what's sent next waits behind it. */
+  private busyUntil = 0;
+  /** Paths and texts answered "queued" whose end the sidecar hasn't said yet. */
+  private playing = 0;
 
   constructor(private udid: string, private o: HidOptions) {}
 
@@ -161,12 +193,34 @@ export class HidHost {
     return this.openP;
   }
 
-  /** One input on the open session; throws if HID isn't ready or the phone refused it. */
-  async input(op: 'down' | 'move' | 'up' | 'tap' | 'path' | 'type', fields: Record<string, unknown>): Promise<HidReply> {
+  /**
+   * One input on the open session; throws if HID isn't ready or the phone refused it (HidTimeout when no answer came:
+   * it may or may not have happened). A path or text is answered once it's queued; with `done` the answer is its end
+   * on the phone instead (the text typed, the gesture lifted). The sidecar plays one thing at a time, so an input sent
+   * while a path or text still plays gets that much longer to answer (it used to time out behind a long hold, which
+   * killed the sidecar mid-gesture).
+   */
+  async input(op: 'down' | 'move' | 'up' | 'tap' | 'path' | 'type', fields: Record<string, unknown>, opts: { done?: boolean } = {}): Promise<HidReply> {
     if (!this.ready()) throw new Error(`HID is ${this.state}${this.reason ? `: ${this.reason}` : ''}`);
     this.touchIdle();
-    const r = await this.send(op, fields, INPUT_TIMEOUT_MS);
-    if (!r.ok) throw new Error(r.error || `HID ${op} failed`);
+    const now = Date.now();
+    const start = Math.max(now, this.busyUntil);
+    const play = hidPlayMs(op, fields);
+    if (play) this.busyUntil = start + play;
+    const queued = op === 'path' || op === 'type';
+    let r: HidReply;
+    try {
+      r = await this.send(op, fields, (this.o.inputTimeoutMs ?? INPUT_TIMEOUT_MS) + (start - now) + (opts.done ? play : 0), !!opts.done);
+    } catch (err) {
+      this.busyUntil = Math.max(Date.now(), this.busyUntil - play);
+      throw err;
+    }
+    if (!r.ok) {
+      this.busyUntil = Math.max(Date.now(), this.busyUntil - play); // it isn't playing (any more)
+      throw new (r.done ? HidPartial : Error)(r.error || `HID ${op} failed`);
+    }
+    // queued and playing: its {"ev": "done"} says when the sidecar is free again (sooner or later than reckoned)
+    if (queued && !r.done) this.playing++;
     return r;
   }
 
@@ -229,6 +283,8 @@ export class HidHost {
   private onExit(p: ChildProcess, why: string): void {
     if (this.proc !== p) return;
     this.proc = undefined;
+    this.busyUntil = 0;
+    this.playing = 0;
     for (const [id, w] of this.pending) {
       clearTimeout(w.timer);
       w.reject(new Error(why));
@@ -274,21 +330,30 @@ export class HidHost {
       }
       return;
     }
+    const id = typeof m.id === 'number' ? m.id : NaN;
     if (m.ev === 'done') {
+      reply.done = true;
+      if (this.playing > 0 && !this.pending.get(id)?.done && --this.playing === 0) this.busyUntil = 0; // nothing left playing
       this.o.onDone?.(String(m.op ?? ''), reply);
       if (!reply.ok) this.log(`queued input failed on the phone: ${reply.error ?? 'unknown'}`);
+      const waiting = this.pending.get(id);
+      if (waiting?.done) {
+        clearTimeout(waiting.timer);
+        this.pending.delete(id);
+        waiting.resolve(reply);
+      }
       return;
     }
     if (m.ev) return; // hello, open
-    const id = typeof m.id === 'number' ? m.id : NaN;
     const w = this.pending.get(id);
     if (!w) return;
+    if (w.done && reply.ok) return; // queued: its "done" is the answer
     clearTimeout(w.timer);
     this.pending.delete(id);
     w.resolve(reply);
   }
 
-  private send(op: string, fields: Record<string, unknown>, timeoutMs: number): Promise<HidReply> {
+  private send(op: string, fields: Record<string, unknown>, timeoutMs: number, done = false): Promise<HidReply> {
     if (this.closed) return Promise.reject(new Error('closed'));
     let p: ChildProcess;
     try {
@@ -300,14 +365,14 @@ export class HidHost {
     return new Promise<HidReply>((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pending.delete(id);
-        reject(new Error(`no answer from the HID helper within ${Math.round(timeoutMs / 1000)} s (${op})`));
+        reject(new HidTimeout(`no answer from the HID helper within ${Math.round(timeoutMs / 1000)} s (${op})`));
         // a stuck helper: start over (the next input reopens)
         if (op !== 'close' && this.proc === p) {
           this.fail(`HID ${op} timed out`);
           p.kill('SIGKILL');
         }
       }, timeoutMs);
-      this.pending.set(id, { op, resolve, reject, timer });
+      this.pending.set(id, { op, resolve, reject, timer, done });
       p.stdin?.write(`${JSON.stringify({ ...fields, id, op })}\n`);
     });
   }
