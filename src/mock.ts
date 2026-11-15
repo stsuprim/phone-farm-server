@@ -200,6 +200,20 @@ export class MockBackend implements Backend {
     return { hid: 'unsupported', hid_reason: 'mock phones', wda_fast: 'no' };
   }
 
+  private lockedSet = new Set<string>();
+  async lock(udid: string): Promise<void> {
+    this.live(udid);
+    this.lockedSet.add(udid);
+  }
+  async unlock(udid: string): Promise<void> {
+    this.live(udid);
+    this.lockedSet.delete(udid);
+  }
+  async isLocked(udid: string): Promise<boolean | null> {
+    return this.phones.get(udid)?.info.online ? this.lockedSet.has(udid) : null;
+  }
+  restartWda(_udid: string): void {}
+
   async recover(udid: string): Promise<ControlState> {
     this.live(udid);
     return 'ready';

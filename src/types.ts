@@ -27,6 +27,37 @@ export interface PhoneInfo {
   lan?: string[];
   /** The Mac's Tailscale base URLs (100.64.0.0/10), apart from `lan`: a tailnet address is not a local one. */
   tailnet?: string[];
+  /** Idle lock (src/idle.ts): the phone is locked (null = not known yet). */
+  locked?: boolean | null;
+  /** The screen is on (an estimate: off after a lock, on after a wake or while unlocked; null = not known). */
+  screenOn?: boolean | null;
+  /** Last input or viewer on this phone, ms since the epoch (null = none since the server started). */
+  lastActive?: number | null;
+}
+
+/** Which way a viewer is connected: lan = full quality + live HID touch; remote = adaptive lane, swipes as one command. */
+export type Profile = 'lan' | 'remote';
+/** thumb = a small, ~6 fps lane (grids); full = the profile's normal lane. */
+export type QualityTier = 'thumb' | 'full';
+
+/** One open live view in the stats (`stats.sessions`). */
+export interface SessionStats {
+  id: string;
+  /** The video path: "h264" (phonecap capture + VideoToolbox) or "mjpeg" (the old WDA screenshots). */
+  path: 'h264' | 'mjpeg';
+  transport: 'webrtc' | 'h264-ws' | 'mjpeg-ws';
+  /** The network path: lan, tailscale, loopback or direct (WebRTC: the chosen pair; WebSocket: the client address). */
+  net: string | null;
+  profile: Profile;
+  quality: QualityTier;
+  lane: 'lan' | 'remote' | 'thumb' | null;
+  /** Frames sent to this viewer in the last second. */
+  fps: number;
+  /** Capture -> sent at the server plus half the round trip when known (ms; an estimate of glass-to-network-out). */
+  latencyMs: number | null;
+  /** Why it's on MJPEG (when the H.264 path wasn't available). */
+  reason?: string | null;
+  since: number;
 }
 
 /** Per-phone live view stats in GET /phones. Timings are averages in ms; null when unknown. */
@@ -54,6 +85,10 @@ export interface StreamStats {
   helper_build_error?: string | null;
   /** Touch/tap latency on the server (receive -> injected) and the input methods the phone has now. */
   input?: InputStats & { methods?: InputMethods };
+  /** The video path new viewers get now: "h264" (phonecap) when it's available, else "mjpeg" (see h264_reason). */
+  video_path?: 'h264' | 'mjpeg';
+  /** Each open live view (server.ts fills it in). */
+  sessions?: SessionStats[];
 }
 
 /**
@@ -67,7 +102,7 @@ export interface InputMethods {
 }
 
 export interface LaneStats {
-  kind: 'lan' | 'remote' | null;
+  kind: 'lan' | 'remote' | 'thumb' | null;
   fps: number;
   fps_target: number | null;
   scale: number;
@@ -90,6 +125,8 @@ export interface H264Want {
   remote?: boolean;
   /** `full=1`: a far viewer that wants exactly what it asked (no far caps). */
   full?: boolean;
+  /** `quality=thumb`: a small, ~6 fps lane (src/lanes.ts); `full` (or none): the profile's normal lane. */
+  tier?: QualityTier;
 }
 
 /** Screen size in points plus the scale, as WDA reports it. */
@@ -142,6 +179,14 @@ export interface Backend {
   warmInput?(udid: string): () => void;
   /** The phone's input methods now. */
   inputMethods?(udid: string): InputMethods;
+  /** Lock the phone (screen off): WDA /wda/lock. */
+  lock?(udid: string): Promise<void>;
+  /** Wake and unlock the phone (past the lock screen when it has no passcode): WDA /wda/unlock. */
+  unlock?(udid: string): Promise<void>;
+  /** Whether the phone is locked now (WDA /wda/locked); null when it can't tell. */
+  isLocked?(udid: string): Promise<boolean | null>;
+  /** Restart the phone's WDA runner (reinstalls a freshly signed build). */
+  restartWda?(udid: string): void;
   /** Drop the WDA session, restart the runner if WDA doesn't answer, make a new warm session. */
   recover(udid: string): Promise<ControlState>;
   /** Subscribe to image frames. Returns unsubscribe and the settings actually used. Throws HttpError if unknown/not ready. */

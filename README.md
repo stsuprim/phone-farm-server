@@ -39,6 +39,14 @@ recovering) or `WDA refused the request on <name>: ...` (WDA answered but said n
 | POST | `/phones/:udid/home` | `{}` | `{ok:true}` |
 | POST | `/phones/:udid/launch` | `{bundleId}` | `{ok:true}` |
 | POST | `/phones/:udid/recover` | `{}` | drops the WDA session, restarts the runner if `/status` fails, makes a new warm session (in the phone's queue, after any waiting actions): `{ok:true, control}`, or 502 `{error}` naming WDA |
+| POST | `/phones/:udid/swipe` | `{points: [[x, y, t], ...], duration}` (a whole drag in one command; `t` ms, `duration` ms optional) | `{ok:true, via, ms}`: replayed on the server as ONE smooth gesture (resampled every 8 ms; `duration` stretches the client's timing). The `remote` profile sends drags this way, never per point |
+| POST | `/phones/:udid/wake` (also `/api/devices/:udid/wake`) | `{}` | wakes and unlocks (WDA `/wda/unlock`: past the lock screen when there's no passcode): `{ok, udid, locked, screenOn, lastActive, warning?}`; 404 `{"error":"unknown phone"}` |
+| POST | `/phones/:udid/lock` (also `/api/devices/:udid/lock`) | `{}` | locks, screen off (WDA `/wda/lock`): same answer |
+| GET | `/api/devices` | - | the same list as `/phones` (every `/phones/:udid/...` route also answers under `/api/devices/:udid/...`) |
+| GET / PUT | `/api/settings` (also `/settings`) | PUT `{idleLockMinutes}` (0 = off, default 10) | the settings; kept in `data/settings.json` |
+| GET | `/api/wda` (also `/wda`) | - | `{signedAt, expiresAt, daysLeft, state: "ok"\|"soon"\|"expired"\|"resigning"\|"failed", lastError?, nextAttemptAt, perDevice: {udid: {signedAt, lastError?}}}` (mock: `{state:"unavailable"}`) |
+| POST | `/api/wda/resign` (also `/wda/resign`) | - | 202 + the status (`state:"resigning"`): re-signs WDA for every phone now |
+| GET | `/api/status` (also `/status`) | - | `{mock, settings, wda, devices}` (`devices` as `/api/devices`) |
 | GET | `/update/status` | - | `{current, remote, upToDate, lastCheck, lastError}` (runs `git fetch`, compares local HEAD with `origin/main`) |
 | POST | `/update/now` | - | force-updates to GitHub main now: `{started:true}` (built; process exits and launchd restarts it) or `{started:false, reason}` (up to date, GitHub unreachable, build failed and rolled back...). 503 in mock mode |
 
@@ -247,6 +255,33 @@ don't wait for animations, and the MJPEG settings applied). On a WDA failure (co
 makes a new session, restarts the phone's WDA runner if `/status` doesn't answer, and retries the action once. Every ~10 s
 each idle phone gets a `/status` check that recovers the same way before anyone notices. `GET /phones` shows it in `control`.
 
+## Idle lock, WDA re-sign, profiles and thumbnails (2026-11-15)
+
+- **Idle lock** (`src/idle.ts`): after `idleLockMinutes` (GET/PUT `/api/settings`, default 10, 0 = off) with no input and
+  no open viewer, the server locks the phone (WDA `/wda/lock`, screen off). A new viewer (stream or control socket) or
+  any input wakes it by itself (WDA `/wda/unlock`) before the input runs; input on an awake phone waits for nothing.
+  Every phone in `/phones` and `/api/devices` has `locked`, `screenOn` (an estimate: off after a lock) and `lastActive`
+  (ms since the epoch). A phone with a passcode stays locked after a wake (`warning` says so): remove the passcode.
+- **WDA re-sign** (`src/resign.ts`): a free Apple ID's profile lasts 7 days. Six days after the last good sign the server
+  re-runs `scripts/build-wda.sh $WDA_TEAM_ID <udid>` for each phone at a quiet hour (03:00-06:00 local,
+  `WDA_RESIGN_HOUR`), then restarts the phone's runner so the new build is installed. Never during a live view unless
+  under 12 h are left; a failure retries at most every 2 h. The time is kept in `data/wda-sign.json`, and the real expiry
+  is read from the built runner's `embedded.mobileprovision` (so a manual build counts). An Xcode that isn't signed in to
+  the Apple ID shows as `lastError: "Xcode is not signed in to the Apple ID ..."`. `WDA_RESIGN=false` turns it off.
+- **Profiles**: `?profile=lan|remote` on `/stream` and `/control` (default from the client's address: LAN/loopback =
+  lan, Tailscale 100.64/10 / fd7a:115c:a1e0::/48 / public = remote); an `rtc-offer`'s `want.profile` too. `lan`: the full
+  lane (source size, 60 fps, `H264_BITRATE_MBPS`), taps and live drags straight through CoreDevice HID when the phone has
+  it. `remote`: the adaptive far lane (congestion control, src/lanes.ts), and drags go as one
+  `{type:"swipe", points:[[x,y,t],...], duration}` (control socket, data channel or HTTP), replayed on the server as one
+  smooth gesture; taps stay single commands.
+- **Thumbnails**: `?quality=thumb` (or `want.quality:"thumb"` in an `rtc-offer`) gets a small lane: ~360 px long side,
+  6 fps (4-8 with `fps=`), ~250 kbit/s, shared by every thumbnail viewer of that phone; `quality=full` (or none) gets the
+  profile's normal lane. A numeric `quality` keeps its old meaning. MJPEG fallback for a thumb: 6 fps, 20 %, quality 35.
+- **Which video path**: each phone's `stats.video_path` (`h264` when phonecap works, else `mjpeg` with `h264_reason`),
+  every hello carries `path`, `profile` and `quality_tier`, and `stats.sessions` lists each open view:
+  `{id, path, transport: "webrtc"|"h264-ws"|"mjpeg-ws", net, profile, quality, lane, fps, latencyMs, reason?, since}`
+  (`latencyMs` = capture -> sent on the server plus half the round trip when known).
+
 ## Mac setup (real mode)
 
 1. **Xcode**: install from the App Store, open it once, accept the license, then
@@ -320,12 +355,13 @@ Against a live server: `URL=http://<mac>:8787 API_TOKEN=<token> npm test` (needs
 Input: `HID_INPUT` (`auto` = iOS 27+ phones, `on` = try every phone, `off`), `HID_PYTHON` (the Python with pymobiledevice3;
 default `~/.phonefarm-hid/bin/python` if it exists, else `python3`), `HID_IDLE_SECONDS` (120), `HID_TUNNEL` (`auto`,
 `userspace`, `native`, `tunneld`), `WDA_FAST` (`0` = never try the fast route), `INPUT_LOG` (`0` = no per-action lines);
-`WDA_PATCH=0` makes `scripts/build-wda.sh` build WDA unpatched. Video: `RTC_PLAYOUT_ZERO=1` gives far viewers
+`WDA_PATCH=0` makes `scripts/build-wda.sh` build WDA unpatched. WDA re-sign: `WDA_TEAM_ID` (the Apple Team ID),
+`WDA_RESIGN` (true), `WDA_RESIGN_HOUR` (3: the quiet window is 03:00-06:00 local). Video: `RTC_PLAYOUT_ZERO=1` gives far viewers
 playout-delay 0/0 again.
 
 ## Notes / known limits
 
-- Free Apple ID limits: on each phone, trust the developer under Settings > General > VPN & Device Management > Verify App. Free signing expires after 7 days (rebuild WDA), allows only about 3 devices, so a real farm needs the paid $99/year developer account.
+- Free Apple ID limits: on each phone, trust the developer under Settings > General > VPN & Device Management > Verify App. Free signing expires after 7 days (the server re-signs WDA every 6 days by itself, see above), allows only about 3 devices, so a real farm needs the paid $99/year developer account.
 
 - Latency: expected numbers per stage, before and after, are in [docs/latency.md](docs/latency.md) (estimates).
 - Real mode could not be tested on Windows (nor the Swift helper, which was written without a Mac to compile it); the WDA and libimobiledevice calls follow their documented CLIs/endpoints.

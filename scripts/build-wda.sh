@@ -13,6 +13,17 @@ BUNDLE="${WDA_BUNDLE_ID:-com.${TEAM_LC}.WebDriverAgentRunner}"
 # no active-app lookup. WDA_PATCH=0 builds WDA as it is.
 if [ "${WDA_PATCH:-1}" != "0" ]; then node scripts/patch-wda.mjs "$PROJ"; fi
 mkdir -p "$OUT"
+# WDA_FRESH_PROFILE=1 (the server's 6-day re-sign): drop the cached provisioning profiles for this bundle first, so
+# Xcode fetches a new 7-day one instead of reusing the one that is about to expire.
+if [ "${WDA_FRESH_PROFILE:-0}" = "1" ]; then
+  for DIR in "$HOME/Library/MobileDevice/Provisioning Profiles" "$HOME/Library/Developer/Xcode/UserData/Provisioning Profiles"; do
+    [ -d "$DIR" ] || continue
+    for P in "$DIR"/*.mobileprovision; do
+      [ -f "$P" ] || continue
+      if grep -aq "$BUNDLE" "$P" 2>/dev/null; then echo "removing old profile $(basename "$P")"; rm -f "$P"; fi
+    done
+  done
+fi
 for UDID in "$@"; do
   echo "== $UDID"
   LOG="$OUT/build-wda-$UDID.log"

@@ -184,7 +184,23 @@ export class H264Viewer {
   dropped = 0;
   private sentConfig?: Buffer;
   private lastAsk = 0;
+  /** Frames sent to this viewer (its own fps) and its capture -> sent time (ms, smoothed). */
+  readonly meter = new RateMeter();
+  capToSent: number | null = null;
   constructor(readonly t: Transport, private src: H264Source) {}
+
+  /** This viewer's numbers for `stats.sessions`: fps and capture -> sent (+ half the round trip when known). */
+  sessionStats(): { fps: number; latencyMs: number | null; lane: 'lan' | 'remote' | 'thumb' | null } {
+    const rtt = this.t.net?.().rtt_ms ?? null;
+    const lat = this.capToSent === null ? null : this.capToSent + (rtt !== null ? rtt / 2 : 0);
+    return { fps: this.meter.rate(), latencyMs: lat === null ? null : Math.round(lat), lane: this.src.kind };
+  }
+
+  private sent(r: Rec): void {
+    this.meter.tick();
+    this.capToSent = ewma(this.capToSent, Date.now() - r.time);
+    this.src.noteSent(r);
+  }
 
   private over(): boolean {
     const keySize = this.src.key?.payload.length ?? 0;
@@ -230,7 +246,7 @@ export class H264Viewer {
         return;
       }
       this.t.send(r);
-      this.src.noteSent(r);
+      this.sent(r);
     }
   }
 
@@ -246,7 +262,7 @@ export class H264Viewer {
       this.sentConfig = config.payload;
     }
     this.t.send(key);
-    this.src.noteSent(key);
+    this.sent(key);
   }
 }
 
@@ -255,7 +271,7 @@ export interface SourceOptions {
   openTimeoutMs?: number; // give up on the first keyframe after this long
   log?: (m: string) => void;
   /** Whose lane this is: "lan" (full settings) or "remote" (a far viewer's), for the stats. */
-  kind?: 'lan' | 'remote';
+  kind?: 'lan' | 'remote' | 'thumb';
 }
 
 /** A lane's network numbers: its WebRTC viewers' longest round trip and queue (the worst one counts). */
@@ -291,7 +307,7 @@ export class H264Source {
   private targets = new Map<H264Viewer, number>(); // each viewer's link: the bitrate it carries
   private applied = 0; // the bitrate the running helper was last given
   private appliedFps = 0; // the frame rate the running helper was last given
-  readonly kind: 'lan' | 'remote' | null;
+  readonly kind: 'lan' | 'remote' | 'thumb' | null;
   private encodeMs: number | null = null;
   private capToEnc: number | null = null;
   private capToSent: number | null = null;

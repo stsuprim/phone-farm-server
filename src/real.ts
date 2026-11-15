@@ -32,7 +32,7 @@ function helperCaps(): string[] {
     return [];
   }
 }
-import { WdaManager } from './wda.js';
+import { WdaError, WdaManager } from './wda.js';
 
 function run(cmd: string, args: string[]): Promise<string> {
   return new Promise((resolve, reject) => {
@@ -201,7 +201,7 @@ export class RealBackend implements Backend {
         if (!host) this.hosts.set(udid, (host = new PhonecapHost(HELPER, args, tag)));
         start = host.start;
       } else start = helperProducer(HELPER, args, tag);
-      const kind = prof.remote ? 'remote' : 'lan';
+      const kind = prof.thumb ? 'thumb' : prof.remote ? 'remote' : 'lan';
       src = new H264Source(lanes ? `${tag} ${kind}` : tag, start, prof.settings, { kind });
       this.h264Sources.set(key, src);
     }
@@ -353,6 +353,43 @@ export class RealBackend implements Backend {
     this.known(udid);
     await this.wda.call(udid, 'POST', '/wda/apps/launch', { bundleId });
     return { via: 'wda' };
+  }
+
+  // ---- idle lock and wake (src/idle.ts): WDA's session-less routes, the session ones on an older WDA ----
+
+  private async wdaPower(udid: string, method: 'GET' | 'POST', route: string, timeout = 15000): Promise<any> {
+    try {
+      return await this.wda.callNoSession(udid, method, route, method === 'POST' ? {} : undefined, timeout);
+    } catch (err) {
+      if (err instanceof WdaError && err.kind === 'unknown') return this.wda.call(udid, method, route, method === 'POST' ? {} : undefined, timeout);
+      throw err;
+    }
+  }
+
+  async lock(udid: string): Promise<void> {
+    this.known(udid);
+    await this.wdaPower(udid, 'POST', '/wda/lock');
+  }
+
+  async unlock(udid: string): Promise<void> {
+    this.known(udid);
+    // home press + swipe up: past the lock screen when the phone has no passcode
+    await this.wdaPower(udid, 'POST', '/wda/unlock', 20000);
+  }
+
+  async isLocked(udid: string): Promise<boolean | null> {
+    const p = this.phones.get(udid);
+    if (!p?.online || this.wda.status(udid) !== 'ready') return null;
+    try {
+      const j = await this.wdaPower(udid, 'GET', '/wda/locked', 5000);
+      return typeof j?.value === 'boolean' ? j.value : null;
+    } catch {
+      return null;
+    }
+  }
+
+  restartWda(udid: string): void {
+    this.wda.restartRunner(udid);
   }
 
   async recover(udid: string): Promise<ControlState> {

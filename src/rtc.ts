@@ -2,7 +2,8 @@ import type NdcModule from 'node-datachannel';
 import { bitrateAsk, DEFAULT_CEILING_BPS, DelayTracker, parseRtcp, RateControl, REMOTE_START_BPS } from './congestion.js';
 import type { Control } from './control.js';
 import { H264Settings, H264Source, H264Viewer, KIND, Rec, Transport } from './h264.js';
-import { Backend, HttpError } from './types.js';
+import { THUMB_DEFAULT_FPS } from './lanes.js';
+import { Backend, HttpError, Profile, QualityTier } from './types.js';
 
 /**
  * WebRTC live view (node-datachannel / libdatachannel). Signaling rides the control WebSocket:
@@ -134,10 +135,15 @@ const wantNum = (v: unknown, dflt: number, lo: number, hi: number) =>
  * The H.264 settings a client asked for (`want` of rtc-offer); `bitrate` (or `kbps`) in kbit/s; `full: true` keeps a
  * far viewer's ask exactly (no far caps, src/lanes.ts).
  */
-export function rtcWant(want: unknown): { fps: number; scale: number; quality: number | null; bitrate: number | null; full: boolean } {
+export function rtcWant(want: unknown): {
+  fps: number; scale: number; quality: number | null; bitrate: number | null; full: boolean; tier: QualityTier; profile: Profile | null;
+} {
   const w = (want && typeof want === 'object' ? want : {}) as Record<string, unknown>;
+  const tier: QualityTier = w.quality === 'thumb' || w.tier === 'thumb' ? 'thumb' : 'full';
   return {
-    fps: wantNum(w.fps, 60, 1, 60),
+    tier,
+    profile: w.profile === 'lan' || w.profile === 'remote' ? w.profile : null,
+    fps: wantNum(w.fps, tier === 'thumb' ? THUMB_DEFAULT_FPS : 60, 1, 60),
     scale: wantNum(w.scale, 100, 10, 100),
     quality: typeof w.quality === 'number' && Number.isFinite(w.quality) ? wantNum(w.quality, 50, 1, 100) : null,
     bitrate: bitrateAsk(w.bitrate ?? w.kbps),
@@ -185,6 +191,8 @@ export class RtcSession {
   private lastKeyAsk = 0;
   private want?: { bitrate: number | null };
   private delay = new DelayTracker(); // the round trip from the browser's receiver reports
+  private tier: QualityTier = 'full';
+  readonly since = Date.now();
 
   constructor(
     private backend: Backend,
@@ -199,7 +207,10 @@ export class RtcSession {
     if (this.closed) return;
     if (!ndc) throw new Error(`WebRTC is unavailable on this server (${libError})`);
     const offer = parseOffer(sdp);
-    const want = { ...rtcWant(wantRaw), remote: this.remote };
+    const w = rtcWant(wantRaw);
+    if (w.profile) this.remote = w.profile === 'remote'; // the client's choice wins over its address
+    this.tier = w.tier;
+    const want = { ...w, remote: this.remote };
     this.want = want;
     const src = this.backend.h264(this.udid, want);
     if (typeof src === 'string') throw new Error(src);
@@ -277,6 +288,12 @@ export class RtcSession {
       },
       (err) => this.fail(errText(err)),
     );
+  }
+
+  /** This session for `stats.sessions` (null until its video runs). */
+  info(): { profile: Profile; quality: QualityTier; net: string | null; fps: number; latencyMs: number | null; lane: 'lan' | 'remote' | 'thumb' | null; since: number } | null {
+    if (!this.viewer || this.closed) return null;
+    return { profile: this.remote ? 'remote' : 'lan', quality: this.tier, net: this.path, ...this.viewer.sessionStats(), since: this.since };
   }
 
   addIce(candidate: unknown, mid: unknown): void {
@@ -512,6 +529,10 @@ export function rtcSignaling(backend: Backend, control: Control, udid: string, s
     close() {
       session?.close('control socket closed');
       session = undefined;
+    },
+    /** The WebRTC session's numbers, or null without one. */
+    info() {
+      return session?.info() ?? null;
     },
   };
 }

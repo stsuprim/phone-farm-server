@@ -1,0 +1,204 @@
+import type { Backend } from './types.js';
+
+/**
+ * Idle lock and wake. After `idleLockMinutes` (src/settings.ts) with no input and no open viewer on a phone, the
+ * server locks it (screen off: WDA /wda/lock). Input or a new viewer (a stream or WebRTC session) counts as activity:
+ * it wakes the phone by itself (WDA /wda/unlock: home press + swipe, which lands past the lock screen when there's no
+ * passcode) before the input goes through.
+ *
+ * Input only waits for a wake when the phone is known to be locked, so a tap on an awake phone pays nothing.
+ */
+
+export interface PowerState {
+  locked: boolean | null;
+  screenOn: boolean | null;
+  lastActive: number | null;
+  viewers: number;
+  /** The last lock/wake failure (e.g. a passcode keeps it locked), or null. */
+  error: string | null;
+}
+
+interface Entry extends PowerState {
+  known: boolean; // seen online + ready since the server started (idle time counts from then)
+  busy?: Promise<void>; // a lock or wake in progress
+}
+
+export interface IdleOptions {
+  now?: () => number;
+  /** How often the idle check runs (ms; default 30 s). 0 = never on its own (tests call tick()). */
+  tickMs?: number;
+  log?: (m: string) => void;
+  /** Which phones can be locked now (online, WDA ready); default: backend.list(). */
+  devices?: () => Promise<string[]>;
+}
+
+export class IdleLock {
+  private st = new Map<string, Entry>();
+  private timer?: NodeJS.Timeout;
+  private now: () => number;
+  private log: (m: string) => void;
+  private ticking = false;
+
+  constructor(private backend: Backend, private minutes: () => number, private o: IdleOptions = {}) {
+    this.now = o.now ?? Date.now;
+    this.log = o.log ?? ((m) => console.log(`[idle] ${m}`));
+    const every = o.tickMs ?? 30_000;
+    if (every > 0) {
+      this.timer = setInterval(() => void this.tick(), every);
+      this.timer.unref();
+    }
+  }
+
+  /** Whether lock/wake can work on this backend at all. */
+  get supported(): boolean {
+    return typeof this.backend.lock === 'function' && typeof this.backend.unlock === 'function';
+  }
+
+  private entry(udid: string): Entry {
+    let e = this.st.get(udid);
+    if (!e) this.st.set(udid, (e = { locked: null, screenOn: null, lastActive: null, viewers: 0, error: null, known: false }));
+    return e;
+  }
+
+  state(udid: string): PowerState {
+    const e = this.st.get(udid);
+    return e
+      ? { locked: e.locked, screenOn: e.screenOn, lastActive: e.lastActive, viewers: e.viewers, error: e.error }
+      : { locked: null, screenOn: null, lastActive: null, viewers: 0, error: null };
+  }
+
+  /** Open viewers on every phone (the WDA re-sign waits for none unless expiry is close). */
+  liveViewers(): number {
+    let n = 0;
+    for (const e of this.st.values()) n += e.viewers;
+    return n;
+  }
+
+  /**
+   * Input on the phone: counts as activity. Returns a promise to wait on only when the phone is known to be locked
+   * (the wake), else null (nothing to wait for).
+   */
+  activity(udid: string): Promise<void> | null {
+    const e = this.entry(udid);
+    e.lastActive = this.now();
+    e.known = true;
+    if (e.busy) return e.busy.catch(() => {});
+    if (e.locked === true) return this.wake(udid).then(() => undefined, () => undefined);
+    return null;
+  }
+
+  /** A viewer opened (stream or WebRTC session): activity, and the phone wakes. Returns the release. */
+  viewer(udid: string): () => void {
+    const e = this.entry(udid);
+    e.viewers++;
+    e.lastActive = this.now();
+    e.known = true;
+    // a viewer isn't latency-critical: ask the phone whether it's locked when we don't know
+    if (this.supported && e.locked !== false) void this.wake(udid, e.locked === null).catch(() => {});
+    let done = false;
+    return () => {
+      if (done) return;
+      done = true;
+      e.viewers = Math.max(0, e.viewers - 1);
+      e.lastActive = this.now();
+    };
+  }
+
+  /** Wake and unlock now. `check`: ask first and do nothing if it's already unlocked. */
+  wake(udid: string, check = false): Promise<PowerState> {
+    const e = this.entry(udid);
+    e.lastActive = this.now();
+    e.known = true;
+    return this.serial(e, async () => {
+      if (!this.backend.unlock) throw new Error('this backend cannot wake phones');
+      if (check && this.backend.isLocked) {
+        const l = await this.backend.isLocked(udid).catch(() => null);
+        if (l === false) {
+          e.locked = false;
+          e.screenOn = true;
+          return;
+        }
+      }
+      await this.backend.unlock(udid);
+      const still = this.backend.isLocked ? await this.backend.isLocked(udid).catch(() => null) : false;
+      e.screenOn = true;
+      e.locked = still === null ? false : still;
+      e.error = still ? 'still locked after wake (a passcode is set: enter it on the phone once, or remove it)' : null;
+      if (!still) this.log(`${udid.slice(-8)} woke`);
+    }).then(() => this.state(udid));
+  }
+
+  /** Lock (screen off) now. */
+  lock(udid: string): Promise<PowerState> {
+    const e = this.entry(udid);
+    return this.serial(e, async () => {
+      if (!this.backend.lock) throw new Error('this backend cannot lock phones');
+      await this.backend.lock(udid);
+      e.locked = true;
+      e.screenOn = false;
+      e.error = null;
+    }).then(() => this.state(udid));
+  }
+
+  private serial(e: Entry, fn: () => Promise<void>): Promise<void> {
+    const prev = e.busy ?? Promise.resolve();
+    const p = prev.catch(() => {}).then(fn);
+    const mine = p.then(
+      () => undefined,
+      (err: Error) => {
+        e.error = err?.message?.slice(0, 200) ?? 'failed';
+      },
+    );
+    e.busy = mine;
+    void mine.then(() => {
+      if (e.busy === mine) e.busy = undefined;
+    });
+    return p;
+  }
+
+  /** Whether a phone should be locked now (idle long enough, nobody watching, not already locked). Pure. */
+  static due(e: Pick<PowerState, 'locked' | 'viewers' | 'lastActive'>, minutes: number, now: number): boolean {
+    if (!(minutes > 0) || e.viewers > 0 || e.locked === true || e.lastActive === null) return false;
+    return now - e.lastActive >= minutes * 60_000;
+  }
+
+  /** The periodic check: learn the phones, lock the idle ones. Returns the phones it locked. */
+  async tick(): Promise<string[]> {
+    if (this.ticking || !this.supported) return [];
+    this.ticking = true;
+    const locked: string[] = [];
+    try {
+      const ids = this.o.devices
+        ? await this.o.devices()
+        : (await this.backend.list()).filter((p) => p.online && p.ready).map((p) => p.udid);
+      const now = this.now();
+      for (const udid of ids) {
+        const e = this.entry(udid);
+        if (!e.known) {
+          e.known = true;
+          e.lastActive ??= now; // idle time counts from when the server first saw it
+        }
+      }
+      const minutes = this.minutes();
+      for (const udid of ids) {
+        const e = this.entry(udid);
+        if (e.busy || !IdleLock.due(e, minutes, now)) continue;
+        try {
+          await this.lock(udid);
+          locked.push(udid);
+          this.log(`${udid.slice(-8)} locked after ${minutes} min idle`);
+        } catch (err) {
+          this.log(`${udid.slice(-8)} could not be locked: ${(err as Error).message}`);
+          e.lastActive = now; // try again after another idle period, not every tick
+        }
+      }
+    } finally {
+      this.ticking = false;
+    }
+    return locked;
+  }
+
+  close(): void {
+    if (this.timer) clearInterval(this.timer);
+  }
+}

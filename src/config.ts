@@ -23,6 +23,14 @@ export interface Config {
   hidPython: string;
   /** Seconds without a viewer or input before a phone's touch session closes (frees its camera/mic). */
   hidIdleSeconds: number;
+  /** The server's config dir (settings.json, wda-sign.json, ports.json): data/ under the working directory. */
+  dataDir: string;
+  /** The Apple Team ID WDA is signed with (scripts/build-wda.sh's first argument), for the 6-day re-sign. */
+  wdaTeamId: string;
+  /** Re-sign WDA every 6 days (free Apple ID profiles last 7). */
+  wdaResign: boolean;
+  /** Local hour the quiet re-sign window starts (3 hours long). */
+  wdaResignHour: number;
 }
 
 function loadDotEnv(file: string): void {
@@ -71,5 +79,9 @@ export function loadConfig(envFile = '.env'): Config {
     hidInput: /^(on|off)$/i.test(e.HID_INPUT ?? '') ? (e.HID_INPUT!.toLowerCase() as 'on' | 'off') : 'auto',
     hidPython: expand(e.HID_PYTHON || 'python3'),
     hidIdleSeconds: Math.max(10, num(e.HID_IDLE_SECONDS, 120)),
+    dataDir: 'data', // relative to the working directory, like data/ports.json (launchd's WorkingDirectory)
+    wdaTeamId: (e.WDA_TEAM_ID ?? '').trim(),
+    wdaResign: bool(e.WDA_RESIGN, true),
+    wdaResignHour: Math.min(23, Math.max(0, Math.round(num(e.WDA_RESIGN_HOUR, 3)))),
   };
 }

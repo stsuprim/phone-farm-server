@@ -112,3 +112,20 @@ one frame in flight behind another. Expected over the Nepal -> UK link (~180 ms)
   2.2 s on the server side means the old XCTest `/wda/tap` route (the fast `/wda/lotus/touch` route answers when queued,
   tens of ms). WDA must be rebuilt with the patch (RINOR_TAP_CHECK.md step 3). Each ack also waits behind any queue in
   front of the video on the way back, which the delay-based control above now keeps short.
+
+### 2026-11-15: profiles, thumbnails and one more encoder frame
+
+- **Encoder**: phonecap now sets `MaxFrameDelayCount = 0` (each frame leaves the encoder before the next goes in), on top
+  of RealTime, no reordering, low-latency rate control and `PrioritizeEncodingSpeedOverQuality`. Expected saving: up to
+  one frame (~16 ms at 60 fps) on encoders that held a look-ahead frame; none where they didn't (est.).
+- **Keyframe on join** already holds: a new viewer gets the cached config + keyframe at once and a fresh IDR is asked
+  for, so the first picture is one frame away, not the next 2 s interval.
+- **lan profile** (Rinor on the LAN): full size, 60 fps, 8 Mbps (`H264_BITRATE_MBPS`), HID touch. Expected glass-to-glass
+  ~35-80 ms video; tap ~60-100 ms on iOS 27 (HID), ~250-350 ms on iOS 18 (patched WDA) (est., unchanged).
+- **remote profile** (the owner over Tailscale, ~180 ms RTT): the adaptive far lane, 25-30 fps at ~250-400 ms glass to
+  glass over WebRTC (est.); a drag is now one `swipe` command replayed on the Mac, so it plays smooth whatever the
+  link's jitter (it lands ~one-way + its own duration after release, instead of stuttering point by point).
+- **Thumbnails** (`quality=thumb`): ~360 px, 6 fps, ~250 kbit/s each, all thumbnail viewers of a phone share one lane: a
+  grid of 10 phones costs ~2.5 Mbit/s, about one full-quality far stream.
+- **Per session numbers**: `stats.sessions[].fps` and `latencyMs` (capture -> sent on the server + half the round trip)
+  replace guessing; the client's own glass-to-glass measure is still the truth.

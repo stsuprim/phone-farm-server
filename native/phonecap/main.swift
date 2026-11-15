@@ -683,6 +683,8 @@ final class Encoder {
         }
         set(kVTCompressionPropertyKey_RealTime, kCFBooleanTrue)
         set(kVTCompressionPropertyKey_AllowFrameReordering, kCFBooleanFalse) // no B-frames
+        // each frame comes out before the next one goes in (no look-ahead queue in the encoder): one less frame of delay
+        set(kVTCompressionPropertyKey_MaxFrameDelayCount, 0 as CFNumber, optional: true)
         var profile: CFString = kVTProfileLevel_H264_Baseline_AutoLevel
         if profileName == "main" {
             profile = kVTProfileLevel_H264_Main_AutoLevel

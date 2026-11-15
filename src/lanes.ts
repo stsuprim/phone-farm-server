@@ -12,11 +12,20 @@ import type { H264Want } from './types.js';
  */
 
 export const MAX_LANES = 8;
+/** `quality=thumb`: a small, cheap lane for grids (one phone full, the rest as thumbnails). */
+export const THUMB_LONG_SIDE = 360;
+export const THUMB_MIN_FPS = 4;
+export const THUMB_MAX_FPS = 8;
+export const THUMB_DEFAULT_FPS = 6;
+export const THUMB_BPS = 250_000;
+export const THUMB_KEY_SECONDS = 4;
 
 /** What a viewer gets: its lane's key (viewers with the same key share it) and the lane's settings. */
 export interface Profile {
   key: string;
   remote: boolean;
+  /** A thumbnail lane (`quality=thumb`). */
+  thumb?: boolean;
   settings: H264Settings;
 }
 
@@ -26,6 +35,14 @@ export interface Profile {
  * one), frame rate lowered with the bitrate.
  */
 export function profileFor(want: H264Want, dfltBps: number, longSidePx: number | null): Profile {
+  if (want.tier === 'thumb') {
+    // a grid tile: ~360 px on the long side, 4-8 fps, a few hundred kbit/s; viewers of any profile share it
+    const long = longSidePx && longSidePx > 0 ? longSidePx : 2778;
+    const scale = Math.max(10, Math.min(want.scale, Math.floor((100 * THUMB_LONG_SIDE) / long)));
+    const fps = Math.min(THUMB_MAX_FPS, Math.max(THUMB_MIN_FPS, want.fps));
+    const bitrate = Math.min(want.bitrate ?? THUMB_BPS, THUMB_BPS * 2);
+    return { key: `thumb:${fps}:${scale}`, remote: !!want.remote, thumb: true, settings: { fps, scale, bitrate, keySeconds: THUMB_KEY_SECONDS } };
+  }
   if (!want.remote || want.full) {
     const bitrate = want.bitrate ?? bitrateFor(want.quality, dfltBps);
     return {

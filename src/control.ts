@@ -36,6 +36,45 @@ function parsePath(v: unknown): PathPoint[] {
   });
 }
 
+/** Replay step for a one-command swipe: the gesture is resampled to this (ms; ~120 Hz) so it plays smooth. */
+export const SWIPE_STEP_MS = 8;
+const SWIPE_DEFAULT_MS = 300;
+
+/**
+ * A one-command swipe's points, ready to replay as one gesture: time starts at 0; with `duration` (ms) the client's
+ * timing is stretched to it (no timing at all: spread evenly); then resampled every SWIPE_STEP_MS by linear
+ * interpolation along the path, so a coarse or jittery client sample still plays as a smooth drag. One point (or a
+ * zero-length, zero-time path) stays one point (a tap).
+ */
+export function swipePlan(points: PathPoint[], duration?: unknown, stepMs = SWIPE_STEP_MS): PathPoint[] {
+  if (!points.length) return [];
+  const t0 = points[0]![2];
+  let pts = points.map(([x, y, t]) => [x, y, t - t0] as PathPoint);
+  const span = pts[pts.length - 1]![2];
+  const want = typeof duration === 'number' && Number.isFinite(duration) && duration > 0 ? Math.min(duration, MAX_GESTURE_MS) : null;
+  if (pts.length === 1) return want ? [pts[0]!, [pts[0]![0], pts[0]![1], want]] : pts;
+  if (span <= 0) {
+    const total = want ?? SWIPE_DEFAULT_MS;
+    pts = pts.map(([x, y], i) => [x, y, (total * i) / (pts.length - 1)] as PathPoint);
+  } else if (want) {
+    pts = pts.map(([x, y, t]) => [x, y, (t * want) / span] as PathPoint);
+  }
+  const end = pts[pts.length - 1]![2];
+  const step = Math.max(stepMs, end / (MAX_POINTS - 2)); // a very long drag: fewer steps, never cut short
+  const out: PathPoint[] = [];
+  let j = 0;
+  for (let t = 0; t < end; t += step) {
+    while (j < pts.length - 2 && pts[j + 1]![2] <= t) j++;
+    const a = pts[j]!;
+    const b = pts[j + 1]!;
+    const f = b[2] > a[2] ? Math.min(1, Math.max(0, (t - a[2]) / (b[2] - a[2]))) : 1;
+    out.push([a[0] + (b[0] - a[0]) * f, a[1] + (b[1] - a[1]) * f, t]);
+  }
+  const last = pts[pts.length - 1]!;
+  out.push([last[0], last[1], end]);
+  return out;
+}
+
 interface Touch {
   pts: PathPoint[];
   t0: number; // Date.now() at t = 0
@@ -62,20 +101,34 @@ export class Control {
   private queues = new Map<string, { tail: Promise<unknown>; waiting: number }>();
   private touches = new Map<string, Touch>();
   readonly meter: InputMeter;
+  /** Called on every input (src/idle.ts): a promise to wait for (the phone waking) or null. */
+  onInput?: (udid: string) => Promise<void> | null;
 
   constructor(private backend: Backend, meter?: InputMeter) {
     this.meter = meter ?? new InputMeter();
   }
 
-  /** Run one message: `{type: "tap"|"swipe"|"path"|"hold"|"home"|"type"|"launch"|"touch", ...}`. */
+  /**
+   * Run one message: `{type: "tap"|"swipe"|"path"|"hold"|"home"|"type"|"launch"|"touch", ...}`. A swipe is either
+   * `{x1, y1, x2, y2, ms}` or a whole drag `{points: [[x, y, t], ...], duration}` (swipePlan).
+   */
   async handle(udid: string, msg: Record<string, unknown>, owner?: object): Promise<Result> {
     const tRecv = performance.now();
+    // input is activity (idle lock): a locked phone is woken first; an awake one pays nothing
+    const waking = this.onInput?.(udid);
+    if (waking) await waking;
     switch (msg.type) {
       case 'tap': {
         const [x, y] = this.clamp(udid, ...(numbers(msg, 'x', 'y') as [number, number]));
         return this.run(udid, 'tap', tRecv, () => this.backend.tap(udid, x, y));
       }
       case 'swipe': {
+        if (msg.points !== undefined) {
+          // a whole drag in one command (the remote profile): replayed here as one smooth gesture
+          const plan = swipePlan(parsePath(msg.points), msg.duration ?? msg.ms);
+          if (plan.length === 1) return this.handle(udid, { type: 'tap', x: plan[0]![0], y: plan[0]![1] }, owner);
+          return this.gesture(udid, plan, 'swipe', tRecv);
+        }
         const [x1, y1, x2, y2] = numbers(msg, 'x1', 'y1', 'x2', 'y2') as [number, number, number, number];
         return this.gesture(udid, [[x1, y1, 0], [x2, y2, duration(msg.ms, 300, 10000)]], 'swipe', tRecv);
       }

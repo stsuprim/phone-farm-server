@@ -181,6 +181,15 @@ export class WdaManager {
     e.agent = newAgent();
   }
 
+  /** Relaunch the phone's runner now (after a re-sign: test-without-building installs the fresh build). */
+  restartRunner(udid: string): void {
+    const e = this.entries.get(udid);
+    if (!e?.wanted) return;
+    this.log(e, 'restarting the runner (fresh WDA build)');
+    e.restarts = 0;
+    this.restart(e);
+  }
+
   /** Kill and relaunch the WDA runner and its forwards right away. */
   private restart(e: Entry): void {
     if (!e.wanted) return;
