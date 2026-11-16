@@ -412,10 +412,16 @@ an event for a touch the server no longer has (lifted by the timeout, replaced b
   (the unordered channel).
 - **Coalescing.** While a move waits for the phone, newer moves replace it: the phone always gets the newest point and
   a slow link never builds a backlog. All of them are acked when that point is injected.
-- **Auto-release.** A live touch with no event for 1.5 s is lifted by the server and its sender told:
-  `{"type":"touch-released", id, reason:"timeout"}`. **A finger held still must repeat its `move`** (same point, new
-  `seq`) at least once a second. The HID sidecar has its own 3 s watchdog below that, and lifts when its session
-  closes. A touch is also lifted when its socket or channel closes, and by a new `down`.
+- **One contact from `down` to `up`** (2026-11-16). A finger held still stays down for as long as its sender's link is
+  alive: any message on its socket or channel counts, its pings too, so a long press needs no repeated `move` (one a
+  few times a second is still welcome), and the server says the contact again to the phone every 0.8 s. The owner's
+  live touch never waits for WDA's health checks, the idle probe, the look at a quiet phone's screen or the gap
+  between two actions, and natural touch never reshapes or delays it.
+- **Auto-release.** The server lifts a live touch itself, and tells its sender
+  `{"type":"touch-released", id, reason:"timeout"}`, only when the link died: no event of the touch and nothing at
+  all from its sender for 6 s, or a sender that is alive but silent about the touch for 30 s (a frozen page). A touch
+  whose socket or channel closed waits 2.5 s for the same touch (`id`) to go on over another link, then it's lifted.
+  A new `down` lifts it too. The HID sidecar has its own 12 s watchdog below that, and lifts when its session closes.
 - **Live or buffered.** With CoreDevice HID (below) `down`, each `move` and `up` reach the phone as they come, like a
   real finger. Without it (WDA can't keep a finger down between requests) they're buffered and played as one gesture
   when `up` arrives, with every point and its timing; a still touch lifted within 250 ms becomes a tap. A buffered touch

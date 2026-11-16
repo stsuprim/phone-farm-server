@@ -10,8 +10,25 @@ const MAX_GESTURE_MS = 60000;
 const TAP_MS = 250; // a still touch lifted sooner than this is a tap
 const STILL_PT = 4; // ...and "still" means it never strayed more than this many points
 const STALE_TOUCH_MS = 60000; // a buffered touch (nothing on the phone yet) never lifted is forgotten after this
-/** A live touch (a finger down on the phone) with no event for this long is lifted: no stuck fingers. */
-export const TOUCH_RELEASE_MS = 1500;
+/**
+ * A live touch (a finger down on the phone) is lifted by the server when neither an event of the touch nor anything
+ * at all from its sender (its socket's or channel's pings count: `Control.alive`) came for this long: the link died
+ * with the finger down. 2026-11-16: it was 1.5 s without a touch event, whatever the link said, so a finger held still
+ * was lifted whenever the client's repeated moves were late or lost (a long press let go by itself, a drag cut).
+ */
+export const TOUCH_RELEASE_MS = 6000;
+/**
+ * ...and one whose sender is alive but has said nothing of the touch for this long (a frozen page; a healthy client
+ * repeats a still finger's place a few times a second) is lifted too.
+ */
+export const TOUCH_QUIET_MS = 30_000;
+/** A finger held still: its contact is said again to the phone this often, so nothing on the way takes it for stuck. */
+export const HOLD_REPEAT_MS = 800;
+/**
+ * A touch whose sender closed (a data channel made anew, a socket reconnecting) waits this long for the same touch to
+ * go on over another link before it's lifted.
+ */
+export const OWNER_GRACE_MS = 2500;
 /**
  * A live touch stays down at least this long. A quick tap whose down waited in the phone's queue (the phone waking,
  * a gesture still playing) would otherwise be pressed and lifted in the same instant, which iOS can take for nothing.
@@ -106,6 +123,12 @@ interface Touch {
   t0: number; // Date.now() at t = 0
   owner?: object;
   timer?: NodeJS.Timeout;
+  /** When an event of this touch last came, when its sender was last heard at all, when its sender closed (Date.now()). */
+  eventAt: number;
+  heardAt: number;
+  orphanAt?: number;
+  /** When its contact was last said to the phone (live touches: the hold's repeat). */
+  reportAt: number;
   /** Its down went straight to the phone (HID live touch): moves and the up follow live. */
   live: boolean;
   /** When its down reached the phone (performance.now()). */
@@ -135,11 +158,23 @@ interface RunOptions {
   timeoutMs?: number;
   /** Not input at all (a health check): not activity, not timed, no spacing, never marks the phone as acted on. */
   quiet?: boolean;
+  /**
+   * The owner's live touch on the phone's live channel (HID): never held up by what only WDA needs. It doesn't wait
+   * for a health check, the idle probe or the look at a quiet phone's screen (those run beside it), nor for the
+   * breath between two actions.
+   */
+  live?: boolean;
 }
 
 export interface ControlOptions {
-  /** A live touch with no event for this long is lifted (ms; default TOUCH_RELEASE_MS). */
+  /** A live touch with no event and nothing from its sender for this long is lifted (ms; default TOUCH_RELEASE_MS). */
   releaseMs?: number;
+  /** ...and one with no event of its own for this long, whatever its sender says (ms; default TOUCH_QUIET_MS). */
+  quietMs?: number;
+  /** A held finger's contact is said again to the phone this often (ms; default HOLD_REPEAT_MS; 0 = never). */
+  holdRepeatMs?: number;
+  /** A touch whose sender closed waits this long to go on over another link (ms; default OWNER_GRACE_MS). */
+  ownerGraceMs?: number;
   /** Discrete actions on one phone start at least this long after the last one ended (ms; default MIN_GAP_MS). */
   minGapMs?: number;
   /** An action that takes longer than this is answered with an error and the phone is healed (ms; default ACTION_TIMEOUT_MS). */
@@ -214,13 +249,17 @@ export class Control {
   private queues = new Map<string, { tail: Promise<unknown>; waiting: number }>();
   private touches = new Map<string, Touch>();
   private acted = new Map<string, number>(); // when each phone last had an action start, end or finish playing
+  private checks = new Map<string, Promise<unknown>>(); // a health check running beside each phone's queue
   private releaseMs: number;
+  private quietMs: number;
+  private holdRepeatMs: number;
+  private ownerGraceMs: number;
   readonly meter: InputMeter;
   /**
    * Called for every input, inside the phone's queue (src/idle.ts): marks activity; for a discrete action it
    * returns a promise to wait for (the phone waking) or null.
    */
-  onInput?: (udid: string, discrete: boolean) => Promise<void> | null;
+  onInput?: (udid: string, discrete: boolean, live?: boolean) => Promise<void> | null;
   /** Lock and wake (src/idle.ts), for `key: "lock"` and `wake`. */
   power?: { lock(udid: string): Promise<unknown>; wake(udid: string): Promise<unknown> };
   /** An app's name -> its bundle id (src/agent.ts), for `launch {name}`. */
@@ -241,6 +280,9 @@ export class Control {
   constructor(private backend: Backend, meter?: InputMeter, opts: ControlOptions = {}) {
     this.meter = meter ?? new InputMeter();
     this.releaseMs = opts.releaseMs ?? TOUCH_RELEASE_MS;
+    this.quietMs = opts.quietMs ?? TOUCH_QUIET_MS;
+    this.holdRepeatMs = opts.holdRepeatMs ?? HOLD_REPEAT_MS;
+    this.ownerGraceMs = opts.ownerGraceMs ?? OWNER_GRACE_MS;
     this.minGapMs = opts.minGapMs ?? MIN_GAP_MS;
     this.actionTimeoutMs = opts.actionTimeoutMs ?? ACTION_TIMEOUT_MS;
     this.idleProbeMs = opts.idleProbeMs ?? IDLE_PROBE_MS;
@@ -264,15 +306,29 @@ export class Control {
   }
 
   /**
-   * A health check in the phone's queue, so it never runs on WDA alongside an action; skipped (false) when the queue
-   * isn't empty (the phone is busy, so it's being used: the actions themselves find out).
+   * A health check beside the phone's queue: it never runs on WDA alongside an action (it's skipped, false, when the
+   * queue isn't empty: the phone is being used, so the actions themselves find out; and an action that comes while
+   * it runs waits for it). 2026-11-16: the owner's live touch doesn't wait for it: it goes by the phone's live channel,
+   * not WDA, and a press that landed during a check used to sit in the queue for seconds (a drag that started late
+   * and jumped).
    */
   async check(udid: string, fn: () => Promise<void>): Promise<boolean> {
-    if (this.pending(udid) > 0) return false;
-    await this.run(udid, 'health', null, async () => {
-      await fn();
-    }, { quiet: true, timeoutMs: Infinity });
+    if (this.pending(udid) > 0 || this.checks.has(udid)) return false;
+    const p = fn().finally(() => {
+      if (this.checks.get(udid) === p) this.checks.delete(udid);
+    });
+    this.checks.set(udid, p);
+    await p;
     return true;
+  }
+
+  /**
+   * Something came from `owner` (a ping, any message on its socket or channel): its link is alive, so a finger of
+   * its held still on the phone stays down.
+   */
+  alive(owner: object): void {
+    const now = Date.now();
+    for (const t of this.touches.values()) if (t.owner === owner) t.heardAt = now;
   }
 
   /**
@@ -388,10 +444,20 @@ export class Control {
     }, { silent: true, timeoutMs: Infinity }).then(() => state);
   }
 
-  /** Forget unfinished live touches started by `owner` (its socket closed); a finger down on the phone is lifted. */
+  /**
+   * `owner` closed (its socket, its data channel): its unfinished touches wait `ownerGraceMs` for the same touch to
+   * go on over another link (the page's channel is made anew mid-drag and the touch carries on over its socket), then
+   * a finger down on the phone is lifted and a buffered one dropped.
+   */
   release(owner: object): void {
+    const now = Date.now();
     for (const [udid, t] of this.touches) {
-      if (t.owner === owner) this.end(udid, t, 'closed');
+      if (t.owner !== owner) continue;
+      if (this.ownerGraceMs <= 0) this.end(udid, t, 'closed');
+      else {
+        t.owner = undefined;
+        t.orphanAt = now;
+      }
     }
   }
 
@@ -495,22 +561,25 @@ export class Control {
     let hung: Promise<unknown> | null = null; // the action that timed out, still on its way at the phone
     const p = queue.tail.then(async () => {
       if (opts.quiet) return fn();
+      // a health check is on WDA right now: what goes through WDA waits for it (the owner's live touch doesn't)
+      if (!opts.live) await this.checks.get(udid)?.catch(() => {});
       // the first action after a quiet spell: the phone's WDA is probed (and healed) first, in this same request
       if (opts.discrete && this.onHeal) {
         const last = this.acted.get(udid);
         const quiet = last === undefined ? Infinity : performance.now() - last;
         if (quiet >= this.idleProbeMs) {
           const why = last === undefined ? 'first action since the server started' : `first action after ${Math.round(quiet / 1000)} s idle`;
-          await within(this.onHeal(udid, why), HEAL_WAIT_MS, () => new Error('probe')).catch(() => {});
+          const probe = within(this.onHeal(udid, why), HEAL_WAIT_MS, () => new Error('probe')).catch(() => {});
+          if (!opts.live) await probe; // a live touch isn't WDA's: the probe runs beside it
         }
       }
       // input is activity (idle lock); a locked or dark phone is woken first, here, so the order of actions holds
       if (!opts.silent) {
-        const waking = this.onInput?.(udid, !!opts.discrete);
+        const waking = this.onInput?.(udid, !!opts.discrete, !!opts.live);
         if (waking && opts.discrete) await within(waking, WAKE_WAIT_MS, () => new Error('wake')).catch(() => {});
       }
       // bursts are spaced: a discrete action starts a breath after the last one ended
-      if (opts.discrete && this.minGapMs > 0) {
+      if (opts.discrete && !opts.live && this.minGapMs > 0) {
         const since = performance.now() - (this.acted.get(udid) ?? -Infinity);
         if (since < this.minGapMs) await sleep(this.minGapMs - since);
       }
@@ -569,8 +638,10 @@ export class Control {
    * and up go to the phone as they come, in order (a real finger: drags follow live, a hold is a hold); a down and
    * an up are never dropped, and moves arriving while the phone is behind fold into the newest one. Without one (WDA
    * can't keep a finger down across requests) they're buffered and played as one gesture on "up", keeping every
-   * point and its timing (`t` = ms since the press, else server time). A live touch with no event for `releaseMs` is
-   * lifted by the server (no stuck fingers), so a finger held still repeats its `move`.
+   * point and its timing (`t` = ms since the press, else server time). One contact is held on the phone from the down
+   * to the up: a finger held still stays down for as long as its sender's link is alive (`alive`; the server says the
+   * contact again to the phone meanwhile), and is lifted by the server only when that link died (`watch`). Natural
+   * touch never comes near it: the owner's own input goes to the phone as it came.
    */
   private touch(udid: string, msg: Record<string, unknown>, tRecv: number, owner?: object): Promise<Result> {
     const phase = msg.phase;
@@ -590,7 +661,7 @@ export class Control {
       if (g) this.end(udid, g, 'replaced'); // a new press lifts (or plays) any unfinished one
       const t = given ?? 0;
       const live = !!liveTouch && !!this.backend.liveTouchReady?.(udid);
-      const ng: Touch = { tid, seq: seq ?? -Infinity, unit, pts: [[x, y, t]], t0: now - t, owner, live, liveFailed: false, ended: false };
+      const ng: Touch = { tid, seq: seq ?? -Infinity, unit, pts: [[x, y, t]], t0: now - t, owner, live, liveFailed: false, ended: false, eventAt: now, heardAt: now, reportAt: now };
       this.touches.set(udid, ng);
       this.arm(udid, ng);
       if (!live || !liveTouch) {
@@ -601,9 +672,10 @@ export class Control {
       const press = async () => {
         const r = await liveTouch(udid, 'down', x, y);
         ng.downAt = performance.now();
+        ng.reportAt = Date.now();
         return r;
       };
-      return this.run(udid, 'touch-down', tRecv, press, { discrete: true, must: true }).catch((err): Result => {
+      return this.run(udid, 'touch-down', tRecv, press, { discrete: true, must: true, live: true }).catch((err): Result => {
         // nothing reached the phone: the rest is buffered and "up" plays the whole gesture by the other route
         ng.liveFailed = true;
         ng.reason = `live touch failed (${(err as Error)?.message ?? 'unknown'}): the gesture plays on "up"`;
@@ -614,6 +686,10 @@ export class Control {
 
     // a move or up whose touch is gone (lifted by the server, replaced, or late on the unordered channel)
     if (!g || (tid !== null && g.tid !== null && tid !== g.tid)) return Promise.resolve({ via: 'buffered', stray: true });
+    // the touch goes on, maybe over another link than its down came by (its first sender closed): that one owns it now
+    g.eventAt = g.heardAt = now;
+    if (owner && g.owner !== owner) g.owner = owner;
+    if (g.owner) g.orphanAt = undefined;
     if (phase === 'move' && seq !== null) {
       if (seq <= g.seq) {
         this.meter.coalesced(udid);
@@ -639,8 +715,9 @@ export class Control {
         if (g.moving === p) g.moving = undefined;
         if (g.liveFailed) return { via: 'buffered' as InputVia, reason: g.reason }; // its down never reached the phone
         const [mx, my] = g.next!;
+        g.reportAt = Date.now();
         return liveTouch(udid, 'move', mx, my);
-      }).catch((err): Result => {
+      }, { live: true }).catch((err): Result => {
         if (g.moving === p) g.moving = undefined;
         // the finger was down and the channel broke: lift it and say so (replaying would play the drag twice)
         this.lose(udid, g, (err as Error)?.message ?? 'unknown');
@@ -666,7 +743,7 @@ export class Control {
         const held = g.downAt === undefined ? Infinity : performance.now() - g.downAt;
         if (held < MIN_CONTACT_MS) await sleep(MIN_CONTACT_MS - held);
         return liveTouch(udid, 'up', x, y);
-      }, { must: true }).catch((err) => {
+      }, { must: true, live: true }).catch((err) => {
         if (played) throw err;
         throw new HttpError(502, `the live touch's lift failed (${(err as Error)?.message ?? 'unknown'}); the phone lifts it as its touch session closes`);
       });
@@ -674,16 +751,44 @@ export class Control {
     return this.finish(udid, g, tRecv);
   }
 
-  /** (Re)start a touch's timer: a live one is lifted after `releaseMs` without an event, a buffered one forgotten later. */
+  /**
+   * The touch's watch, from its down to its end. A live one (a finger down on the phone) is lifted when its sender's
+   * link has died (no event of the touch and nothing from its sender for `releaseMs`), when its sender is alive but
+   * silent about it for `quietMs`, or when its sender closed and nobody carried it on within `ownerGraceMs`; while it
+   * is held still its contact is said again to the phone every `holdRepeatMs`. A buffered one (nothing on the phone
+   * yet) is only forgotten, after STALE_TOUCH_MS, or dropped once its sender closed.
+   */
   private arm(udid: string, g: Touch): void {
-    this.disarm(g);
-    const live = g.live && !g.liveFailed;
-    g.timer = setTimeout(() => this.end(udid, g, live ? 'timeout' : 'stale'), live ? this.releaseMs : STALE_TOUCH_MS);
+    if (g.timer) return;
+    const every = Math.max(10, Math.min(250, this.releaseMs / 4, this.holdRepeatMs > 0 ? this.holdRepeatMs / 4 : 250, this.ownerGraceMs > 0 ? this.ownerGraceMs / 4 : 250));
+    g.timer = setInterval(() => this.watch(udid, g), every);
     g.timer.unref?.();
   }
 
+  private watch(udid: string, g: Touch): void {
+    if (g.ended || this.touches.get(udid) !== g) return this.disarm(g);
+    const now = Date.now();
+    const live = g.live && !g.liveFailed;
+    if (g.orphanAt !== undefined && now - g.orphanAt >= this.ownerGraceMs) return this.end(udid, g, 'closed');
+    if (!live) {
+      if (now - g.eventAt >= STALE_TOUCH_MS) this.end(udid, g, 'stale');
+      return;
+    }
+    if (now - Math.max(g.eventAt, g.heardAt) >= this.releaseMs || now - g.eventAt >= this.quietMs) return this.end(udid, g, 'timeout');
+    // held still: the contact is said again where it is (in the live lane, behind any move on its way)
+    const liveTouch = this.backend.liveTouch?.bind(this.backend);
+    if (this.holdRepeatMs > 0 && liveTouch && g.downAt !== undefined && !g.moving && now - g.reportAt >= this.holdRepeatMs) {
+      g.reportAt = now;
+      const [x, y] = g.next ?? [g.pts[g.pts.length - 1]![0], g.pts[g.pts.length - 1]![1]];
+      this.run(udid, 'touch-hold', null, async () => {
+        if (g.ended || g.liveFailed) return;
+        return liveTouch(udid, 'move', x, y);
+      }, { live: true }).catch((err) => this.lose(udid, g, (err as Error)?.message ?? 'unknown'));
+    }
+  }
+
   private disarm(g: Touch): void {
-    if (g.timer) clearTimeout(g.timer);
+    if (g.timer) clearInterval(g.timer);
     g.timer = undefined;
   }
 
@@ -695,14 +800,14 @@ export class Control {
     g.ended = true;
     const lift = this.backend.liveTouch?.bind(this.backend);
     const [x, y] = g.next ?? [g.pts[g.pts.length - 1]![0], g.pts[g.pts.length - 1]![1]];
-    if (lift && this.backend.liveTouchReady?.(udid)) this.run(udid, 'touch-release', null, () => lift(udid, 'up', x, y), { must: true, silent: true }).catch(() => {});
+    if (lift && this.backend.liveTouchReady?.(udid)) this.run(udid, 'touch-release', null, () => lift(udid, 'up', x, y), { must: true, silent: true, live: true }).catch(() => {});
     (g.owner as TouchOwner | undefined)?.touchReleased?.({ id: g.tid, reason: 'lost', error });
   }
 
   /**
-   * End a touch that got no "up": timeout (a live one, no event for `releaseMs`: lifted, its owner told), replaced
-   * (a new press: a live one is lifted, a buffered one played), closed (its socket closed: a live one is lifted, a
-   * buffered one dropped) or stale (a buffered one never lifted: dropped).
+   * End a touch that got no "up": timeout (a live one whose sender's link died: lifted, its owner told), replaced
+   * (a new press: a live one is lifted, a buffered one played), closed (its sender closed and nobody carried it on: a
+   * live one is lifted, a buffered one dropped) or stale (a buffered one never lifted: dropped).
    */
   private end(udid: string, g: Touch, why: 'timeout' | 'replaced' | 'closed' | 'stale'): void {
     this.disarm(g);
@@ -712,7 +817,7 @@ export class Control {
     if (g.live && !g.liveFailed && this.backend.liveTouch) {
       const [x, y] = g.next ?? [g.pts[g.pts.length - 1]![0], g.pts[g.pts.length - 1]![1]];
       const lift = this.backend.liveTouch.bind(this.backend);
-      this.run(udid, 'touch-release', performance.now(), () => lift(udid, 'up', x, y), { must: true, silent: true }).catch(() => {});
+      this.run(udid, 'touch-release', performance.now(), () => lift(udid, 'up', x, y), { must: true, silent: true, live: true }).catch(() => {});
       if (why === 'timeout') {
         this.meter.released(udid);
         (g.owner as TouchOwner | undefined)?.touchReleased?.({ id: g.tid, reason: 'timeout' });

@@ -39,11 +39,14 @@ import sys
 import threading
 import time
 
-VERSION = 2
+VERSION = 3
 CONTACT = 0xC2
 RELEASE = 0x02
 MAIN_TOUCHSCREEN = 257
-STUCK_SECONDS = 3.0  # a finger down with no report for this long is lifted
+# A finger down with no report for this long is lifted. Only the last resort: the server holds a finger for as long as
+# its sender's link is alive, saying the contact again every 0.8 s, and lifts it itself when that link dies
+# (src/control.ts); this catches a server that hung with a finger down.
+STUCK_SECONDS = 12.0
 
 
 def out(obj):

@@ -4,7 +4,7 @@ import os from 'node:os';
 import { WebSocket, WebSocketServer } from 'ws';
 import { ackExtra, Agent } from './agent.js';
 import { bitrateAsk, DEFAULT_CEILING_BPS, RateControl, REMOTE_START_BPS, WsFlow } from './congestion.js';
-import { Control, touchAck, TouchOwner } from './control.js';
+import { Control, ControlOptions, touchAck, TouchOwner } from './control.js';
 import { H264Viewer, KIND, RateMeter, REMOTE_DROP_BYTES, Transport, wsMessage } from './h264.js';
 import { IdleLock } from './idle.js';
 import { imageSize } from './imgsize.js';
@@ -32,6 +32,8 @@ export interface ServerExtras {
   version?: { commit: string | null; startedAt: string };
   /** How long after a switch of the live phone the one before is locked, if nobody watches it by then (ms; default FOCUS_LOCK_MS). */
   focusLockMs?: number;
+  /** Tests: the live touch's times (src/control.ts: releaseMs, quietMs, holdRepeatMs, ownerGraceMs). */
+  touch?: Pick<ControlOptions, 'releaseMs' | 'quietMs' | 'holdRepeatMs' | 'ownerGraceMs'>;
 }
 
 /** A phone someone watches (an open control socket or stream, or the focused one) is health-checked this often. */
@@ -174,8 +176,14 @@ export function createServer(backend: Backend, token: string, updater?: Updater,
   const wss = new WebSocketServer({ noServer: true, maxPayload: 1_000_000 });
   // natural touch, always (2026-11-16: no setting): the AI's taps and swipes move like a finger; a message with
   // `natural: false` (the owner's own whole tap or hold) stays exact
-  const control = new Control(backend, undefined, { natural: () => !extras.exactTouch, seed: extras.touchSeed });
-  control.onInput = (udid, discrete) => idle.activity(udid, discrete);
+  const control = new Control(backend, undefined, { natural: () => !extras.exactTouch, seed: extras.touchSeed, ...extras.touch });
+  // the owner's live press waits for a wake only when the phone is known to be locked: the look at a quiet phone's
+  // screen (a screenshot through WDA) runs beside it, never in front of it
+  control.onInput = (udid, discrete, live) => {
+    const locked = idle.state(udid).locked === true;
+    const waking = idle.activity(udid, discrete);
+    return live && !locked ? null : waking;
+  };
   if (idle.supported) control.power = { lock: (u) => idle.lock(u), wake: (u) => idle.wake(u) };
   // the first action after a quiet spell (and one that hung) has the phone's WDA probed and healed first
   if (backend.heal) control.onHeal = (udid, reason) => backend.heal!(udid, reason);
@@ -895,7 +903,10 @@ export function createServer(backend: Backend, token: string, updater?: Updater,
     // the phone is on show: health-checked every WATCH_MS, and its card's changes are pushed here as they happen
     const unattach = attach(udid);
     const uninfo = onInfo(udid, reply);
+    // the socket's own pings say its link is alive too (a finger of its held still stays down)
+    ws.on('ping', () => control.alive(owner));
     ws.on('message', (data, isBinary) => {
+      control.alive(owner);
       if (isBinary) return;
       const msg = parseObject(data);
       if (!msg) return reply({ type: 'ack', id: null, ok: false, error: 'message must be a JSON object' });

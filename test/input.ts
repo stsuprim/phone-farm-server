@@ -128,7 +128,7 @@ function fakeBackend(live: boolean, failLive: (phase: string) => boolean = () =>
 // ---- a viewer leaving mid-press lifts the finger on the phone ----
 {
   const { b, calls } = fakeBackend(true);
-  const c = new Control(b);
+  const c = new Control(b, undefined, { ownerGraceMs: 0 }) // no grace for another link to carry it on (test/drag.ts has that);
   const owner = {};
   await c.handle('P', { type: 'touch', phase: 'down', x: 10, y: 20 }, owner);
   c.release(owner);

@@ -123,7 +123,7 @@ const touch = (phase: string, x: number, y: number, seq: number, id = 1, t = seq
 
 // ---- no stuck fingers: a live touch with no event for the release time is lifted, and its owner told ----
 {
-  assert.equal(TOUCH_RELEASE_MS, 1500);
+  assert.equal(TOUCH_RELEASE_MS, 6000);
   const { b, calls } = slowPhone(0);
   const c = new Control(b, undefined, { releaseMs: 80 });
   const told: unknown[] = [];
@@ -140,7 +140,7 @@ const touch = (phase: string, x: number, y: number, seq: number, id = 1, t = seq
   assert.deepEqual(await c.handle('P', touch('up', 30, 30, 3, 9), owner), { via: 'buffered', stray: true }, 'its late up finds nothing to lift');
   assert.equal(c.meter.stats('P').touch.auto_released, 1);
   assert.equal(calls.length, 3);
-  ok('auto-release: no event for the release time (1.5 s) lifts the finger, tells the owner, counts it');
+  ok('auto-release: no event and nothing from the sender for the release time lifts the finger, tells the owner, counts it');
 }
 
 // ---- a down and an up are never refused, even with the phone's queue full ----
@@ -278,7 +278,7 @@ type Fake = ChildProcess & EventEmitter & { lines: Record<string, unknown>[]; ou
 {
   const token = crypto.randomBytes(16).toString('hex');
   const backend = new MockBackend(1, { live: true });
-  const server = createServer(backend, token);
+  const server = createServer(backend, token, undefined, { touch: { releaseMs: 1500, holdRepeatMs: 0 } });
   await new Promise<void>((r) => server.listen(0, '127.0.0.1', r));
   const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
   const auth = { authorization: `Bearer ${token}`, 'content-type': 'application/json' };

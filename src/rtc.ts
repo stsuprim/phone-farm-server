@@ -596,6 +596,7 @@ export class RtcSession {
       }
     };
     dc.onMessage((data) => {
+      this.control.alive(this); // its pings too: the channel is alive, so a finger held still stays down
       let msg: Record<string, unknown>;
       try {
         const v = JSON.parse(typeof data === 'string' ? data : Buffer.from(data as ArrayBuffer).toString('utf8'));
