@@ -32,6 +32,10 @@ export interface ServerExtras {
   version?: { commit: string | null; startedAt: string };
   /** How long after a switch of the live phone the one before is locked, if nobody watches it by then (ms; default FOCUS_LOCK_MS). */
   focusLockMs?: number;
+  /** How often the server pings a control socket (ms; default CONTROL_PING_MS; 0 = never). */
+  controlPingMs?: number;
+  /** A control socket nothing was heard from for this long is taken for dead and closed (ms; default CONTROL_DEAD_MS). */
+  controlDeadMs?: number;
   /** Tests: the live touch's times (src/control.ts: releaseMs, quietMs, holdRepeatMs, ownerGraceMs). */
   touch?: Pick<ControlOptions, 'releaseMs' | 'quietMs' | 'holdRepeatMs' | 'ownerGraceMs'>;
 }
@@ -43,6 +47,14 @@ export const WATCH_MS = 12_000;
  * (the viewer that switched has let go of it; another Lotus still on it keeps it awake and streaming).
  */
 export const FOCUS_LOCK_MS = 1500;
+/**
+ * The control socket's heartbeat (2026-11-16): the server pings each one every CONTROL_PING_MS, and one nothing at all
+ * was heard from for CONTROL_DEAD_MS (three beats and more: its pongs, its own pings, any message) is closed: a link
+ * that died without a word no longer counts as someone watching the phone (its capture and its live touch session
+ * would stay up for nobody). Never on one late beat: a jittery far link is left alone.
+ */
+export const CONTROL_PING_MS = 10_000;
+export const CONTROL_DEAD_MS = 35_000;
 /** Every this many watch ticks a watched phone's screen itself is looked at (dark with nothing said: iOS's Auto-Lock). */
 const DARK_EVERY = 4;
 
@@ -158,8 +170,6 @@ const flag = (v: string | null | undefined) => /^(1|true|yes)$/i.test(v ?? '');
 const ORIENT_POLL_MS = 3000;
 /** An MJPEG hello waits this long at most for the first frame (so it can say `connectMs`), then goes without it. */
 const MJPEG_HELLO_WAIT_MS = 1500;
-/** A warm-up keeps the phone's live touch channel open this long for the viewer that's about to come. */
-const WARM_INPUT_MS = 20_000;
 
 export function createServer(backend: Backend, token: string, updater?: Updater, extras: ServerExtras = {}): http.Server {
   const settings = extras.settings ?? new SettingsStore();
@@ -270,11 +280,24 @@ export function createServer(backend: Backend, token: string, updater?: Updater,
       return i ? [{ id: l.id, ...i }] : [];
     });
 
-  /** A phone's stats with its input part (latency + methods), its video path and its open sessions. */
+  // ---- the control link, counted (stats.controlLink): the sockets open now, how many opened and closed, how many
+  // of those were drops (not closed by the client: the link died or broke), and the last close with why ----
+  type LinkClose = { at: number; code: number; reason: string; why: 'client' | 'dropped' | 'dead'; livedMs: number };
+  const links = new Map<string, { open: number; opens: number; closes: number; drops: number; lastOpen: number | null; lastClose: LinkClose | null }>();
+  const linkOf = (udid: string) => {
+    let l = links.get(udid);
+    if (!l) links.set(udid, (l = { open: 0, opens: 0, closes: 0, drops: 0, lastOpen: null, lastClose: null }));
+    return l;
+  };
+
+  /** A phone's stats with its input part (latency + methods), its video path, its open sessions and its control link. */
   const withInput = <T extends object>(udid: string, stats: T | undefined) => {
     const s = (stats ?? {}) as Record<string, unknown>;
+    const { wda_link, ...rest } = s;
     return {
-      ...s,
+      ...rest,
+      // the control link: this server's sockets for the phone, and WDA's own link to it (missed checks, recoveries)
+      controlLink: { ...(links.get(udid) ?? { open: 0, opens: 0, closes: 0, drops: 0, lastOpen: null, lastClose: null }), wda: wda_link ?? null },
       // WDA's self-heals (a backend that never heals: none)
       heals: typeof s.heals === 'number' ? s.heals : 0,
       lastHeal: s.lastHeal ?? null,
@@ -291,6 +314,8 @@ export function createServer(backend: Backend, token: string, updater?: Updater,
     const pw = idle.state(p.udid);
     return {
       ...p, lan, tailnet, focused: p.udid === focused, locked: pw.locked, screenOn: pw.screenOn, lastActive: pw.lastActive,
+      // whether the phone's USB screen capture runs now: only while a live view of it is open (and a moment after)
+      capturing: backend.capturing?.(p.udid) ?? false,
       stats: withInput(p.udid, p.stats), info: info.peek(p),
     };
   };
@@ -304,22 +329,15 @@ export function createServer(backend: Backend, token: string, updater?: Updater,
   // the detail cards' data: gathered from the phone at most every ~15 s, off to the side of everything live
   const info = new InfoCache((udid) => (backend.facts ? backend.facts(udid) : Promise.reject(new Error('this backend has no device facts'))), wdaSigning);
   /**
-   * Get a phone ready for a viewer that's about to open it: its capture starts (or stays up), its live touch channel
-   * opens, and it wakes. Opening the live view then finds a picture at once.
+   * Get a phone ready for a viewer that's about to open it: it wakes. 2026-11-16: its capture is NOT started here any
+   * more (nor its live touch session): the phone's screen is captured only while a live view is open, from the
+   * viewer's own request (an rtc-offer, a stream) to a moment after the last one left, because iOS tells apps while
+   * it's captured. The answer says whether it runs now.
    */
   const warmUp = (udid: string, wake = true): WarmState => {
-    let state: WarmState;
-    try {
-      state = backend.warm?.(udid) ?? { capture: 'unavailable', reason: 'this backend starts its capture with the first viewer' };
-    } catch (err) {
-      state = { capture: 'unavailable', reason: err instanceof HttpError ? err.message : 'the capture could not be started' };
-    }
-    if (wake) {
-      const release = backend.warmInput?.(udid);
-      if (release) setTimeout(release, WARM_INPUT_MS).unref();
-      if (idle.supported) void idle.wake(udid, true).catch(() => {});
-    }
-    return state;
+    if (wake && idle.supported) void idle.wake(udid, true).catch(() => {});
+    if (!backend.capturing) return { capture: 'unavailable', reason: 'this backend starts its capture with the first viewer' };
+    return backend.capturing(udid) ? { capture: 'warm' } : { capture: 'off', reason: 'the capture runs only while a live view is open' };
   };
   /** 404 {error: "unknown phone"} or 503 offline, before a wake or lock. */
   const phoneFor = async (udid: string): Promise<PhoneInfo> => {
@@ -393,11 +411,10 @@ export function createServer(backend: Backend, token: string, updater?: Updater,
     focused = udid;
     let previous: { udid: string; slept: boolean; reason?: string } | null = null;
     if (prev && prev !== udid) {
+      // its capture isn't stopped from here: it ends by itself a moment after its last viewer left
       if (agent.busy(prev) || control.pending(prev) > 0) {
-        backend.stopCapture?.(prev, 'another phone is in focus');
         previous = { udid: prev, slept: false, reason: 'an agent action is running on it' };
       } else if (!idle.supported) {
-        backend.stopCapture?.(prev, 'another phone is in focus');
         previous = { udid: prev, slept: false, reason: 'this backend cannot lock phones' };
       } else {
         // 2026-11-16: a moment later, and only if nobody watches it by then: the viewer that switched has closed its
@@ -407,7 +424,6 @@ export function createServer(backend: Backend, token: string, updater?: Updater,
         const sleepPrev = () => {
           if (focused === prev) return;
           if (attached.has(prev)) return void console.log(`[focus] ${prev.slice(-8)} stays awake: someone is watching it`);
-          backend.stopCapture?.(prev, 'another phone is in focus');
           if (agent.busy(prev) || control.pending(prev) > 0) return;
           void control.handle(prev, { type: 'key', key: 'lock' }).then(
             () => console.log(`[focus] ${prev.slice(-8)} is asleep`),
@@ -447,8 +463,6 @@ export function createServer(backend: Backend, token: string, updater?: Updater,
               if (backend.isLocked) idle.note(udid, await backend.isLocked(udid, quick).catch(() => null));
             })
             .catch(() => {});
-          // the focused phone's capture stays warm while a viewer is attached (its view can reopen at once)
-          if (udid === focused && attached.has(udid) && !(p.stats?.viewers ?? 0)) warmUp(udid, false);
           info.peek(p); // the card gathers again when it's ~15 s old: a change is pushed (info.onChange)
         }),
       );
@@ -889,8 +903,32 @@ export function createServer(backend: Backend, token: string, updater?: Updater,
     const releaseInput = backend.warmInput?.(udid);
     // ...and it's activity: the phone wakes and isn't idle-locked while the view is open
     const releaseIdle = idle.viewer(udid);
-    // ...and its picture is about to be asked for (the rtc-offer follows): the capture starts now, not then
-    warmUp(udid, false);
+    // (the capture starts with the viewer's own rtc-offer, not here: it runs only under a picture someone asked for)
+    const link = linkOf(udid);
+    const opened = Date.now();
+    link.open++;
+    link.opens++;
+    link.lastOpen = opened;
+    let heard = opened;
+    let dead = false;
+    const pingMs = extras.controlPingMs ?? CONTROL_PING_MS;
+    const deadMs = extras.controlDeadMs ?? CONTROL_DEAD_MS;
+    const beat = pingMs > 0
+      ? setInterval(() => {
+          if (Date.now() - heard >= deadMs) {
+            // nothing for several beats: the link died without saying so
+            dead = true;
+            console.log(`[control ${udid.slice(-8)}] nothing heard for ${Math.round((Date.now() - heard) / 1000)} s: closing the dead link`);
+            return void ws.terminate();
+          }
+          if (ws.readyState === WebSocket.OPEN) ws.ping();
+        }, pingMs)
+      : undefined;
+    beat?.unref();
+    ws.on('pong', () => {
+      heard = Date.now();
+      control.alive(owner);
+    });
     const unlist = addLive(udid, () => {
       const i = rtc.info();
       return i ? { path: 'h264' as const, transport: 'webrtc' as const, ...i } : null;
@@ -904,8 +942,12 @@ export function createServer(backend: Backend, token: string, updater?: Updater,
     const unattach = attach(udid);
     const uninfo = onInfo(udid, reply);
     // the socket's own pings say its link is alive too (a finger of its held still stays down)
-    ws.on('ping', () => control.alive(owner));
+    ws.on('ping', () => {
+      heard = Date.now();
+      control.alive(owner);
+    });
     ws.on('message', (data, isBinary) => {
+      heard = Date.now();
       control.alive(owner);
       if (isBinary) return;
       const msg = parseObject(data);
@@ -915,7 +957,18 @@ export function createServer(backend: Backend, token: string, updater?: Updater,
       // actions answer {type: "ack", id, ...}; a live touch with `seq` answers {ack: seq, ok, ms}
       void agent.dispatch(udid, msg, owner).then((answer) => answer && reply(answer));
     });
-    const done = () => {
+    let closed = false;
+    const done = (code = 1006, reason = '') => {
+      if (closed) return;
+      closed = true;
+      if (beat) clearInterval(beat);
+      // counted: closed by the client (a close frame: 1000, 1001, or none given: 1005), or dropped (no close frame,
+      // an error), or found dead by the heartbeat
+      const why = dead ? 'dead' : code === 1000 || code === 1001 || code === 1005 ? 'client' : 'dropped';
+      link.open = Math.max(0, link.open - 1);
+      link.closes++;
+      if (why !== 'client') link.drops++;
+      link.lastClose = { at: Date.now(), code, reason: reason.slice(0, 120), why, livedMs: Date.now() - opened };
       control.release(owner);
       rtc.close();
       releaseInput?.();
@@ -926,8 +979,8 @@ export function createServer(backend: Backend, token: string, updater?: Updater,
       unattach();
       uninfo();
     };
-    ws.on('close', done);
-    ws.on('error', done);
+    ws.on('close', (code, reason) => done(code, reason?.toString() ?? ''));
+    ws.on('error', (err) => done(1006, err.message));
   }
 
   server.on('close', () => {

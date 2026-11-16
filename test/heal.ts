@@ -319,7 +319,7 @@ const fakeSpawn = ((cmd: string, args: string[]) => {
     assert.deepEqual([f2.body.focused, f2.body.previous], [b2, { udid: a, slept: false, reason: 'locking' }]);
     for (let i = 0; i < 50 && !(await backend.isLocked(a!)); i++) await sleep(20);
     assert.equal(await backend.isLocked(a!), true, 'the previous phone is asleep');
-    assert.deepEqual(stopped, [`${a} another phone is in focus`]);
+    assert.deepEqual(stopped, [], 'its capture is not stopped from here: it ends by itself a moment after its last viewer left');
     assert.deepEqual((await get('/phones')).map((p: any) => p.focused), [false, true, false]);
     assert.equal((await post('/phones/NOPE/focus')).status, 404);
 

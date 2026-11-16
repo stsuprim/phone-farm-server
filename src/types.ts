@@ -71,9 +71,13 @@ export interface DeviceInfo {
 /** The phone's own part of DeviceInfo, as a backend gathers it (the server adds `wda`, `at`, `fresh`). */
 export type PhoneFacts = Omit<DeviceInfo, 'wda' | 'at' | 'fresh'>;
 
-/** How ready a phone's capture is for a viewer (POST /warm): running with a picture, starting, or why it can't. */
+/**
+ * A phone's capture as POST /warm and /focus say it (2026-11-16: neither starts it any more; it runs only while a
+ * live view is open): "warm" a view is open and it has a picture, "starting" it's on its way up for one, "off" nobody
+ * is watching, "unavailable" this backend can't say.
+ */
 export interface WarmState {
-  capture: 'warm' | 'starting' | 'unavailable';
+  capture: 'warm' | 'starting' | 'off' | 'unavailable';
   reason?: string;
 }
 
@@ -137,6 +141,8 @@ export interface StreamStats {
   sessions?: SessionStats[];
   /** The capture's picture doesn't have the phone's shape (wide against tall) and couldn't be put right: why. */
   capture_mismatch?: string | null;
+  /** WDA's own link (src/wda.ts linkHealth): the state as told and as it is, missed liveness checks, recoveries, restarts. */
+  wda_link?: unknown;
   /** WDA self-heals since the server started (a session remade, WDA restarted, a port forward respawned). */
   heals?: number;
   /** The last self-heal: when (ms since the epoch) and why; null when there was none. */
@@ -275,11 +281,8 @@ export interface Backend {
   restartWda?(udid: string): void;
   /** The detail card's facts, asked from the phone now (never throws for a known phone: unknown parts are null). */
   facts?(udid: string): Promise<PhoneFacts>;
-  /**
-   * Start the phone's capture ahead of its first viewer (it then runs for the warm time unless one comes): opening a
-   * live view finds a picture at once.
-   */
-  warm?(udid: string): WarmState;
+  /** Whether the phone's USB screen capture runs right now (it does only while a live view is open, and a moment after). */
+  capturing?(udid: string): boolean;
   /**
    * A gesture or text that was answered when it was queued on the phone and then failed while playing, since `since`
    * (Date.now()): what went wrong, else null.
@@ -294,7 +297,7 @@ export interface Backend {
   heal?(udid: string, reason: string): Promise<boolean>;
   /** Tell the backend which phones are being watched (their health check probes the session itself). */
   setWatched?(fn: (udid: string) => boolean): void;
-  /** Stop the phone's capture now (another phone took the focus): no warm time; its viewers are told why. */
+  /** Stop the phone's capture now, whoever watches it; its viewers are told why. */
   stopCapture?(udid: string, why: string): void;
   /** Subscribe to image frames. Returns unsubscribe and the settings actually used. Throws HttpError if unknown/not ready. */
   subscribe(

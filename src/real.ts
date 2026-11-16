@@ -1,5 +1,4 @@
 import { execFile } from 'node:child_process';
-import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -8,14 +7,14 @@ import { parseInstalled, withKnown } from './apps.js';
 import { Config } from './config.js';
 import { jpegMaybeBlack, pngIsBlack, wakeScreen } from './dark.js';
 import { H264Info, H264Source, helperProducer, phoneStats, StartProducer } from './h264.js';
-import { imageSize } from './imgsize.js';
 import { basicFacts, mergeBattery, parseActiveApp, parseBatteryDomain, parseDeviceInfo, parseIoreg, parseWdaBattery } from './info.js';
-import { PhonecapHost, profileFor, THUMB_DEFAULT_FPS } from './lanes.js';
+import { PhonecapHost, profileFor } from './lanes.js';
 import { HidHost, HidPartial, hidPlayMs, HidTimeout, hidTypable, iosMajor, toHid } from './hid.js';
 import type { InputResult } from './inputlog.js';
 import { MjpegSource } from './mjpeg.js';
 import { frameAgrees, Orientation, Size } from './orient.js';
-import { AppInfo, Backend, ButtonName, ControlState, H264Want, HttpError, Image, ImageFormat, InputMethods, PathPoint, PhoneFacts, PhoneInfo, ScreenInfo, StreamSettings, WarmState } from './types.js';
+import { still, stillHash, StillSource } from './stills.js';
+import { AppInfo, Backend, ButtonName, ControlState, H264Want, HttpError, Image, ImageFormat, InputMethods, PathPoint, PhoneFacts, PhoneInfo, ScreenInfo, StreamSettings } from './types.js';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..'); // src/ or dist/ -> project root
 // inside a minimal app bundle so macOS gives it its own Camera (TCC) entry (scripts/build-native.mjs)
@@ -28,6 +27,13 @@ const HID_SCRIPT = path.join(ROOT, 'native', 'hid', 'hid_input.py');
 // the venv RINOR_TAP_CHECK.md makes; HID_PYTHON wins
 const HID_VENV_PYTHON = path.join(os.homedir(), '.phonefarm-hid', 'bin', 'python');
 const HID_RETRY_MS = 60000;
+/**
+ * 2026-11-16: a phone's USB screen capture runs only while a live view of it is open. It starts with the first viewer
+ * and stops this long after the last one left (long enough for a page to redraw or a WebRTC session to be made anew,
+ * no longer): iOS tells apps while the screen is captured (UIScreen.isCaptured), so it's never kept warm, started
+ * ahead or kept for the phone in focus. The live touch session (HID) goes by the same rule.
+ */
+export const CAPTURE_GRACE_MS = 2500;
 /** How long a picture may disagree with the phone's orientation (wide against tall) before the capture starts over. */
 const CAPTURE_SETTLE_MS = 1200;
 const CAPTURE_RESTARTS = 2;
@@ -281,7 +287,13 @@ export class RealBackend implements Backend {
       ...phoneStats(srcs, { fps: m?.viewers ? m.meter.rate() : 0, viewers: m?.viewers ?? 0 }, reason, this.buildError()),
       capture_mismatch: this.capture.get(udid)?.mismatch ?? null,
       ...this.wda.healStats(udid),
+      wda_link: this.wda.linkHealth(udid),
     };
+  }
+
+  /** Whether the phone's USB screen capture runs right now (a live view is open, or closed a moment ago). */
+  capturing(udid: string): boolean {
+    return !!this.hosts.get(udid)?.running || this.phoneSources(udid).some((s) => s.running);
   }
 
   /** The last phonecap build's error while an older helper still runs, else null. */
@@ -341,9 +353,9 @@ export class RealBackend implements Backend {
         start = host.start;
       } else start = helperProducer(HELPER, args, tag);
       const kind = prof.thumb ? 'thumb' : prof.remote ? 'remote' : 'lan';
-      // kept running a while after its last viewer (CAPTURE_WARM_SECONDS): coming back to a phone shows it at once
+      // it stops a moment after its last viewer left (CAPTURE_GRACE_MS): never kept warm
       src = new H264Source(lanes ? `${tag} ${kind}` : tag, start, prof.settings, {
-        kind, onInfo: (info) => this.captureInfo(udid, info), idleMs: (this.cfg.captureWarmSeconds ?? 120) * 1000,
+        kind, onInfo: (info) => this.captureInfo(udid, info), idleMs: CAPTURE_GRACE_MS,
       });
       this.h264Sources.set(key, src);
     }
@@ -351,29 +363,6 @@ export class RealBackend implements Backend {
     if (down) return down;
     src.setWant(prof.settings);
     return src;
-  }
-
-  /**
-   * Start the phone's capture ahead of its first viewer. The slow part of opening a live view is the capture itself
-   * (the helper starting, the phone's screen showing up as a capture device); with a lanes helper that's one process
-   * per phone whatever the lane, so a thumbnail lane (the cheapest encoder) started now means the viewer's own lane
-   * is only added to a running capture. It stops by itself after the warm time unless a viewer came.
-   */
-  warm(udid: string): WarmState {
-    this.known(udid);
-    const problem = this.helperProblem();
-    if (problem) return { capture: 'unavailable', reason: problem };
-    if (!helperCaps().includes('lanes')) {
-      // one shared encoder, set by its first viewer: starting it here would fix that viewer's size
-      const s = this.h264Sources.get(udid);
-      if (s?.ready) s.warm();
-      return s?.ready ? { capture: 'warm' } : { capture: 'unavailable', reason: 'this capture helper is an older build (no lanes): it starts with the first viewer' };
-    }
-    const was = this.phoneSources(udid).some((s) => s.ready);
-    const src = this.h264(udid, { tier: 'thumb', fps: THUMB_DEFAULT_FPS, scale: 100, quality: null });
-    if (typeof src === 'string') return { capture: 'unavailable', reason: src };
-    src.warm();
-    return { capture: was ? 'warm' : 'starting' };
   }
 
   // ---- the detail card (src/info.ts) ----
@@ -434,19 +423,26 @@ export class RealBackend implements Backend {
     return s;
   }
 
+  /**
+   * The phone's stills (src/stills.ts): WDA's own screenshots, never the USB capture's frames. `soft`: the PNG is
+   * asked without ever recovering WDA (the server's own looks at the screen).
+   */
+  private stills(udid: string, soft = false): StillSource {
+    return {
+      mjpeg: this.wda.mjpegAvailable(udid) ? (maxAgeMs, waitMs) => this.source(udid).grab(maxAgeMs, waitMs) : null,
+      png: async (timeoutMs) => {
+        const j = soft ? await this.wda.callSoft(udid, 'GET', '/screenshot', undefined, timeoutMs ?? DARK_SHOT_MS) : await this.wda.callNoSession(udid, 'GET', '/screenshot', undefined, timeoutMs);
+        if (typeof j?.value !== 'string') throw new HttpError(502, 'WDA gave no screenshot');
+        return Buffer.from(j.value, 'base64');
+      },
+      orientation: () => this.wda.orientation(udid),
+    };
+  }
+
+  /** One still: WDA's screenshot (JPEG from its MJPEG server when it has one, else its PNG). Never the live capture. */
   async screenshot(udid: string, format: ImageFormat): Promise<Image> {
     this.known(udid);
-    if (format === 'jpeg') {
-      // grab one frame from the MJPEG stream
-      const jpeg = await new Promise<Buffer>((resolve, reject) => {
-        const t = setTimeout(() => { off(); reject(new HttpError(504, 'no MJPEG frame within 5s')); }, 5000);
-        const off = this.source(udid).add((f) => { clearTimeout(t); off(); resolve(f); });
-      });
-      // an older WDA's MJPEG frames stay the panel's (sideways in landscape): its PNG route turns its own
-      if (frameAgrees(imageSize(jpeg), this.wda.orientation(udid))) return { data: jpeg, contentType: 'image/jpeg' };
-    }
-    const j = await this.wda.callNoSession(udid, 'GET', '/screenshot');
-    return { data: Buffer.from(String(j.value), 'base64'), contentType: 'image/png' };
+    return still(this.stills(udid), format);
   }
 
   // ---- input (docs/BEST_METHOD.md): CoreDevice HID when the phone's session is open, else WDA (fast route first) ----
@@ -467,7 +463,7 @@ export class RealBackend implements Backend {
     if (!h) {
       const python = process.env.HID_PYTHON ? this.cfg.hidPython : fs.existsSync(HID_VENV_PYTHON) ? HID_VENV_PYTHON : this.cfg.hidPython;
       h = new HidHost(udid, {
-        python, script: HID_SCRIPT, idleMs: this.cfg.hidIdleSeconds * 1000, retryMs: HID_RETRY_MS,
+        python, script: HID_SCRIPT, idleMs: CAPTURE_GRACE_MS, retryMs: HID_RETRY_MS,
         // a path or text answered "queued" that then failed on the phone: the report of that action says so
         onDone: (op, reply) => {
           if (!reply.ok) this.playFails.set(udid, { at: Date.now(), error: `the ${op === 'type' ? 'text' : 'gesture'} broke off on the phone (HID: ${reply.error ?? 'unknown'})` });
@@ -496,6 +492,9 @@ export class RealBackend implements Backend {
       if (mode === 'swap') o = o === 'landscape-left' ? 'landscape-right' : o === 'landscape-right' ? 'landscape-left' : o;
     }
     if (h.ready()) return { h, s, o };
+    // its touch session is a media session on the phone: opened only while a live view holds it (warmInput), never
+    // for an agent's tap on a phone nobody watches (WDA takes that)
+    if (!h.held) return { why: 'HID live touch opens with a live view (nobody is watching this phone)' };
     h.kick(); // open it for the next one; WDA takes this one
     return { why: `HID is ${h.state}${h.reason ? ` (${h.reason})` : ''}` };
   }
@@ -637,11 +636,10 @@ export class RealBackend implements Backend {
     return { via: 'wda' };
   }
 
-  /** A hash of the newest MJPEG frame (WDA's screenshots: identical screens give identical bytes); null without one. */
+  /** A hash of a still (WDA's own screenshot: identical screens give identical bytes); null without one. Never the live capture. */
   async frameHash(udid: string): Promise<string | null> {
     if (!this.phones.get(udid)?.online || this.wda.status(udid) !== 'ready') return null;
-    const f = await this.source(udid).grab(150, 1500);
-    return f ? crypto.createHash('sha1').update(f).digest('hex').slice(0, 16) : null;
+    return stillHash(this.stills(udid, true));
   }
   async home(udid: string): Promise<InputResult> {
     this.known(udid);
@@ -709,15 +707,15 @@ export class RealBackend implements Backend {
    */
   private async dark(udid: string): Promise<boolean | null> {
     if (!this.phones.get(udid)?.online || this.wda.status(udid) !== 'ready') return null;
+    const s = this.stills(udid, true);
     try {
-      const f = await this.source(udid).grab(300, 900);
+      const f = s.mjpeg ? await s.mjpeg(300, 900) : null;
       if (f && jpegMaybeBlack(f) === false) return false;
     } catch {
       /* no MJPEG frame: the screenshot says */
     }
     try {
-      const j = await this.wda.callSoft(udid, 'GET', '/screenshot', undefined, DARK_SHOT_MS);
-      return typeof j?.value === 'string' ? pngIsBlack(Buffer.from(j.value, 'base64')) : null;
+      return pngIsBlack(await s.png(DARK_SHOT_MS));
     } catch {
       return null;
     }
@@ -771,7 +769,7 @@ export class RealBackend implements Backend {
     this.wda.watched = fn;
   }
 
-  /** Stop the phone's capture now (another phone took the focus): no warm time, its viewers are told why. */
+  /** Stop the phone's capture now, whoever watches it: its viewers are told why. */
   stopCapture(udid: string, why: string): void {
     if (this.phoneSources(udid).length || this.hosts.has(udid)) console.log(`[capture ${udid.slice(-8)}] stopped: ${why}`);
     this.closeH264(udid, why);

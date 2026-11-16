@@ -16,6 +16,8 @@ type Kind = 'unreachable' | 'session' | 'server' | 'rejected' | 'unknown';
 
 export class WdaError extends HttpError {
   named = false;
+  /** No answer came in time (WDA may only be busy: it works one request at a time), rather than a refused connection. */
+  timeout = false;
   constructor(public kind: Kind, message: string) {
     super(502, message);
   }
@@ -63,6 +65,18 @@ interface Entry {
   inflight: number;
   /** A liveness probe in progress (shared by everyone asking). */
   probeP?: Promise<boolean>;
+  /** Requests of any kind on their way to WDA now (card reads, the orientation, a lock, a screenshot: all of them). */
+  busy: number;
+  /** When WDA last answered anything at all, whatever it said (Date.now()). */
+  lastAnswer: number;
+  /** Liveness checks in a row that got no answer in time, and when the first of them was. */
+  misses: number;
+  missAt: number;
+  /** When `control` last left "ready" (state() says so only once that lasted: a blip is never shown). */
+  unreadyAt: number;
+  /** Recoveries and runner restarts so far, and why the last recovery ran (stats). */
+  recoveries: number;
+  runnerRestarts: number;
 }
 
 /** One self-heal: when (ms since the epoch) and why. */
@@ -81,8 +95,29 @@ export interface WdaTimeouts {
   probe: number;
   /** How long a restarted runner gets to come back. */
   restart: number;
+  /** A recovery's first ask of /status (ms; default STATUS_MS); the two asks after it get half as long again. */
+  status?: number;
+  /** Liveness checks in a row with no answer in time before WDA counts as down (default MISSES)... */
+  misses?: number;
+  /** ...and only when they span at least this long (ms; default MISS_SPAN_MS). */
+  missSpan?: number;
+  /** A control state other than "ready" is said only once it lasted this long (ms; default CONTROL_DEBOUNCE_MS). */
+  debounce?: number;
 }
 export const DEFAULT_TIMEOUTS: WdaTimeouts = { input: 8000, launch: 20000, probe: 3000, restart: 90000 };
+/**
+ * 2026-11-16, the control link that kept failing and recovering: WDA works one request at a time, and one liveness
+ * check that got no answer in 3 s (it waited behind a screenshot, a lock, a card read, the orientation) counted as a
+ * dead WDA: its session was dropped, and when /status then waited behind the same request (2.5 s) its runner was
+ * restarted on the phone (half a minute of "Recovering"). Now WDA counts as down only after MISSES liveness checks
+ * in a row over MISS_SPAN_MS got no answer while nothing else answered either; a recovery asks /status three times
+ * before it restarts anything and keeps a session that still answers; and a state that isn't "ready" is said only
+ * once it lasted CONTROL_DEBOUNCE_MS. A refused connection (WDA isn't listening at all) still recovers at once.
+ */
+export const MISSES = 3;
+export const MISS_SPAN_MS = 15_000;
+export const STATUS_MS = 2500;
+export const CONTROL_DEBOUNCE_MS = 4000;
 
 const newAgent = () => new http.Agent({ keepAlive: true, maxSockets: 6 });
 type HttpErr = Error & { code?: string };
@@ -181,15 +216,55 @@ export class WdaManager {
     return { heals: e?.heals ?? 0, lastHeal: e?.lastHeal ?? null };
   }
 
+  /**
+   * How WDA's own link is doing, for the phone's stats (`stats.controlLink.wda`): the state as told (debounced) and
+   * as it is, liveness checks missed in a row, recoveries and runner restarts so far, ms since WDA last answered.
+   */
+  linkHealth(udid: string): { state: ControlState; raw: ControlState; misses: number; recoveries: number; runnerRestarts: number; answeredMsAgo: number | null; busy: number } | null {
+    const e = this.entries.get(udid);
+    if (!e) return null;
+    return {
+      state: this.state(udid), raw: !e.wanted ? 'down' : e.status === 'starting' ? 'recovering' : e.status !== 'ready' ? 'down' : e.control,
+      misses: e.misses, recoveries: e.recoveries, runnerRestarts: e.runnerRestarts,
+      answeredMsAgo: e.lastAnswer ? Date.now() - e.lastAnswer : null, busy: e.busy + e.inflight,
+    };
+  }
+
+  /** `control` changes here, so when it left "ready" is known (state() says a state only once it lasted). */
+  private setControl(e: Entry, c: ControlState): void {
+    if (c !== 'ready' && e.control === 'ready') e.unreadyAt = Date.now();
+    e.control = c;
+  }
+
+  /**
+   * A liveness check got no answer. True when WDA now counts as down: the connection was refused (nothing listens), or
+   * this is the `misses`-th check in a row without an answer in time, over `missSpan`, with nothing else answered
+   * meanwhile (any answer at all clears the count: src request()).
+   */
+  private missed(e: Entry, err: unknown): boolean {
+    if (!(err instanceof WdaError) || !err.timeout) return true;
+    const now = Date.now();
+    if (!e.misses) e.missAt = now;
+    e.misses++;
+    const down = e.misses >= (this.timeouts.misses ?? MISSES) && now - e.missAt >= (this.timeouts.missSpan ?? MISS_SPAN_MS);
+    if (!down && e.misses === 1) this.log(e, `a liveness check got no answer in time (${err.message}); WDA may only be busy, checking again`);
+    return down;
+  }
+
   status(udid: string): WdaStatus {
     return this.entries.get(udid)?.status ?? 'stopped';
   }
-  /** ready = session warm; recovering = WDA starting or session being remade; down = not running / gave up. */
+  /**
+   * ready = session warm; recovering = WDA starting or session being remade; down = not running / gave up. A session
+   * being remade or checked says "ready" until that has lasted `debounce`: a hiccup that heals in a moment is never
+   * shown as the link going down and coming back.
+   */
   state(udid: string): ControlState {
     const e = this.entries.get(udid);
     if (!e || !e.wanted) return 'down';
     if (e.status === 'starting') return 'recovering';
     if (e.status !== 'ready') return 'down';
+    if (e.control !== 'ready' && Date.now() - e.unreadyAt < (this.timeouts.debounce ?? CONTROL_DEBOUNCE_MS)) return 'ready';
     return e.control;
   }
   /** The screen in points, upright: as the phone is turned now (844 x 390 in landscape). */
@@ -199,6 +274,13 @@ export class WdaManager {
   }
   orientation(udid: string): Orientation | null {
     return this.entries.get(udid)?.orientation ?? null;
+  }
+  /**
+   * Whether this phone's WDA has its MJPEG server (WDA's screenshots as a JPEG stream; stock WDA: yes). A WDA built
+   * without it gives stills as PNG screenshots only (src/stills.ts asks here).
+   */
+  mjpegAvailable(_udid: string): boolean {
+    return true;
   }
   mjpegPort(udid: string): number {
     const e = this.entries.get(udid);
@@ -214,6 +296,7 @@ export class WdaManager {
       udid, wdaPort: this.cfg.wdaBasePort + n, mjpegPort: this.cfg.mjpegBasePort + n, status: 'starting', control: 'recovering',
       wanted: true, procs: [], restarts: 0, checking: false, lastOk: 0, orientation: null, orientAt: 0, tapRoute: 0, fast: 'unknown', fastFails: 0,
       mjpeg: { ...DEFAULT_MJPEG }, agent: newAgent(), heals: 0, lastHeal: null, inflight: 0,
+      busy: 0, lastAnswer: 0, misses: 0, missAt: 0, unreadyAt: 0, recoveries: 0, runnerRestarts: 0,
     };
     e.wanted = true;
     this.entries.set(udid, e);
@@ -255,6 +338,7 @@ export class WdaManager {
     if (!e.wanted) return;
     this.killProcs(e);
     e.restarts++;
+    e.runnerRestarts++;
     this.launch(e);
   }
 
@@ -346,7 +430,7 @@ export class WdaManager {
           this.log(e, 'ready');
           try {
             await this.session(e);
-            e.control = 'ready';
+            this.setControl(e, 'ready');
           } catch (err) {
             this.log(e, `could not make a session yet: ${(err as Error).message}`);
           }
@@ -365,8 +449,17 @@ export class WdaManager {
    * connection the other side had already closed is retried once on a fresh one, so a stale socket never looks
    * like WDA being down (which would trigger a session recovery).
    */
-  private request(e: Entry, method: string, p: string, body: string | undefined, timeout: number): Promise<{ status: number; text: string }> {
-    return this.requestOnce(e, method, p, body, timeout, false);
+  private async request(e: Entry, method: string, p: string, body: string | undefined, timeout: number): Promise<{ status: number; text: string }> {
+    e.busy++;
+    try {
+      const r = await this.requestOnce(e, method, p, body, timeout, false);
+      // any answer at all, whatever it says: WDA is there
+      e.lastAnswer = Date.now();
+      e.misses = 0;
+      return r;
+    } finally {
+      e.busy--;
+    }
   }
 
   private requestOnce(e: Entry, method: string, p: string, body: string | undefined, timeout: number, retried: boolean): Promise<{ status: number; text: string }> {
@@ -411,7 +504,9 @@ export class WdaManager {
     } catch (err) {
       const x = err as HttpErr;
       const why = x.code === 'TIMEOUT' ? `no answer within ${Math.round(timeout / 1000)}s` : `unreachable (${x.code ?? x.message})`;
-      throw new WdaError('unreachable', why);
+      const werr = new WdaError('unreachable', why);
+      werr.timeout = x.code === 'TIMEOUT';
+      throw werr;
     }
     res.ok = res.status >= 200 && res.status < 300;
     const text = res.text;
@@ -520,7 +615,7 @@ export class WdaManager {
     e.mjpegApplied = undefined;
     void this.session(e).then(
       () => {
-        e.control = 'ready';
+        this.setControl(e, 'ready');
       },
       () => {},
     );
@@ -640,22 +735,55 @@ export class WdaManager {
     return e;
   }
 
-  /** Recreate the session; restart the WDA runner if WDA itself doesn't answer. Shared by concurrent callers. */
-  private recover(e: Entry, why: string): Promise<void> {
+  /**
+   * Find out what's wrong and fix only that. WDA is asked /status up to three times (one slow answer isn't a dead
+   * WDA; a port forward that just exited is back within a second): only a WDA that never answers has its runner
+   * restarted. A WDA that answers keeps its session when that still answers too; one that's gone (`sessionGone`: WDA
+   * said so itself) is made anew. Shared by concurrent callers.
+   */
+  private recover(e: Entry, why: string, sessionGone = false): Promise<void> {
     if (e.recovering) return e.recovering;
     const run = (async () => {
-      e.control = 'recovering';
-      e.sessionId = undefined;
-      e.mjpegApplied = undefined;
+      this.setControl(e, 'recovering');
+      e.recoveries++;
+      e.misses = 0;
       this.healed(e, `recovering: ${why}`);
       let restarted = false;
-      if (!(await this.ping(e, 2500)).ok) {
-        this.log(e, 'WDA is not answering; restarting it');
+      const first = this.timeouts.status ?? STATUS_MS;
+      let alive = false;
+      for (const ms of [first, first * 1.5, first * 1.5]) {
+        if (!e.wanted || e.status !== 'ready') break;
+        const t0 = Date.now();
+        if ((await this.ping(e, ms)).ok) {
+          alive = true;
+          break;
+        }
+        // refused at once (nothing listens, or its forward is being started again): a moment before the next ask
+        if (Date.now() - t0 < 700) await sleep(Math.min(700, first / 3));
+      }
+      if (!alive && e.wanted && e.status === 'ready') {
+        this.log(e, 'WDA is not answering (/status asked three times); restarting it');
         this.restart(e);
         restarted = true;
       }
       if (e.status !== 'ready') await this.waitReady(e, restarted ? this.timeouts.restart : 45000);
       if (e.status !== 'ready') throw new WdaError('unreachable', `WebDriverAgent did not come back (${e.status})`);
+      // WDA answers. Its session is kept when it still answers too; dropped when it's gone, or when it says nothing
+      const sid = e.sessionId;
+      if (sid && !restarted) {
+        let gone = sessionGone;
+        if (!gone) {
+          try {
+            await this.raw(e, 'GET', `/session/${sid}`, undefined, this.timeouts.probe * 2);
+          } catch (err) {
+            gone = !(err instanceof WdaError) || err.down || err.kind === 'session' || (await this.sessionExpired(e, sid));
+          }
+        }
+        if (gone && e.sessionId === sid) {
+          e.sessionId = undefined;
+          e.mjpegApplied = undefined;
+        }
+      }
       try {
         await this.session(e);
       } catch (err) {
@@ -667,12 +795,12 @@ export class WdaManager {
         if (e.status !== 'ready') throw new WdaError('unreachable', `WebDriverAgent did not come back (${e.status})`);
         await this.session(e);
       }
-      e.control = 'ready';
+      this.setControl(e, 'ready');
       this.log(e, 'recovered');
     })();
     e.recovering = run
       .catch((err) => {
-        e.control = 'down';
+        this.setControl(e, 'down');
         this.log(e, `recovery failed: ${(err as Error).message}`);
         throw err;
       })
@@ -700,7 +828,7 @@ export class WdaManager {
     } catch (err) {
       if (!(err instanceof WdaError) || !err.down) throw this.named(e, err);
       try {
-        await this.recover(e, err.message);
+        await this.recover(e, err.message, err.kind === 'session');
       } catch (err2) {
         throw this.named(e, err2 instanceof WdaError ? err2 : err);
       }
@@ -751,7 +879,7 @@ export class WdaManager {
         if (!(err instanceof WdaError) || err.down || !(await this.sessionExpired(e, sid))) throw err;
         this.healed(e, `the session expired (${err.message}); making a new one`);
         const r = await this.raw(e, method, `/session/${await this.session(e)}${sub}`, body, timeout);
-        e.control = 'ready';
+        this.setControl(e, 'ready');
         return r;
       }
     });
@@ -853,9 +981,10 @@ export class WdaManager {
     if (e.status === 'starting') await this.waitReady(e, 45000);
     if (e.recovering) await e.recovering.catch(() => {});
     if (e.status !== 'ready') return false;
-    // an action or read is on its way to WDA (a long gesture, a big /source): WDA works one thing at a time, so a
-    // probe now would only wait behind it and look like a hang; that action finds out for itself
-    if (e.inflight > 0) return true;
+    // something is on its way to WDA (a long gesture, a big /source, a screenshot, a lock, a card's read): WDA
+    // works one thing at a time, so a probe now would only wait behind it and look like a hang; that request finds
+    // out for itself.
+    if (e.inflight > 0 || e.busy > 0) return true;
     const sid = e.sessionId;
     try {
       if (!sid) {
@@ -869,10 +998,12 @@ export class WdaManager {
         }
       }
       e.lastOk = Date.now();
-      e.control = 'ready';
+      this.setControl(e, 'ready');
       return true;
     } catch (err) {
       if (!(err instanceof WdaError)) throw err;
+      // no answer in time, once: WDA may only be busy. It counts as down after several in a row (missed())
+      if (err.down && !this.missed(e, err)) return true;
       if (!sid) {
         await this.recover(e, `${reason}: no session could be made (${err.message})`);
       } else if (err.kind === 'session' || (!err.down && (await this.sessionExpired(e, sid)))) {
@@ -894,7 +1025,7 @@ export class WdaManager {
         await this.recover(e, `${reason}: ${err.message}`);
       }
       e.lastOk = Date.now();
-      e.control = 'ready';
+      this.setControl(e, 'ready');
       return true;
     }
   }
@@ -1010,7 +1141,8 @@ export class WdaManager {
   private healthCheck(): void {
     for (const e of this.entries.values()) {
       if (!e.wanted || e.status !== 'ready' || e.recovering || e.checking) continue;
-      if (e.sessionId && Date.now() - e.lastOk < HEALTH_MS - 1000) continue;
+      if (e.sessionId && Date.now() - Math.max(e.lastOk, e.lastAnswer) < HEALTH_MS - 1000) continue; // it answered lately
+      if (e.inflight > 0 || e.busy > 0) continue; // busy with something: that request finds out for itself
       e.checking = true;
       if (this.watched?.(e.udid)) {
         // someone is looking at this phone: ask the session itself, not just /status
@@ -1022,7 +1154,10 @@ export class WdaManager {
       void (async () => {
         const st = await this.ping(e, 3000);
         if (!st.ok) {
-          await this.recover(e, 'health check: /status did not answer').catch(() => {});
+          // once isn't down: several in a row are (a /status that waited behind a slow request answers the next time)
+          const quiet = new WdaError('unreachable', '/status did not answer');
+          quiet.timeout = true;
+          if (this.missed(e, quiet)) await this.recover(e, 'health check: /status did not answer').catch(() => {});
           return;
         }
         e.lastOk = Date.now();
@@ -1038,7 +1173,7 @@ export class WdaManager {
             return;
           }
         }
-        e.control = 'ready';
+        this.setControl(e, 'ready');
       })().finally(() => {
         e.checking = false;
       });

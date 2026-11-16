@@ -176,7 +176,7 @@ export class MockBackend implements Backend {
             };
           };
       src = new H264Source(udid.slice(0, 12), start, { fps: want.fps, scale: want.scale, bitrate: 0, keySeconds: this.opts.h264KeySeconds }, {
-        idleMs: this.opts.h264IdleMs ?? 10_000,
+        idleMs: this.opts.h264IdleMs ?? 2500,
         log: () => {},
       });
       this.h264Sources.set(udid, src);
@@ -184,13 +184,9 @@ export class MockBackend implements Backend {
     return src;
   }
 
-  /** Start the mock capture ahead of a viewer (it stops after the idle time unless one comes). */
-  warm(udid: string): WarmState {
-    const src = this.h264(udid, { fps: 60, scale: 100, quality: null });
-    if (typeof src === 'string') return { capture: 'unavailable', reason: src };
-    const was = src.ready;
-    src.warm();
-    return { capture: was ? 'warm' : 'starting' };
+  /** Whether the mock capture runs now (a viewer opened it, or left a moment ago). */
+  capturing(udid: string): boolean {
+    return !!this.h264Sources.get(udid)?.running;
   }
 
   /** The detail card's facts of a mock phone (the 2nd one doesn't say its temperature or uptime: nulls). */

@@ -363,7 +363,7 @@ export class H264Source {
   open(): Promise<H264Info> {
     this.cancelIdle();
     if (this.info && this.key) {
-      // warm: the caller's viewer (add) cancels this; a caller that never adds one doesn't leave it running for good
+      // running: the caller's viewer (add) cancels this; a caller that never adds one doesn't leave it running
       this.maybeIdle();
       return Promise.resolve(this.info);
     }
@@ -381,14 +381,6 @@ export class H264Source {
     });
     if (!this.producer && !this.restartTimer) this.start();
     return p;
-  }
-
-  /**
-   * Start the capture ahead of a viewer: it then runs for the idle (warm) time and stops unless one came. Never
-   * rejects (a capture that can't start says so to the viewer that asks for it).
-   */
-  warm(): void {
-    this.open().catch(() => {}); // already warm: a whole warm time more from now
   }
 
   add(v: H264Viewer): void {

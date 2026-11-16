@@ -46,19 +46,21 @@ function viewerOf(src: H264Source) {
 }
 const want = { fps: 60, scale: 100, bitrate: 8_000_000 };
 
-// ---- the capture: warmed ahead, kept after its last viewer, stopped when nobody comes ----
+// ---- the capture: started by its first viewer, kept a moment after its last one, stopped when nobody comes ----
 {
   const { ctl, start } = manual();
   const src = new H264Source('t', start, want, { log: () => {}, idleMs: 80, openTimeoutMs: 2000 });
   assert.equal(src.ready, false);
-  src.warm(); // nobody is watching yet
-  assert.equal(ctl.starts, 1, 'the capture starts at the warm-up');
+  assert.equal(ctl.starts, 0, 'nothing runs before a viewer asks');
+  const first = src.open(); // the first viewer asks for the picture
+  assert.equal(ctl.starts, 1, 'the capture starts with the first viewer');
   ctl.up();
+  await first;
   assert.equal(src.ready, true, 'a picture is at hand');
   // a viewer joining now gets the keyframe at once, without waiting for the capture
   const t0 = performance.now();
   const info = await src.open();
-  assert.ok(performance.now() - t0 < 60, 'open() on a warm capture answers at once');
+  assert.ok(performance.now() - t0 < 60, 'open() on a running capture answers at once');
   assert.equal(info.width, 208);
   const a = viewerOf(src);
   src.add(a.v);
@@ -76,11 +78,11 @@ const want = { fps: 60, scale: 100, bitrate: 8_000_000 };
   ctl.emit(KIND.KEY);
   ctl.emit(KIND.DELTA);
   assert.deepEqual(b.sent, [KIND.CONFIG, KIND.KEY, KIND.KEY, KIND.DELTA]);
-  // the last viewer leaves: the capture stays up for the warm time, so coming back is instant
+  // the last viewer leaves: the capture stays up for the grace time (a page redrawing, a session made anew)
   src.remove(a.v);
   src.remove(b.v);
   await sleep(40);
-  assert.equal(src.ready, true, 'still warm');
+  assert.equal(src.ready, true, 'still up within the grace time');
   const c = viewerOf(src);
   await src.open();
   src.add(c.v);
@@ -90,28 +92,17 @@ const want = { fps: 60, scale: 100, bitrate: 8_000_000 };
   assert.equal(ctl.stops, 0, 'never stopped under a viewer');
   src.remove(c.v);
   await sleep(140);
-  assert.deepEqual([ctl.stops, src.running, src.ready], [1, false, false], 'stopped after the warm time with nobody watching');
-
-  // a warm-up nobody joins stops by itself; warming again while it runs keeps it up from then
-  src.warm();
-  assert.equal(ctl.starts, 2);
-  ctl.up();
-  await sleep(50);
-  src.warm(); // 50 ms in: a whole warm time more
-  await sleep(50);
-  assert.equal(src.running, true, 'the second warm-up restarted the clock');
-  await sleep(90);
-  assert.deepEqual([ctl.stops, src.running], [2, false], 'a capture nobody joined stops after the warm time');
+  assert.deepEqual([ctl.stops, src.running, src.ready], [1, false, false], 'stopped after the grace time with nobody watching');
 
   // a viewer that asked for the capture and left while it started doesn't leave it running for good
   const p = src.open();
-  assert.equal(ctl.starts, 3);
+  assert.equal(ctl.starts, 2);
   ctl.up();
   await p; // ...and never adds a viewer
   await sleep(140);
-  assert.deepEqual([ctl.stops, src.running], [3, false]);
+  assert.deepEqual([ctl.stops, src.running], [2, false]);
   src.close();
-  ok('capture: started by a warm-up, a keyframe at once on join, kept for the warm time after the last viewer, stopped when nobody comes');
+  ok('capture: started by the first viewer, a keyframe at once on join, kept for the grace time after the last viewer, stopped when nobody comes');
 }
 
 // ---- MJPEG: someone joining a running stream gets its newest frame at once ----
@@ -154,7 +145,7 @@ const want = { fps: 60, scale: 100, bitrate: 8_000_000 };
   ok('MJPEG: a viewer joining a running stream gets its newest frame at once');
 }
 
-// ---- the server: connectMs in the hello, "first-frame", a warm second view, POST /warm, the control socket ----
+// ---- the server: connectMs in the hello, "first-frame", a second view within the grace time, POST /warm starts nothing ----
 {
   const START_MS = 400; // the mock capture's first picture takes this long, as a real one takes a second or two
   const token = crypto.randomBytes(16).toString('hex');
@@ -219,36 +210,38 @@ const want = { fps: 60, scale: 100, bitrate: 8_000_000 };
     assert.ok(warm.hello.connectMs < cold.hello.connectMs / 2, 'a warm view opens much faster than a cold one');
     warm.close();
 
-    // POST /warm starts a phone's capture ahead of its viewer
+    // POST /warm no longer starts a phone's capture (2026-11-16: it runs only while a live view is open): it wakes
+    // the phone and says whether the capture runs
     const post = async (p: string) => {
       const r = await fetch(`http://${host}${p}`, { method: 'POST', headers: auth, body: '{}' });
       return { status: r.status, body: (await r.json()) as any };
     };
     const w1 = await post(`/phones/${u2}/warm`);
-    assert.deepEqual([w1.status, w1.body.ok, w1.body.udid, w1.body.capture], [200, true, u2, 'starting']);
+    assert.deepEqual([w1.status, w1.body.ok, w1.body.udid, w1.body.capture], [200, true, u2, 'off']);
     assert.ok(w1.body.input && typeof w1.body.input.hid === 'string', 'and says the input methods');
     await sleep(START_MS + 80);
-    assert.equal((await post(`/api/devices/${u2}/warm`)).body.capture, 'warm', 'the same under /api/devices; warm once its picture is there');
-    const ahead = await view(u2!, '&codec=h264');
-    assert.equal(ahead.hello.warm, true, 'the view finds the capture up');
-    assert.ok(ahead.hello.connectMs < 200, `warmed-ahead connectMs ${ahead.hello.connectMs}`);
-    ahead.close();
+    assert.equal((await post(`/api/devices/${u2}/warm`)).body.capture, 'off', 'the same under /api/devices: nothing was started');
+    assert.equal(backend.capturing(u2!), false);
+    const cold2 = await view(u2!, '&codec=h264');
+    assert.equal(cold2.hello.warm, false, 'the view starts the capture itself');
+    assert.equal((await post(`/phones/${u2}/warm`)).body.capture, 'warm', 'running under its viewer');
+    cold2.close();
     assert.equal((await post('/phones/NOPE/warm')).status, 404);
     assert.equal((await fetch(`http://${host}/phones/${u2}/warm`, { headers: auth })).status, 405);
 
-    // a control socket opening (the live view's first step) warms the capture before the offer or the stream asks
+    // a control socket opening (the live view's first step) starts no capture either: the offer or the stream does
     const ctl = new WebSocket(`ws://${host}/phones/${u3}/control?token=${token}`);
     await new Promise((r) => ctl.once('open', r));
     await sleep(START_MS + 80);
+    assert.equal(backend.capturing(u3!), false, 'no capture behind a control socket alone');
     const viaCtl = await view(u3!, '&codec=h264');
-    assert.equal(viaCtl.hello.warm, true);
-    assert.ok(viaCtl.hello.connectMs < 200, `connectMs behind a control socket ${viaCtl.hello.connectMs}`);
+    assert.equal(viaCtl.hello.warm, false);
     viaCtl.close();
     ctl.close();
 
-    // a warm-up nobody joins lets go: the capture stops after the warm time
+    // the last viewer gone: the capture stops after the grace time
     await sleep(800);
-    assert.equal((await post(`/phones/${u2}/warm`)).body.capture, 'starting', 'it had stopped (nobody came): starting again');
+    assert.deepEqual([backend.capturing(u1!), backend.capturing(u2!), backend.capturing(u3!)], [false, false, false]);
 
     // MJPEG: the hello goes with the first frame and says connectMs too
     const mj = await view(u1!, '&codec=mjpeg&fps=20');
@@ -264,10 +257,10 @@ const want = { fps: 60, scale: 100, bitrate: 8_000_000 };
     server.close();
     await backend.close();
   }
-  ok('server: connectMs + warm in the hello, "first-frame", a warm second view, POST /warm, the control socket warms the capture');
+  ok('server: connectMs + warm in the hello, "first-frame", a second view within the grace time, POST /warm and the control socket start no capture');
 }
 
-// ---- a backend with no H.264: POST /warm says so, the MJPEG fallback's connectMs counts from the request ----
+// ---- a backend with no H.264: POST /warm starts nothing, the MJPEG fallback's connectMs counts from the request ----
 {
   const token = crypto.randomBytes(16).toString('hex');
   const backend = new MockBackend(1, { h264: false });
@@ -278,8 +271,8 @@ const want = { fps: 60, scale: 100, bitrate: 8_000_000 };
   const udid = ((await (await fetch(`http://${host}/phones`, { headers: auth })).json()) as any[])[0].udid as string;
   try {
     const w = (await (await fetch(`http://${host}/phones/${udid}/warm`, { method: 'POST', headers: auth })).json()) as any;
-    assert.deepEqual([w.ok, w.capture], [true, 'unavailable']);
-    assert.match(w.reason, /H\.264/);
+    assert.deepEqual([w.ok, w.capture], [true, 'off']);
+    assert.match(w.reason, /only while a live view is open/);
     const hello = await new Promise<any>((resolve, reject) => {
       const ws = new WebSocket(`ws://${host}/phones/${udid}/stream?token=${token}&codec=h264`);
       const t = setTimeout(() => reject(new Error('no hello')), 5000);

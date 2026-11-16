@@ -27,7 +27,7 @@ recovering) or `WDA refused the request on <name>: ...` (WDA answered but said n
 | GET | `/health` | - | `{ok, mock, commit, startedAt}` (no auth): alive, and which build runs (the commit's first 7 characters, when it started), so a client can tell whether the Mac has pulled a change |
 | GET | `/phones` | - | `[{udid, name, model, ios, battery, online, ready, control, scale, point_width, point_height, width, height, orientation}]`: `battery` 0-100 or null; `model` the product type (`iPhone14,5`); `ready` = WDA running; `control` = `"ready"` (session warm), `"recovering"` (WDA starting or session being remade) or `"down"`; `orientation` how the phone is turned now (`portrait`, `landscape-left`, `landscape-right`, `portrait-upside-down`; null until WDA has said; see [Orientation and coordinates](#orientation-and-coordinates)); `scale` from WDA (`/wda/screen`); `point_width`/`point_height` the screen in points **as it's turned now** (390 x 844 upright, 844 x 390 on its side), null until known; `width`/`height` the same in pixels (points x scale); `stats` the live view numbers (see [Live view](#live-view-webrtc-h264-mjpeg)); `lan` the Mac's own base URLs on its LAN (private IPv4 only, `["http://192.168.1.20:8787", ...]`, same for every phone); `tailnet` its Tailscale ones (100.64/10), listed apart because a Tailscale address is not a local path; `info` the detail card's data as it was last gathered (see [Device info](#device-info-the-detail-card)); `focused` true for the one phone in focus (see [One live phone at a time](#one-live-phone-at-a-time)); `stats.heals` / `stats.lastHeal` WDA's self-heals (see [Staying responsive](#staying-responsive-wda-self-heal)) |
 | GET | `/phones/:udid/info` | `?fresh=1` (ask the phone now) | `{ok, udid, battery: {level, percent, charging}, temperatureC, app: {bundleId, name}, uptimeSec, model, ios, bootedAt, wda: {expiresAt, daysLeft, state}, thermal, connectedAt, at, fresh}`: the detail card, kept ~15 s; anything unknown is `null`. See [Device info](#device-info-the-detail-card) |
-| POST | `/phones/:udid/warm` | `{}` | `{ok, udid, capture: "warm"\|"starting"\|"unavailable", reason?, input}`: gets the phone ready for a viewer that's about to open it (capture started, live touch channel opened, phone woken). See [Opening a view fast](#opening-a-view-fast) |
+| POST | `/phones/:udid/warm` | `{}` | `{ok, udid, capture: "warm"\|"off"\|"unavailable", reason?, input}`: wakes the phone for a viewer that's about to open it and says whether its capture runs; it starts none (2026-11-16). See [Capture only while a live view is open](#capture-only-while-a-live-view-is-open) |
 | GET | `/phones/:udid/screenshot` | `?format=png` (default) or `jpeg` | image bytes, always upright at the screen's true shape (`jpeg` = latest MJPEG frame, or a PNG when that frame isn't the phone's shape; mock always returns PNG, check `Content-Type`). Headers `x-orientation`, `x-width`, `x-height` (the picture's own size) |
 | WS | `/phones/:udid/stream` | `?codec=` (`h264` or `mjpeg`; absent = MJPEG as before), `?fps=` (1-60, default 60), `?quality=`, `?scale=` (10-100 %; MJPEG default 50, H.264 default 100) | MJPEG: first a text message `{"type":"hello", udid, contentType, fps, scale, quality, orientation, point_width, point_height, screen_width, screen_height, width, height, connectMs}` with the settings actually used, then `{"type":"orientation", ...}` with the frames' real size (and again whenever the phone turns), then one binary message per frame (JPEG from WDA's MJPEG server in real mode, PNG in mock); latest frame only. H.264: see [Live view](#live-view-webrtc-h264-mjpeg). Every hello says `connectMs` (the request -> the first frame, ms) and a `{"type":"first-frame", udid, transport, connectMs}` follows the first frame: see [Opening a view fast](#opening-a-view-fast) |
 | WS | `/phones/:udid/control` | JSON text messages, see below | low-latency control over one connection |
@@ -92,14 +92,13 @@ The randomness is seeded (`createServer(..., { touchSeed })` for tests); `test/h
 `POST /phones/:udid/focus` (or `/api/devices/:udid/focus`) picks the phone on show; a client calls it when the owner
 switches phones, before opening the view.
 
-- **Only it streams.** The phone in focus before it has its capture stopped and is **locked** about 1.5 s after the
+- **Only it streams.** The phone in focus before it is **locked** about 1.5 s after the
   switch (`FOCUS_LOCK_MS`), in its own queue (never on top of an action), without holding the answer up, and **only
   if nobody watches it by then**: the viewer that switched has let go of it, while another Lotus still on it keeps its
   picture and its screen (2026-11-16: a lock under a viewer left a black picture). An agent action running or waiting
   on that phone keeps it awake: `previous.slept: false`, `reason: "an agent action is running on it"`.
-- **The new one is ready.** It wakes (past the lock screen), its live touch channel opens and its capture starts, as
-  `POST /warm`. While a viewer (a control socket or a stream) is attached to it, its capture is kept warm all the
-  time, so its view reopens at once.
+- **The new one is ready.** It wakes (past the lock screen), as `POST /warm`. 2026-11-16: neither starts a capture
+  any more, and a switch never stops one: see [Capture only while a live view is open](#capture-only-while-a-live-view-is-open).
 - `focused: true` marks it in `GET /phones` / `/api/devices` (all `false` until a client picks one). The focus lives
   in the server's memory: after a restart nobody is in focus until a client says so.
 - **FPS:** each phone's `stats.fps` (the live view's frames per second now), each lane's `stats.lanes[].fps` and
@@ -143,6 +142,32 @@ What used to leave a phone not answering after a while, and what the server does
 
 Every heal is logged as `[wda-heal] <udid end> <reason>` and counted: each phone's `stats.heals` (since the server
 started) and `stats.lastHeal` `{at, reason}` (null when there was none), in `GET /phones` / `/api/devices`.
+
+### A stable control link (2026-11-16)
+
+The owner: "what is the problem with the CONTROL LINK failing and recovering all the time". **The cause:** WDA works
+one request at a time, and one liveness check that got no answer in 3 s counted as a dead WDA. The check waited behind
+whatever WDA was doing (a screenshot of the dark-screen look, a lock that waits for "locked" on a phone without a
+passcode, a card's read, the orientation poll: none of them counted as "busy"), so its session was dropped
+("Recovering"), and when `/status` then waited behind the same request for 2.5 s the runner was restarted on the phone
+(half a minute). Over and over, with nothing wrong.
+
+- **Busy isn't down.** Every request to WDA counts as busy; a liveness check is skipped while one is on its way, and
+  any answer at all (whatever it says) means WDA is there and clears the count.
+- **Several missed beats, not one.** WDA counts as down only after `MISSES` (3) liveness checks in a row got no
+  answer in time, over at least 15 s. A refused connection (nothing listens) still recovers at once.
+- **A recovery fixes only what's wrong.** It asks `/status` three times (2.5 s, then 3.75 s twice) before it restarts
+  the runner, and keeps a session that still answers (it was only slow); a session WDA itself says is gone is remade.
+- **No "down" for a hiccup.** `control` says `recovering` or `down` only once that lasted 4 s
+  (`CONTROL_DEBOUNCE_MS`); a session remade in a moment is never shown. A restarting runner says so at once.
+- **The control socket.** The server answers `{type:"ping"}` in the message handler, beside whatever the phone's
+  queue is doing. It pings each socket every 10 s and closes one nothing was heard from for 35 s (a link that died
+  without a word would otherwise count as someone watching, and keep the capture up). Any number of sockets may be
+  open for one phone; none closes another.
+- **Measured.** `stats.controlLink` on each phone of `GET /phones`: `{open, opens, closes, drops, lastOpen,
+  lastClose: {at, code, reason, why: "client"|"dropped"|"dead", livedMs}, wda: {state, raw, misses, recoveries,
+  runnerRestarts, answeredMsAgo, busy}}` (`drops`: closes that weren't the client's own; `wda.state` is what
+  `control` says, `wda.raw` what it is underneath).
 
 ### Device info (the detail card)
 
@@ -196,19 +221,30 @@ wait for the next list:
 - the phone turned (also `{"type":"orientation"}` as before);
 - the card was gathered for another reason (the list, the 12 s watch of a phone on show) and one of those changed.
 
-### Opening a view fast
+### Capture only while a live view is open
+
+2026-11-16 (the owner: "we really don't need it to be LIVE all the time ... ONLY when we start on LIVE VIEW we start
+seeing it"). iOS tells apps while the screen is captured (`UIScreen.isCaptured`), so the phone's USB screen capture
+(`phonecap`, the H.264 lanes, WebRTC) runs only under a picture someone asked for.
+
+- **Starts with the first viewer**: an `rtc-offer` on the control socket, or a stream WebSocket. Nothing else starts
+  it: not `POST /focus`, not `POST /warm`, not a control socket by itself, not the watch. No warm capture, no
+  prestart, nothing kept for the phone in focus (`CAPTURE_WARM_SECONDS` is ignored).
+- **Stops completely `CAPTURE_GRACE_MS` (2.5 s) after the last viewer left**: long enough for a page to redraw or a
+  WebRTC session to be made anew, no longer. A switch of the focus never stops a capture someone still watches.
+- **`capturing`** on each phone of `GET /phones` says whether it runs now. `POST /warm` and `/focus` answer
+  `capture`: `"warm"` (running under a viewer), `"off"` (nobody is watching) or `"unavailable"`.
+- **The live touch session (HID) goes by the same rule**: opened while a live view holds it, closed 2.5 s after the
+  last one left, never opened for an agent's tap on a phone nobody watches (WDA takes that).
+- **The agent works from stills** (`src/stills.ts`): `/screenshot`, `/ui`, `/act`, `/tap-element` and every look
+  before and after an action use WDA's own single screenshots (a frame of WDA's MJPEG server on a stock WDA, else its
+  PNG), never a frame of the capture, and never start it or keep it running.
+
+### Opening a view
 
 The slow part of opening a live view is the capture: `phonecap` starting and the phone's screen showing up as a capture
 device takes a second or two; everything after it is a few ms.
 
-- **Kept warm.** A phone's capture keeps running for `CAPTURE_WARM_SECONDS` (default 120; it was 10) after its last
-  viewer left, so going back to a phone (one phone at a time, switching between them) shows its picture at once.
-- **Started ahead.** `POST /phones/:udid/warm` starts the capture (a thumbnail lane: the cheapest encoder, the same one
-  capture process the viewer's own lane is then added to), opens the live touch channel and wakes the phone; call it
-  when a phone is selected, before its view opens. Opening the control socket does the same for the capture, so it's
-  starting while the `rtc-offer` is still on its way. A warm-up nobody joins stops by itself after the warm time.
-  `capture`: `"warm"` (a picture is at hand), `"starting"`, or `"unavailable"` with `reason` (no H.264 helper, an older
-  helper without lanes: it starts with the first viewer).
 - **A keyframe at once.** A joining viewer gets the cached config + keyframe immediately and a fresh one is asked from
   the encoder; an MJPEG viewer joining a running stream gets its newest frame without waiting for the next.
 - **`connectMs`** = the request (the stream's upgrade, the `rtc-offer`) -> the first frame, in ms, and **`warm`** =
@@ -448,7 +484,7 @@ the ~1.2 s tap on the LAN. It was replaced, not tuned. Each action takes the fir
    pymobiledevice3) holds a touch session open while someone views the phone (the media-stream auth gate, ~0.5-2 s to
    open once, not per tap) and writes 58-byte touchscreen reports to it: a tap is a few ms on the Mac, live drags, typing
    through a virtual HID keyboard (printable ASCII; other text goes through WDA). The session closes after
-   `HID_IDLE_SECONDS` (120) with no viewer and no input: while it's open the phone's camera/mic apps get black/silence, and
+   2.5 s with no live view holding it (2026-11-16; `HID_IDLE_SECONDS` is ignored): while it's open the phone's camera/mic apps get black/silence, and
    it can't start while one is in the foreground. In landscape the point is turned onto the panel (`HID_LANDSCAPE=swap` if the two landscapes come out mirrored on the Mac, `off` to use WDA
    whenever the phone is turned). Any failure falls back to WDA for that gesture, with the reason in its ack, and HID
    reconnects by itself (1, 2, 5, 15, 30 s, then every minute).
@@ -494,7 +530,7 @@ does (CoreMediaIO's `kCMIOHardwarePropertyAllowScreenCaptureDevices`, then the i
 matched by UDID, then name), at up to 60 fps, encodes it with VideoToolbox H.264 in real time (low-latency rate control,
 Constrained Baseline, no B-frames, keyframe at least every 2 s, 8 Mbps by default, optional downscale in the capture
 pipeline), and writes framed Annex B NAL units to stdout. The server runs one helper per phone on demand, shared by all
-viewers, stops it `CAPTURE_WARM_SECONDS` (120) after the last viewer leaves (see [Opening a view fast](#opening-a-view-fast)), restarts it on a crash with backoff (after 3 failed starts it gives up
+viewers, stops it 2.5 s after the last viewer leaves (see [Capture only while a live view is open](#capture-only-while-a-live-view-is-open)), restarts it on a crash with backoff (after 3 failed starts it gives up
 for 60 s and viewers get MJPEG), and caches the latest SPS/PPS and keyframe so a new viewer sees a picture at once (then
 gets a fresh IDR). It does not need WDA, so the picture works even while WDA restarts.
 
@@ -761,7 +797,7 @@ and comes back by itself.
 `API_TOKEN`, `HOST`, `PORT`, `MOCK`, `MOCK_PHONES`, `WDA_PROJECT`, `WDA_DERIVED_DATA` (default `~/wda-build`),
 `WDA_BASE_PORT` (8100), `MJPEG_BASE_PORT` (9100), `POLL_MS` (5000), `AUTOSTART_WDA` (true), `AUTO_UPDATE_SECONDS` (10, 0 = off),
 `H264` (true), `H264_BITRATE_MBPS` (8), `PHONECAP_PATH` (default `native/phonecap/build/phonecap`),
-`CAPTURE_WARM_SECONDS` (120: how long a phone's capture keeps running after its last viewer, 10-3600; `10` is the old behaviour).
+`CAPTURE_WARM_SECONDS` (ignored since 2026-11-16: a capture stops 2.5 s after its last viewer).
 Input: `HID_INPUT` (`auto` = iOS 27+ phones, `on` = try every phone, `off`), `HID_PYTHON` (the Python with pymobiledevice3;
 default `~/.phonefarm-hid/bin/python` if it exists, else `python3`), `HID_IDLE_SECONDS` (120), `HID_TUNNEL` (`auto`,
 `userspace`, `native`, `tunneld`), `WDA_FAST` (`0` = never try the fast route), `INPUT_LOG` (`0` = no per-action lines), `HID_LANDSCAPE` (`on` default, `swap`, `off`), `WDA_FAST_LANDSCAPE` (`1` = the fast route in landscape too), `CAPTURE_ROTATE` (`off` default; `cw`/`ccw` turn a sideways picture upright; `90`/`180`/`270` always turn it);

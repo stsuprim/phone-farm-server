@@ -135,6 +135,11 @@ export class HidHost {
     (this.o.log ?? console.log)(`[hid ${this.udid.slice(-8)}] ${m}`);
   }
 
+  /** A live view is holding the session open (hold()). */
+  get held(): boolean {
+    return this.holders > 0;
+  }
+
   /** Touches can go now. */
   ready(): boolean {
     return this.state === 'ready' && !this.closed;
