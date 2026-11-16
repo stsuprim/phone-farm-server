@@ -454,11 +454,15 @@ Signaling over the authenticated control WebSocket:
   frames flow (then `{type:"first-frame", transport:"webrtc", connectMs}` when the first one left on the track), or `{type:"rtc-error", reason}` (H.264 unavailable, bad offer, WebRTC library missing) -> fall back
 - trickle ICE both ways: `{type:"rtc-ice", candidate, mid}` (the server's candidates come without the `a=` prefix);
   `{type:"rtc-close"}` ends the session (closing the control socket does too). A new offer replaces the old session.
+- client -> `{type:"rtc-key"}`: a fresh keyframe now, as a PLI asks (the client's watchdog sends it when its picture
+  stalls). Like PLI/FIR: at most one per 500 ms, and not while a keyframe is still on its way to the viewer.
 
 Media: one sendonly H.264 track (the offer's `packetization-mode=1` H.264 payload type, preferring `42e01f`, answered with
 `profile-level-id=42e01f;packetization-mode=1;level-asymmetry-allowed=1`). Each access unit goes out as RTP with a 90 kHz
-timestamp from the capture time; SPS/PPS go with every keyframe in the same access unit. RTCP PLI/FIR force an IDR, NACKs
-are answered from a small retransmit buffer, sender reports are sent. If the offer has the `playout-delay` header extension,
+timestamp from the capture time (a frame over 500 ms from now when it's sent, such as a cached keyframe, is stamped as
+just captured); **SPS/PPS go with every keyframe in the same access unit** (Chromium's WebRTC decoder can't start from a
+bare IDR: `docs/latency.md`, 2026-11-16). A new viewer of a running stream starts from a fresh keyframe (not the cached
+one). RTCP PLI/FIR force an IDR, NACKs are answered from a small retransmit buffer, sender reports are sent. If the offer has the `playout-delay` header extension,
 every packet carries min=max=0 so Chrome renders frames as soon as they're decoded (the client can also set
 `receiver.jitterBufferTarget = 0`).
 
@@ -676,12 +680,20 @@ After `git pull`/code changes run `npm run build` and `launchctl kickstart -k gu
 ## Testing
 
 `npm run check` type-checks. `npm test` runs `test/h264.ts` (helper framing, config-before-key, latest-only drop to keyframe,
-helper restarts, offer/RTCP parsing), `test/input.ts` (live touch straight to the phone and its fallbacks, the HID sidecar's
+helper restarts, offer/RTCP parsing, WebRTC's keyframe unit, RTP clock and pacer queue), `test/input.ts` (live touch straight to the phone and its fallbacks, the HID sidecar's
 protocol, the WDA patch, latency metering, acks' `via`/`ms`), `test/orient.ts` (upright -> device mapping in all four orientations, units, the capture check, orientation in the list, hellos and on change), `test/touch.ts` (order, coalescing, acks, auto-release, wake first, fallbacks with a reason), `test/ui.ts` (UI tree flattening, the element finder, apps by name, `/ui`, `/tap-element`, `/type`, `/key`, `/launch`, `/act`, reports and verify), `test/info.ts` (the detail card: the battery / IORegistry / WDA parsers, the ~15 s cache, `GET /info`, `info` in the list, WDA's quiet read), `test/connect.ts` (a capture warmed ahead and kept warm, a keyframe at once on join, `connectMs` and `first-frame`, `POST /warm`), `test/reliability.ts` (an expired WDA session remade on a 4xx, never a stale UI tree, the settle wait and ids from a changed screen, a playing gesture holding the next action, HID inputs that time out or break off, HID reconnect), `test/heal.ts` (a fake WDA that expires its session, hangs or dies and an iproxy that exits, all healed and counted; a hung action's 504, bursts spaced, the probe before the first action after idle, wake-on-touch; units; `POST /focus`, `focused`, `percent` and `info` pushed), `test/rtc.ts` (WebRTC in mock mode with a node-datachannel client: signaling, ICE,
-RTP, PLI -> IDR, data channels and acks, stats, rtc-error) and `test/smoke.ts` (a mock server: auth, every endpoint, MJPEG,
+RTP, PLI -> IDR, SPS/PPS with every keyframe, `rtc-key`, the RTP clock, data channels and acks, stats, rtc-error) and `test/smoke.ts` (a mock server: auth, every endpoint, MJPEG,
 H.264 WebSocket, the MJPEG fallback, ping/pong). Mock mode's H.264 is a real, decodable stream (a tiny built-in encoder:
 Constrained Baseline 208x448, I_PCM keyframes and skip-coded deltas), so clients can test decoding against it.
 Against a live server: `URL=http://<mac>:8787 API_TOKEN=<token> npm test` (needs at least one online phone).
+
+**WebRTC against a real browser** (not part of `npm test`: it needs Edge, Chrome or Brave):
+`npx tsx scripts/rtc-browser-check.ts [--profile remote|lan] [--delay 90 --jitter 15 --loss 0.2] [--stale 6]`. The mock
+server streams to a headless browser that receives it with Lotus's own live engine (`phones-live.js`, found beside this
+repo inside Lotus, else `--live <path>`) and prints, each second, the frames that came, were decoded and were shown, with
+the keyframes, PLIs, NACKs, freezes and the jitter buffer. `--delay/--jitter/--loss` put a UDP relay in between (a far
+link); `--bare-keys`, `--break-at <s>` and `--blackout <s>:<s>` break the stream to watch the page heal. Exit code 1 when
+the picture stalls.
 
 ## Settings (.env)
 

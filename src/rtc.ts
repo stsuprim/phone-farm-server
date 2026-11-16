@@ -1,7 +1,7 @@
 import type NdcModule from 'node-datachannel';
 import { bitrateAsk, DEFAULT_CEILING_BPS, DelayTracker, parseRtcp, RateControl, REMOTE_START_BPS } from './congestion.js';
 import { Control, touchAck } from './control.js';
-import { H264Info, H264Settings, H264Source, H264Viewer, KIND, Rec, Transport } from './h264.js';
+import { H264Info, H264Settings, H264Source, H264Viewer, KIND, Rec, REMOTE_DROP_BYTES, Transport } from './h264.js';
 import { THUMB_DEFAULT_FPS } from './lanes.js';
 import { Backend, HttpError, Profile, QualityTier } from './types.js';
 
@@ -9,6 +9,7 @@ import { Backend, HttpError, Profile, QualityTier } from './types.js';
  * WebRTC live view (node-datachannel / libdatachannel). Signaling rides the control WebSocket:
  *   client -> {type:"rtc-offer", sdp, want:{fps, scale, quality?}}   server -> {type:"rtc-answer", sdp}
  *   both ways {type:"rtc-ice", candidate, mid}; server -> {type:"rtc-hello", ...} once frames flow,
+ *   client -> {type:"rtc-key"} (a keyframe now: its picture stalled), {type:"rtc-close"},
  *   or {type:"rtc-error", reason} (the client falls back to the H.264 WebSocket / MJPEG).
  * Host candidates only (no STUN/TURN): the path is always direct (LAN or Tailscale), never relayed.
  */
@@ -18,8 +19,97 @@ type Track = ReturnType<PeerConnection['addTrack']>;
 type DataChannel = ReturnType<PeerConnection['createDataChannel']>;
 type RtpConfig = InstanceType<Ndc['RtpPacketizationConfig']>;
 
-/** A frame this much older than now when it's sent (a cached keyframe) is stamped as just captured (sendFrame). */
+/** A frame whose capture time is this far from now when it's sent (a cached keyframe) is stamped as just captured. */
 export const STALE_FRAME_MS = 500;
+
+/**
+ * A WebRTC keyframe's access unit: SPS and PPS in front of EVERY IDR (one RTP timestamp, the marker on the last NAL).
+ * 2026-11-16, the freeze (frames arriving, none shown, PLI after PLI): only a session's first keyframe carried them
+ * (the WebSocket viewers need them once), so the next IDR came bare. Chromium's hardware decoder for WebRTC reads the
+ * picture's size from each keyframe's SPS; a bare IDR fails it ("Failed parsing stream to get resolution"), WebRTC
+ * falls back to its software decoder, and that one, new, never saw an SPS or PPS: nothing decodes again, whatever
+ * keyframes its PLIs bring. libwebrtc's own senders do the same (sps-pps-idr-in-keyframe).
+ */
+export function keyUnit(config: Buffer | undefined, key: Buffer): Buffer {
+  return config?.length ? Buffer.concat([config, key]) : key;
+}
+
+/** True if an Annex B access unit holds an SPS, a PPS and an IDR slice, in that order (tests). */
+export function hasParameterSets(unit: Buffer): boolean {
+  let need = 7; // 7 SPS -> 8 PPS -> 5 IDR
+  for (let i = 0; i + 3 < unit.length; i++) {
+    if (unit[i] !== 0 || unit[i + 1] !== 0 || unit[i + 2] !== 1) continue;
+    const type = unit[i + 3]! & 0x1f;
+    if (type === need) {
+      if (need === 5) return true;
+      need = need === 7 ? 8 : 5;
+    }
+    i += 2;
+  }
+  return false;
+}
+
+/**
+ * The 90 kHz RTP clock of one session, from the frames' capture times: never backwards, and never far from the send
+ * time. A frame whose capture time is over STALE_FRAME_MS from now (the cached keyframe a new viewer is primed with,
+ * up to REMOTE_KEY_SECONDS old on a far lane; a stepped clock) is stamped as just captured: stamped with its real
+ * age, the next frame's timestamp would jump seconds ahead of its arrival and throw the browser's playout timing.
+ */
+export class RtpClock {
+  private t0 = 0;
+  private last = -1;
+  /** Capture -> sent of the frames flowing (ms, smoothed); null before any. */
+  lag: number | null = null;
+
+  /** The timestamp (90 kHz ticks since the first frame) for a frame captured at `captured`, sent at `now` (ms). */
+  stamp(captured: number, now: number): { ts: number; stale: boolean } {
+    const age = now - captured;
+    const stale = !Number.isFinite(age) || Math.abs(age) > STALE_FRAME_MS;
+    const time = stale ? now - (this.lag ?? 0) : captured;
+    if (!stale) this.lag = this.lag === null ? age : this.lag + (age - this.lag) * 0.1;
+    if (!this.t0) this.t0 = time;
+    let ts = Math.round((time - this.t0) * 90);
+    if (ts <= this.last) ts = this.last + 1;
+    this.last = ts;
+    return { ts, stale };
+  }
+}
+
+/**
+ * What waits in a far viewer's pacer (libdatachannel's PacingHandler has no bound and says nothing): the bytes handed
+ * to it less what its pace has let out since. The viewer counts it as its send buffer, so frames are skipped until the
+ * next keyframe (H264Viewer.over) rather than the picture falling seconds behind.
+ */
+export class PaceQueue {
+  private bytes = 0;
+  private at = 0;
+  constructor(private bps: number) {}
+
+  private drain(now: number): void {
+    if (this.at) this.bytes = Math.max(0, this.bytes - ((now - this.at) * this.bps) / 8000);
+    this.at = now;
+  }
+  add(n: number, now = Date.now()): void {
+    this.drain(now);
+    this.bytes += n;
+  }
+  waiting(now = Date.now()): number {
+    this.drain(now);
+    return Math.round(this.bytes);
+  }
+  /** How long what waits takes to leave (ms). */
+  waitingMs(now = Date.now()): number {
+    return (this.waiting(now) * 8000) / this.bps;
+  }
+}
+
+/**
+ * How long after a keyframe was sent an ask for one (PLI, FIR, rtc-key) is taken to have crossed it: the round trip
+ * (the ask left before the keyframe arrived) plus what the pacer still holds, and a little. At most 2 s.
+ */
+export function keyInFlightMs(rttMs: number | null, pacedMs: number): number {
+  return Math.min(2000, (rttMs ?? 0) + pacedMs + 50);
+}
 
 const PLAYOUT_DELAY_URI = 'http://www.webrtc.org/experiments/rtp-hdrext/playout-delay';
 
@@ -183,15 +273,14 @@ export class RtcSession {
   private ready = false;
   private closed = false;
   private pendingIce: [string, string][] = [];
-  private pendingConfig?: Buffer;
+  private config?: Buffer; // the newest SPS + PPS: sent in front of every keyframe (keyUnit)
   private tsBase = (Math.random() * 0xffffffff) >>> 0;
-  private t0 = 0;
-  private lastTs = -1;
+  private clock = new RtpClock();
+  private pace?: PaceQueue; // a far viewer's pacer queue (estimated)
   private path: string | null = null;
   private lastMoveT = -1;
   private inputR?: DataChannel;
   private lastTsMsg = 0;
-  private lag: number | null = null; // capture -> sent of the frames flowing (ms, smoothed)
   // congestion control (libdatachannel has none): the browser's loss reports and NACKs set the bitrate
   private rc?: RateControl;
   private ccTimer?: NodeJS.Timeout;
@@ -199,6 +288,8 @@ export class RtcSession {
   private nacked = 0; // packets the browser asked again since the last tick
   private reportLoss: number | null = null; // the highest fraction lost in its receiver reports since the last tick
   private lastKeyAsk = 0;
+  private keysAsked = 0; // keyframes the viewer asked for (PLI, FIR, rtc-key)
+  private lastKeySent = 0;
   private want?: { bitrate: number | null };
   private delay = new DelayTracker(); // the round trip from the browser's receiver reports
   private tier: QualityTier = 'full';
@@ -313,7 +404,9 @@ export class RtcSession {
     if (this.remote && process.env.RTC_PACING !== '0' && typeof ndc.PacingHandler === 'function') {
       // a far viewer: packets paced (5 ms slots) rather than a keyframe's ~50 packets at once
       try {
-        packetizer.addToChain(new ndc.PacingHandler(paceFor(want.bitrate ?? (src.ceiling || DEFAULT_CEILING_BPS)), 5));
+        const bps = paceFor(want.bitrate ?? (src.ceiling || DEFAULT_CEILING_BPS));
+        packetizer.addToChain(new ndc.PacingHandler(bps, 5));
+        this.pace = new PaceQueue(bps);
       } catch (err) {
         console.error(`[rtc] pacing unavailable: ${errText(err)}`);
       }
@@ -351,9 +444,9 @@ export class RtcSession {
   }
 
   /** This session for `stats.sessions` (null until its video runs). */
-  info(): { profile: Profile; quality: QualityTier; net: string | null; fps: number; latencyMs: number | null; lane: 'lan' | 'remote' | 'thumb' | null; since: number; connectMs: number | null } | null {
+  info(): { profile: Profile; quality: QualityTier; net: string | null; fps: number; latencyMs: number | null; lane: 'lan' | 'remote' | 'thumb' | null; since: number; connectMs: number | null; keysAsked: number } | null {
     if (!this.viewer || this.closed) return null;
-    return { profile: this.remote ? 'remote' : 'lan', quality: this.tier, net: this.path, ...this.viewer.sessionStats(), since: this.since, connectMs: this.connectMs };
+    return { profile: this.remote ? 'remote' : 'lan', quality: this.tier, net: this.path, ...this.viewer.sessionStats(), since: this.since, connectMs: this.connectMs, keysAsked: this.keysAsked };
   }
 
   addIce(candidate: unknown, mid: unknown): void {
@@ -377,12 +470,14 @@ export class RtcSession {
     const transport: Transport = {
       kind: 'rtc',
       // not every node-datachannel build has Track.bufferedAmount; RTP over UDP doesn't queue much anyway
-      buffered: () => (typeof self.track?.bufferedAmount === 'function' ? self.track.bufferedAmount() : 0),
+      buffered: () => (typeof self.track?.bufferedAmount === 'function' ? self.track.bufferedAmount() : 0) + (self.pace?.waiting() ?? 0),
       open: () => !self.closed && !!self.track?.isOpen(),
       send: (r: Rec) => self.sendFrame(r),
       fail: (reason: string) => self.fail(reason),
       path: () => self.path,
       net: () => self.delay.stats(),
+      // a far viewer: a few frames of pacer queue at most, like its WebSocket (H264Viewer.over)
+      dropBytes: this.pace ? REMOTE_DROP_BYTES : undefined,
     };
     this.viewer = new H264Viewer(transport, this.src);
     // a far viewer starts low and climbs to its ask (its lane's frame rate follows the bitrate)
@@ -402,15 +497,24 @@ export class RtcSession {
       return;
     }
     this.delay.add(info.rttMs);
-    if (info.wantsKey) {
-      const now = Date.now();
-      if (now - this.lastKeyAsk >= 500) {
-        this.lastKeyAsk = now;
-        this.viewer?.forceKey();
-      }
-    }
+    if (info.wantsKey) this.key();
     this.nacked += info.nacked;
     if (info.fractionLost !== null) this.reportLoss = Math.max(this.reportLoss ?? 0, info.fractionLost);
+  }
+
+  /**
+   * A fresh keyframe now (the browser's PLI or FIR, or the client's own `rtc-key` when its picture stalls); at most one
+   * per 500 ms. True if it was asked for.
+   */
+  key(): boolean {
+    const now = Date.now();
+    if (!this.viewer || this.closed || now - this.lastKeyAsk < 500) return false;
+    // a keyframe still on its way (the round trip and the pacer's queue ago, or less): this ask crossed it
+    if (now - this.lastKeySent < keyInFlightMs(this.delay.rtt, this.pace?.waitingMs(now) ?? 0)) return false;
+    this.lastKeyAsk = now;
+    this.keysAsked++;
+    this.viewer.forceKey();
+    return true;
   }
 
   /**
@@ -436,34 +540,20 @@ export class RtcSession {
     if (changed) this.src.setTarget(this.viewer, this.rc.bps);
   }
 
-  /** Config is held and sent with the next keyframe as one access unit (same RTP timestamp, marker on the last NAL). */
+  /** One frame onto the track; a keyframe goes with the SPS and PPS as one access unit (keyUnit). */
   private sendFrame(r: Rec): void {
     if (!this.track || !this.rtp) return;
     if (r.kind === KIND.CONFIG) {
-      this.pendingConfig = r.payload;
+      this.config = r.payload;
       return;
     }
-    let data = r.payload;
-    if (r.kind === KIND.KEY && this.pendingConfig) {
-      data = Buffer.concat([this.pendingConfig, r.payload]);
-      this.pendingConfig = undefined;
-    }
-    // 2026-11-16: the RTP clock follows the capture time, but a frame much older than the ones flowing (the cached
-    // keyframe a new viewer is primed with: up to REMOTE_KEY_SECONDS old on a far lane) is stamped as if it had just
-    // been captured. Stamped with its real age, the next frame's timestamp jumped seconds ahead of its arrival, which
-    // threw Chrome's playout timing (its render times seconds in the future): frames decoded but never shown, a frozen
-    // picture with framesDropped climbing (the 2026-11-16 freeze on the remote profile).
+    const data = r.kind === KIND.KEY ? keyUnit(this.config, r.payload) : r.payload;
+    // the RTP clock follows the capture time; a cached (old) keyframe is stamped as just captured (RtpClock)
     const now = Date.now();
-    const age = now - r.time;
-    const stale = age > STALE_FRAME_MS;
-    const time = stale ? now - (this.lag ?? 0) : r.time;
-    if (!stale) this.lag = this.lag === null ? age : this.lag + (age - this.lag) * 0.1;
-    if (!this.t0) this.t0 = time;
-    // 90 kHz RTP clock from the capture time; never backwards
-    let ts = Math.round((time - this.t0) * 90);
-    if (ts <= this.lastTs) ts = this.lastTs + 1;
-    this.lastTs = ts;
+    const { ts, stale } = this.clock.stamp(r.time, now);
     this.rtp.timestamp = (this.tsBase + ts) >>> 0;
+    this.pace?.add(data.length, now);
+    if (r.kind === KIND.KEY) this.lastKeySent = now;
     this.packets += Math.ceil(data.length / 1188);
     try {
       this.track.sendMessageBinary(data);
@@ -574,6 +664,10 @@ export function rtcSignaling(backend: Backend, control: Control, udid: string, s
         }
         case 'rtc-ice':
           session?.addIce(msg.candidate, msg.mid);
+          return true;
+        case 'rtc-key':
+          // the client's picture stalled (its watchdog): a fresh keyframe, as a PLI would ask
+          session?.key();
           return true;
         case 'rtc-close':
           session?.close('closed by the client');

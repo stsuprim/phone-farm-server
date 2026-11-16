@@ -158,3 +158,48 @@ is the last why (HID closed or starting, a failed report, landscape with `HID_LA
 - `POST /phones/:udid/focus` no longer waits for the previous phone's lock (fire-and-forget, logged). `RealBackend.lock`
   is short (3 s) and soft (`WdaManager.callSoft`: no recovery, no heal): WDA's "Timed out while waiting until the
   screen gets locked" never marks the session or the phone down; the lock state is asked afterwards instead.
+
+## 2026-11-16, later: the WebRTC freeze, found and fixed
+
+**The cause** (reproduced on Windows with `scripts/rtc-browser-check.ts`: the mock server -> headless Chromium 157 with
+Lotus's own `phones-live.js`; before the fix 1 frame shown, then ~25 frames a second received, 0 decoded, ~2 dropped
+and 2-3 PLIs a second, forever: the owner's numbers): **only a WebRTC session's first keyframe carried its SPS and
+PPS.** `H264Viewer.sendKey` sends the config once (right for the WebSocket viewers, whose decoder is configured once),
+and `rtc.ts` only put it in front of the keyframe it arrived with. The next IDR (the fresh one asked at join, a PLI's,
+the lane's periodic one, or the one the page's own WebSocket viewer asked on the same lane) went out bare. Chromium's
+log says the rest: `Received H.264-IDR frame (SPS: 0, PPS: 0)` -> the hardware decoder's adapter `Failed parsing stream
+to get resolution` -> `Decoder falling back to software decoding` -> the new FFmpeg decoder, which never saw an SPS or
+PPS, `avcodec_send_packet error` on every frame -> `Failed to decode frame` -> PLI -> another bare IDR. Frames arrive
+(0 lost), none decode, the picture stays on the last frame of the first second. The H.264 WebSocket was fine because
+the page gives WebCodecs the SPS and PPS once, as its `description`.
+
+**The fix** (`src/rtc.ts`, `src/h264.ts`):
+- `keyUnit`: the SPS and PPS go in front of **every** keyframe, one access unit, one RTP timestamp.
+- A new WebRTC viewer of a running stream no longer gets the stale cached keyframe and then the fresh one back to back
+  (two keyframes in a row are a burst the pacer holds every later frame behind; Chromium then dropped the backlog,
+  "Too many frames backed up in the decoder", and asked a third): it starts from the fresh one, a frame away.
+- `RtpClock`: the 90 kHz clock from the capture times, never backwards; a frame over 500 ms from now (a cached keyframe
+  on a still screen, a stepped clock) is stamped as just captured. The earlier "stale keyframe" fix is kept in it; it was
+  not the cause.
+- `PaceQueue`: libdatachannel's pacer has no bound, so the bytes waiting in it are estimated and count as the viewer's
+  send buffer: past one and a half keyframes' worth (64 KB at least) frames are skipped until the next keyframe instead
+  of the picture falling behind.
+- A keyframe ask (PLI, FIR, the client's new `rtc-key`) is one per 500 ms and ignored while a keyframe sent less than
+  the round trip plus the pacer's queue ago is still on its way (`keyInFlightMs`), so a slow link can't be buried in
+  keyframes. `stats.sessions[].keysAsked` counts them: one that keeps climbing is a picture that won't decode.
+
+**Lotus's side**: WebRTC is the picture again on both profiles. It takes over from the WebSocket picture only once it
+proves it decodes what comes; a stall asks a keyframe (`rtc-key`) after 1 s and makes the peer connection anew after 2 s
+(also when the link drops or goes quiet), keeping the last frame up; after two rebuilds in a minute the WebSocket
+picture comes back and WebRTC is tried again later (30 s, doubling to 10 min). From afar the jitter buffer's target is
+100 ms (smoother over a jittery link); the LAN keeps `playout-delay` 0.
+
+**Measured here** (mock 208x448, loopback, Chromium 157, 20 s each): remote and lan profiles show every frame that
+comes (0 dropped, 0 PLI, 1 keyframe at join); over a relay with 92 ms +-15 ms each way and 0.2 % loss, 524 of 560 frames
+shown with NACKs answered; a session broken on purpose is back in ~2.5 s by itself. **Not measured on the Mac or over
+the real Tailscale link** (the token never leaves Lotus). To confirm there, ask Lotus's Phones AI for `phones_stats`
+with a phone open for a minute: `transport` "webrtc"; `renderedFps` about what the server sends (28-30 from afar);
+`rtc.framesDecoded` climbing with `rtc.framesReceived`; `rtc.pliCount` and `rtc.dropped` flat; `rtc.freezeCount` low;
+`heal.rebuilds` 0 and `stalled` null; the server's `stats.sessions[].keysAsked` flat.
+
+**Rinor does nothing**: the change is TypeScript only (no phonecap or WDA rebuild); the Mac updates itself from GitHub.

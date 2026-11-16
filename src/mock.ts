@@ -19,6 +19,8 @@ export interface MockOptions {
   live?: boolean;
   /** The mock capture's first picture comes this long after it starts (a real one takes a second or two). Default 0. */
   h264StartMs?: number;
+  /** The mock capture's keyframe interval, seconds (default 2; a far lane's is 10: src/congestion.ts). */
+  h264KeySeconds?: number;
   /** A mock phone's gestures and text are answered at once and "play" this long, like HID's queued ones. Default 0. */
   playMs?: number;
 }
@@ -173,7 +175,7 @@ export class MockBackend implements Backend {
               },
             };
           };
-      src = new H264Source(udid.slice(0, 12), start, { fps: want.fps, scale: want.scale, bitrate: 0 }, {
+      src = new H264Source(udid.slice(0, 12), start, { fps: want.fps, scale: want.scale, bitrate: 0, keySeconds: this.opts.h264KeySeconds }, {
         idleMs: this.opts.h264IdleMs ?? 10_000,
         log: () => {},
       });

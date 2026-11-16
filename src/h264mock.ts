@@ -252,12 +252,13 @@ export function renderYuv(scene: MockScene): Yuv {
 }
 
 /**
- * Mock capture helper: renders at `fps`, keyframe every 2 s or when asked, and talks the helper's byte framing
+ * Mock capture helper: renders at `fps`, keyframe every `keySeconds` (2 s) or when asked, and talks the helper's byte framing
  * (serialized, then re-parsed in odd-sized chunks) so the same parser path is exercised as with the real helper.
  */
 export function mockProducer(scene: () => MockScene): StartProducer {
   return (want, hooks: ProducerHooks) => {
     const fps = Math.min(want.fps, 30);
+    const keyEvery = Math.max(1, Math.round(fps * (want.keySeconds ?? 2)));
     const parser = new RecordParser(hooks.record);
     const emit = (kind: number, time: number, payload: Buffer) => {
       const bytes = encodeRecord(kind, time, payload);
@@ -282,7 +283,7 @@ export function mockProducer(scene: () => MockScene): StartProducer {
       const f = renderYuv(s);
       s.frame++;
       const t0 = performance.now();
-      const key = wantKey || !prev || frameNum >= fps * 2;
+      const key = wantKey || !prev || frameNum >= keyEvery;
       if (key) {
         wantKey = false;
         frameNum = 0;

@@ -143,6 +143,28 @@ try {
   const idrIn = nals.find((n) => n.nal === 5 && n.at > asked)!.at - asked;
   ok(`RTCP PLI -> keyframe in ${idrIn} ms`);
 
+  // every keyframe on the wire carries its SPS and PPS at its own RTP timestamp: the first, and the one the PLI
+  // brought (2026-11-16: that one went bare, and Chromium's decoder never started again)
+  const idrs = () => nals.filter((n) => n.nal === 5);
+  assert.ok(idrs().length >= 2, `${idrs().length} keyframes`);
+  const whole = () => idrs().every((k) => nals.some((n) => n.nal === 7 && n.ts === k.ts) && nals.some((n) => n.nal === 8 && n.ts === k.ts));
+  assert.ok(whole(), 'SPS and PPS with every IDR, at the same timestamp');
+  // the client's own ask (its picture stalled): rtc-key brings a keyframe like a PLI does, whole too
+  await sleep(650); // past the 500 ms between two asks
+  const askedKey = Date.now();
+  sendCtl({ type: 'rtc-key' });
+  await until('IDR after rtc-key', () => nals.some((n) => n.nal === 5 && n.at > askedKey), 1500);
+  assert.ok(whole(), 'the rtc-key keyframe has its SPS and PPS');
+  ok(`every keyframe goes with SPS + PPS (${idrs().length} keyframes); rtc-key -> keyframe in ${nals.find((n) => n.nal === 5 && n.at > askedKey)!.at - askedKey} ms`);
+
+  // the RTP clock: frames in order, and as far apart as they were sent
+  const frames = nals.filter((n, i) => i === 0 || n.ts !== nals[i - 1]!.ts);
+  for (let i = 1; i < frames.length; i++) assert.ok(((frames[i]!.ts - frames[i - 1]!.ts) >>> 0) < 0x8000_0000, 'RTP timestamps only go forward');
+  const span = ((frames[frames.length - 1]!.ts - frames[0]!.ts) >>> 0) / 90;
+  const took = frames[frames.length - 1]!.at - frames[0]!.at;
+  assert.ok(Math.abs(span - took) < 300, `RTP time follows real time (${Math.round(span)} ms of timestamps over ${took} ms)`);
+  ok(`RTP timestamps: ${frames.length} frames in order, ${Math.round(span)} ms of 90 kHz time over ${took} ms`);
+
   // ---- input channels ----
   await until('input channels open', () => input.isOpen() && inputR.isOpen());
   inputR.sendMessage(JSON.stringify({ id: 1, type: 'tap', x: 100, y: 200 }));
@@ -171,6 +193,8 @@ try {
   assert.equal(typeof st.capture_to_encoded_ms, 'number');
   assert.equal(typeof st.encoded_to_sent_ms, 'number');
   assert.ok('rtt_ms' in st && 'queue_ms' in st, 'stats carry the RTCP round trip and queue');
+  const mine = (st.sessions ?? []).find((x: any) => x.transport === 'webrtc');
+  assert.ok(mine && mine.keysAsked >= 2, `the session counts the keyframes asked (PLI, rtc-key): ${mine?.keysAsked}`);
   ok(`stats: ${st.fps} fps, ${st.viewers} viewer(s), path ${st.path}, capture->encoded ${st.capture_to_encoded_ms} ms, encoded->sent ${st.encoded_to_sent_ms} ms`);
 
   // ---- errors fall back ----

@@ -214,9 +214,13 @@ export class H264Viewer {
     this.src.requestKey(true);
   }
 
-  /** First frames for a new viewer: the cached config + keyframe right away. `stale` = deltas followed it. */
+  /**
+   * First frames for a new viewer: the cached config + keyframe right away. `stale` = deltas followed it (a fresh
+   * keyframe is on its way). A WebRTC viewer skips a stale one: the fresh keyframe is a frame away, and two keyframes
+   * back to back are a burst that a far link's pacer holds every later frame behind.
+   */
   prime(config: Rec | undefined, key: Rec | undefined, stale: boolean): void {
-    if (key && this.t.open()) {
+    if (key && this.t.open() && !(stale && this.t.kind === 'rtc')) {
       this.sendKey(config, key);
       this.needKey = stale;
     } else this.needKey = true;

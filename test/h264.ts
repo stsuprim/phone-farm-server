@@ -4,7 +4,7 @@ import assert from 'node:assert/strict';
 import { encodeRecord, H264Source, H264Viewer, KIND, ProducerHooks, Rec, RecordParser, Transport, wsMessage } from '../src/h264.js';
 import { mockSpsPps } from '../src/h264mock.js';
 import { firstErrorLine } from '../src/real.js';
-import { parseOffer, pathKind, rtcpWantsKey } from '../src/rtc.js';
+import { hasParameterSets, keyInFlightMs, keyUnit, PaceQueue, parseOffer, pathKind, RtpClock, rtcpWantsKey, STALE_FRAME_MS } from '../src/rtc.js';
 
 let passed = 0;
 const ok = (name: string) => {
@@ -53,10 +53,10 @@ function manual() {
   };
   return { ctl, start };
 }
-function fakeTransport() {
+function fakeTransport(kind: 'ws' | 'rtc' = 'ws') {
   const sent: number[] = [];
   const t: Transport & { buffered_: number; failed: string | null } = {
-    kind: 'ws',
+    kind,
     buffered_: 0,
     failed: null,
     buffered() {
@@ -211,6 +211,98 @@ const info = Buffer.from(JSON.stringify({ width: 100, height: 200, fps: 60 }));
   assert.equal(pathKind('127.0.0.1'), 'loopback');
   assert.equal(pathKind('8.8.8.8'), 'direct');
   ok('offer parsing (H.264 pm=1, 42e01f preferred, playout-delay), RTCP PLI/FIR detection, path kinds');
+}
+
+// ---- WebRTC: SPS and PPS with every keyframe, the RTP clock, the pacer's queue, a new viewer's first keyframe ----
+{
+  // 2026-11-16: only a session's first keyframe carried its SPS and PPS; Chromium's WebRTC decoder can't start from a
+  // bare IDR (it froze: frames arriving, none decoded, PLI after PLI). Every keyframe is one unit: SPS, PPS, IDR.
+  const cfg = mockSpsPps();
+  const idr = Buffer.from([0, 0, 0, 1, 0x65, 0x88, 0x80, 1, 2, 3]);
+  assert.equal(hasParameterSets(idr), false, 'a bare IDR has no parameter sets');
+  const unit = keyUnit(cfg, idr);
+  assert.ok(hasParameterSets(unit), 'SPS, PPS, IDR');
+  assert.ok(unit.subarray(0, cfg.length).equals(cfg) && unit.subarray(cfg.length).equals(idr), 'the config, then the keyframe, untouched');
+  assert.equal(keyUnit(undefined, idr), idr);
+  assert.equal(keyUnit(Buffer.alloc(0), idr), idr);
+  assert.equal(hasParameterSets(Buffer.concat([idr, cfg])), false, 'parameter sets after the IDR are no use');
+  assert.equal(hasParameterSets(Buffer.concat([cfg, Buffer.from([0, 0, 0, 1, 0x41, 9, 9])])), false, 'a delta is not a keyframe');
+  assert.ok(hasParameterSets(Buffer.from([0, 0, 1, 0x67, 1, 0, 0, 1, 0x68, 2, 0, 0, 1, 0x65, 3])), '3-byte start codes');
+
+  // the RTP clock: 90 kHz from the capture times
+  const c = new RtpClock();
+  const t0 = 1_700_000_000_000;
+  // a cached keyframe 8 s old goes first: stamped as just captured, so the fresh frame after it is 33 ms on, not 8 s
+  assert.deepEqual(c.stamp(t0 - 8000, t0), { ts: 0, stale: true });
+  const first = c.stamp(t0 + 28, t0 + 33);
+  assert.deepEqual(first, { ts: 28 * 90, stale: false });
+  let last = first.ts;
+  for (let i = 1; i <= 60; i++) {
+    const cap = t0 + 28 + (i * 1000) / 30;
+    const s = c.stamp(cap, cap + 5 + (i % 3)); // sent 5-7 ms after it was captured
+    assert.equal(s.stale, false);
+    assert.ok(Math.abs(s.ts - last - 3000) <= 1, `30 fps is 3000 ticks a frame (${s.ts - last})`);
+    last = s.ts;
+  }
+  assert.ok(Math.abs(last / 90 - 2028) <= 1, 'two seconds of frames are two seconds of RTP time');
+  // never backwards: the same capture time again, and an older one
+  assert.equal(c.stamp(t0 + 2028, t0 + 2040).ts, last + 1);
+  assert.equal(c.stamp(t0 + 2000, t0 + 2041).ts, last + 2);
+  // a frame older than STALE_FRAME_MS mid-stream (the cached keyframe after a drop) follows the send time
+  const late = c.stamp(t0 + 2100 - STALE_FRAME_MS - 1, t0 + 2100);
+  assert.equal(late.stale, true);
+  assert.ok(Math.abs(late.ts / 90 - (2100 - (c.lag ?? 0))) <= 1, `stamped as sent now (${late.ts / 90} ms)`);
+  // a capture clock that stepped ahead: stamped by the send time too, not minutes in the future
+  const ahead = c.stamp(t0 + 600_000, t0 + 2133);
+  assert.equal(ahead.stale, true);
+  assert.ok(ahead.ts > late.ts && ahead.ts / 90 < 2200);
+  assert.equal(c.stamp(t0 + 2160, t0 + 2166).stale, false);
+  assert.ok(c.lag !== null && c.lag > 4 && c.lag < 14, `capture -> sent is kept (${c.lag} ms)`);
+
+  // the pacer's queue: what was handed to it less what its pace let out
+  const q = new PaceQueue(6_000_000); // 750 bytes a ms
+  q.add(150_000, 1000);
+  assert.equal(q.waiting(1000), 150_000);
+  assert.equal(q.waiting(1100), 75_000);
+  assert.equal(Math.round(q.waitingMs(1100)), 100);
+  q.add(30_000, 1150);
+  assert.equal(q.waiting(1150), 67_500);
+  assert.equal(q.waiting(5000), 0);
+  // a keyframe ask that crossed a keyframe on its way: the round trip, the pacer's queue, and a little
+  assert.equal(keyInFlightMs(null, 0), 50);
+  assert.equal(keyInFlightMs(185, 120), 355);
+  assert.equal(keyInFlightMs(4000, 4000), 2000);
+
+  // a new WebRTC viewer of a running stream waits for the fresh keyframe (no stale one before it); a WebSocket one
+  // and a WebRTC one joining right on a keyframe get the cached one at once
+  const { ctl, start } = manual();
+  const src = new H264Source('t', start, want, { log: () => {} });
+  const opened = src.open();
+  ctl.emit(KIND.INFO, info);
+  ctl.emit(KIND.CONFIG, cfg);
+  ctl.emit(KIND.KEY);
+  await opened;
+  const fresh = fakeTransport('rtc');
+  src.add(new H264Viewer(fresh.t, src));
+  assert.deepEqual(fresh.sent, [KIND.CONFIG, KIND.KEY], 'right on a keyframe: at once');
+  ctl.emit(KIND.DELTA);
+  const rtc = fakeTransport('rtc');
+  const ws = fakeTransport('ws');
+  const k = ctl.keys;
+  src.add(new H264Viewer(rtc.t, src));
+  await sleep(60);
+  src.add(new H264Viewer(ws.t, src));
+  assert.deepEqual(rtc.sent, [], 'WebRTC: nothing until the fresh keyframe');
+  assert.deepEqual(ws.sent, [KIND.CONFIG, KIND.KEY], 'WebSocket: the cached keyframe at once');
+  assert.equal(ctl.keys, k + 2, 'a fresh keyframe is asked for');
+  ctl.emit(KIND.DELTA);
+  assert.deepEqual(rtc.sent, []);
+  ctl.emit(KIND.CONFIG, cfg);
+  ctl.emit(KIND.KEY);
+  ctl.emit(KIND.DELTA);
+  assert.deepEqual(rtc.sent, [KIND.CONFIG, KIND.KEY, KIND.DELTA]);
+  src.close();
+  ok('WebRTC: SPS + PPS with every keyframe, RTP clock (stale and stepped frames, never backwards), pacer queue, fresh first keyframe');
 }
 
 // ---- build error line (h264_reason) ----

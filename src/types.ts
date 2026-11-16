@@ -102,6 +102,8 @@ export interface SessionStats {
   since: number;
   /** The request (the stream's upgrade, the rtc-offer) -> its first frame sent, ms; null until that frame. */
   connectMs?: number | null;
+  /** WebRTC: keyframes the viewer asked for (PLI, FIR, rtc-key); one that keeps climbing is a picture that won't decode. */
+  keysAsked?: number;
 }
 
 /** Per-phone live view stats in GET /phones. Timings are averages in ms; null when unknown. */
