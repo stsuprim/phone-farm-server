@@ -157,6 +157,11 @@ export interface InputMethods {
   hid: 'off' | 'starting' | 'ready' | 'failed' | 'unsupported';
   hid_reason: string | null;
   wda_fast: 'yes' | 'no' | 'unknown';
+  /** Which WebDriverAgent answers on the phone: the stock one, or our own build (src/fork.ts). */
+  wda?: 'stock' | 'fork';
+  /** Live touch through our build (a finger held down between requests): ready, or off with why. */
+  wda_live?: 'ready' | 'off';
+  wda_live_reason?: string | null;
 }
 
 export interface LaneStats {

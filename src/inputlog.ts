@@ -5,8 +5,11 @@
  * `input` part of GET /phones' stats.
  */
 
-/** How an action reached the phone: hid (CoreDevice HID), wda-fast (patched WDA route), wda (the old XCTest route). */
-export type InputVia = 'hid' | 'wda-fast' | 'wda' | 'mock' | 'buffered';
+/**
+ * How an action reached the phone: hid (CoreDevice HID), wda-live (our own WDA build's live touch: a finger held down
+ * between requests), wda-fast (a whole gesture in one command), wda (the old XCTest route).
+ */
+export type InputVia = 'hid' | 'wda-live' | 'wda-fast' | 'wda' | 'mock' | 'buffered';
 
 export interface InputResult {
   via: InputVia;

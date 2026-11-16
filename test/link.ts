@@ -80,9 +80,12 @@ const fakeWda = async () => {
   return w;
 };
 const spawned: string[] = [];
+/** Called as each process is started (a test reads what had happened by the moment a runner was restarted). */
+let onSpawn: ((cmd: string) => void) | null = null;
 const fakeSpawn = ((cmd: string) => {
   const p = new EventEmitter() as ChildProcess & EventEmitter;
   Object.assign(p, { stdout: new PassThrough(), stderr: new PassThrough(), kill: () => true });
+  onSpawn?.(cmd);
   spawned.push(cmd);
   return p;
 }) as unknown as typeof import('node:child_process').spawn;
@@ -153,9 +156,15 @@ const xcodes = () => spawned.filter((c) => c === 'xcodebuild').length;
     await sleep(120);
     assert.equal(await m.probe('U1', 'health check'), true, 'second miss');
     await sleep(120);
+    // (counted at the restart itself: the new runner asks /status too, right away)
+    let asksAtRestart = -1;
+    onSpawn = (cmd) => {
+      if (cmd === 'xcodebuild' && asksAtRestart < 0) asksAtRestart = w.hits.filter((x) => x === 'GET /status').length - statusBefore;
+    };
     const healing = m.probe('U1', 'health check'); // the third, over the span: down
     assert.ok(await until(() => xcodes() === runners + 1), 'the runner is restarted');
-    assert.equal(w.hits.filter((x) => x === 'GET /status').length - statusBefore, 3, '/status was asked three times before anything was restarted');
+    onSpawn = null;
+    assert.equal(asksAtRestart, 3, '/status was asked three times before anything was restarted');
     assert.ok(await until(() => seen.has('recovering')), 'a real outage is said');
     w.slow.probe = 0;
     w.slow.status = 0; // the new runner's WDA answers

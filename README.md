@@ -685,6 +685,55 @@ session WDA has now: when that isn't ours, ours is gone); and the quiet calls th
 health check (the orientation poll, the MJPEG settings), which now have the session remade right then. A refusal on a
 session that is still ours is the phone's answer: it's passed on, not retried.
 
+## Our own WebDriverAgent build (2026-11-16)
+
+The phones run **our own WebDriverAgent build**: `wda/` in this repo, Appium's WebDriverAgent at tag v16.15.3 (BSD-3,
+its licence kept) with our changes on top. What it changes, file by file, and what still has to be seen on a real
+phone: [wda/LOTUS.md](wda/LOTUS.md).
+
+- **A token on every request.** A stock WebDriverAgent answers anyone who reaches its port (another app on the phone,
+  anything on the LAN). Ours answers only requests that carry `X-Lotus-Token`, a secret made per phone by this server
+  (`data/wda-tokens.json`, readable by this user only, never in git, never logged) and given to the build at launch
+  through xcodebuild's environment (`TEST_RUNNER_LOTUS_WDA_TOKEN`). Anything else gets a bare `404` with no body: no
+  `/status`, no WebDriverAgent JSON. The compare is constant-time.
+- **No MJPEG server.** It's gone from the code: nothing listens on 9100. Stills come from `GET /lotus/shot`.
+- **Its own port per phone**: `WDA_FORK_BASE_PORT` (28100) + the phone's index, the same number on the phone and on
+  the Mac; `WDA_FORK_PORTS=udid=port,…` gives a phone its own.
+- **Only the routes this server uses** (status, session, screenshot, the UI tree, tap, W3C actions, keys, apps, lock and
+  unlock, orientation, the app in front, battery and device info, and `/lotus/…`); the rest answer "unknown command".
+- **One command per gesture** (`POST /lotus/gesture`): the curve of a natural swipe is drawn here (`src/human.ts`,
+  seeded) and sent whole; the phone plays all of it by itself, smooth whatever the link does meanwhile.
+- **Live touch** (`POST /lotus/touch`): a finger held down on the phone from "down" to "up", moved as the moves come
+  (`via: "wda-live"`), for phones without CoreDevice HID (before iOS 27). It's used only with the way of holding a
+  finger down that the phone's own self-test found working (`POST /lotus/selftest`, run by the server right after the
+  install); until then, or when none works, a drag is buffered and played whole on "up" as on a stock WebDriverAgent.
+  `stats.input.methods` says `wda: "fork" | "stock"`, `wda_live: "ready" | "off"` and `wda_live_reason`.
+
+**It installs itself** (`src/fork.ts`). When the build in the repo (`wda/LOTUS_FORK.json`'s `version`) is newer than
+what a phone runs (right after the server pulls a commit that changes it, or when a phone that hasn't got it is plugged
+in), the server builds and signs it for that phone with `scripts/build-wda.sh` (`WDA_BUILD_FLAVOR=fork`: the same team,
+certificate and bundle id as the 6-day re-sign, so the phone's developer trust stays valid), into its own build folder
+(`WDA_FORK_DERIVED_DATA`, `~/wda-fork-build`). The stock WebDriverAgent keeps running until then. The runner is then
+switched; if ours doesn't answer with its token within 4 minutes (or the phone refuses the install) the stock one is put
+back at once and it's tried again after 2, 5, 15, 30, 60, 180 minutes, then every 6 hours, the phone woken before each
+try. Ours that stops staying up later (three runner exits in a row) falls back to stock the same way. The install is a
+fresh sign: the 6-day re-sign counts from it and builds each phone's own kind from then on. With no `WDA_TEAM_ID` in
+`.env` the team is read from the WebDriverAgent that's already built.
+
+`GET /api/wda` adds `fork: { enabled, version, upstream, problem, perDevice: { <udid>: { state, version, reason,
+attempts, nextTryAt, port, live: { tested, mode, why, notes } } } }`; `state` is `stock`, `building`, `installing`,
+`fork`, `waiting` (the build failed) or `rolled-back`. The log says the same under `[wda-fork]`.
+
+Before our build is kept on a phone it must also do the work: a session, the screen's size and a still (else the stock
+one comes back). It can be turned off from afar, since the Mac pulls this repo by itself: `"enabled": false` in
+`wda/LOTUS_FORK.json` puts every phone back on the stock WebDriverAgent once the Mac has pulled it, and
+`"liveTouch": "off"` there stops live touch through our build. Its Objective-C can be syntax-checked on a PC:
+`python scripts/objc-check/check.py .` and `check2.py .` (clang's front end through `pip install libclang`,
+against stand-in headers; not a build).
+
+A stock WebDriverAgent (a phone not switched yet, or `WDA_FORK=false`) is talked to exactly as before: 8100 and 9100
+on the phone, no token, MJPEG stills, whole gestures by `/wda/lotus/touch`.
+
 ## Idle lock, WDA re-sign, profiles and thumbnails (2026-11-15)
 
 - **Idle lock** (`src/idle.ts`): after `idleLockMinutes` (GET/PUT `/api/settings`, default 10, 0 = off) with no input and
@@ -740,6 +789,8 @@ session that is still ours is the phone's answer: it's passed on, not retried.
 7. **Run**: `npm start`. Within ~10-30 s of plugging a phone in, `GET /phones` shows `online:true, ready:true`.
    Per phone the server runs `xcodebuild test-without-building` (WDA) plus two `iproxy` forwards (WDA port 8100+n, MJPEG 9100+n;
    the slot `n` per UDID is remembered in `data/ports.json`), restarts WDA with backoff if it dies, and stops it when the phone is unplugged.
+   A few minutes later it builds and installs [our own WebDriverAgent build](#our-own-webdriveragent-build-2026-11-16) on the phone
+   by itself (one forward, port 28100+n, no MJPEG); the stock one of this step is the fallback.
 8. **Network**: the server listens on `HOST=0.0.0.0:8787`, so it is reachable on the LAN and via Tailscale
    (`brew install --cask tailscale`, then use the Mac's Tailscale IP). Allow incoming connections for `node` if the macOS firewall asks.
    Because this API can control phones, keep the token secret and don't port-forward it to the internet.
@@ -802,7 +853,10 @@ Input: `HID_INPUT` (`auto` = iOS 27+ phones, `on` = try every phone, `off`), `HI
 default `~/.phonefarm-hid/bin/python` if it exists, else `python3`), `HID_IDLE_SECONDS` (120), `HID_TUNNEL` (`auto`,
 `userspace`, `native`, `tunneld`), `WDA_FAST` (`0` = never try the fast route), `INPUT_LOG` (`0` = no per-action lines), `HID_LANDSCAPE` (`on` default, `swap`, `off`), `WDA_FAST_LANDSCAPE` (`1` = the fast route in landscape too), `CAPTURE_ROTATE` (`off` default; `cw`/`ccw` turn a sideways picture upright; `90`/`180`/`270` always turn it);
 `WDA_PATCH=0` makes `scripts/build-wda.sh` build WDA unpatched. WDA re-sign: `WDA_TEAM_ID` (the Apple Team ID),
-`WDA_RESIGN` (true), `WDA_RESIGN_HOUR` (3: the quiet window is 03:00-06:00 local). Video: `RTC_PLAYOUT_ZERO=1` gives far viewers
+`WDA_RESIGN` (true), `WDA_RESIGN_HOUR` (3: the quiet window is 03:00-06:00 local). Our own WebDriverAgent build:
+`WDA_FORK` (true; `false` keeps the stock one), `WDA_FORK_BASE_PORT` (28100), `WDA_FORK_PORTS` (`udid=port,…`),
+`WDA_FORK_DERIVED_DATA` (`~/wda-fork-build`), `WDA_LIVE_TOUCH` (`auto`: live touch with the mode the phone's self-test found;
+`off`; `on`: mode 1 without the self-test). Video: `RTC_PLAYOUT_ZERO=1` gives far viewers
 playout-delay 0/0 again.
 
 ## Notes / known limits

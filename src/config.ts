@@ -1,5 +1,6 @@
 import fs from 'node:fs';
 import os from 'node:os';
+import { parsePorts } from './fork.js';
 
 export interface Config {
   host: string;
@@ -36,6 +37,22 @@ export interface Config {
   wdaResign: boolean;
   /** Local hour the quiet re-sign window starts (3 hours long). */
   wdaResignHour: number;
+  /**
+   * Our own WebDriverAgent build (wda/ in this repo, src/fork.ts): installed on each phone by the server itself
+   * (WDA_FORK, on by default; off = the stock WebDriverAgent of WDA_PROJECT stays).
+   */
+  wdaFork?: boolean;
+  /** Where our build is built (WDA_FORK_DERIVED_DATA, default ~/wda-fork-build): apart from the stock one's, which stays for a rollback. */
+  wdaForkDerivedData?: string;
+  /** Our build's port on the first phone, on the phone and on the Mac (WDA_FORK_BASE_PORT, default 28100); the next phone's is one higher. */
+  wdaForkBasePort?: number;
+  /** A phone's own port (WDA_FORK_PORTS=udid=port,udid=port), when base + index doesn't suit. */
+  wdaForkPorts?: Record<string, number>;
+  /**
+   * Live touch through our build (WDA_LIVE_TOUCH): auto (default) = only with the mode a phone's own self-test found
+   * working; on = mode 1 even without the self-test's word; off = never (drags play whole on "up").
+   */
+  wdaLiveTouch?: 'auto' | 'on' | 'off';
 }
 
 function loadDotEnv(file: string): void {
@@ -89,5 +106,10 @@ export function loadConfig(envFile = '.env'): Config {
     wdaTeamId: (e.WDA_TEAM_ID ?? '').trim(),
     wdaResign: bool(e.WDA_RESIGN, true),
     wdaResignHour: Math.min(23, Math.max(0, Math.round(num(e.WDA_RESIGN_HOUR, 3)))),
+    wdaFork: bool(e.WDA_FORK, true),
+    wdaForkDerivedData: expand(e.WDA_FORK_DERIVED_DATA || '~/wda-fork-build'),
+    wdaForkBasePort: Math.min(65000, Math.max(1024, Math.round(num(e.WDA_FORK_BASE_PORT, 28100)))),
+    wdaForkPorts: parsePorts(e.WDA_FORK_PORTS),
+    wdaLiveTouch: /^(on|off)$/i.test(e.WDA_LIVE_TOUCH ?? '') ? (e.WDA_LIVE_TOUCH!.toLowerCase() as 'on' | 'off') : 'auto',
   };
 }

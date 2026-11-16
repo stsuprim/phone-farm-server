@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import http from 'node:http';
 import path from 'node:path';
 import { Config } from './config.js';
+import { FORK_ROUTES, ForkLaunch, launchPlan, TOKEN_ENV, TOKEN_HEADER, WdaFlavor } from './fork.js';
 import { isLandscape, Orientation, orientationFromWda, portraitSize, uprightSize, uprightToPanel } from './orient.js';
 import { ButtonName, ControlState, HttpError, PathPoint, ScreenInfo, StreamSettings } from './types.js';
 
@@ -77,6 +78,23 @@ interface Entry {
   /** Recoveries and runner restarts so far, and why the last recovery ran (stats). */
   recoveries: number;
   runnerRestarts: number;
+  /** Which WebDriverAgent runs (or is being started) on the phone: the stock one, or our own build (src/fork.ts). */
+  flavor: WdaFlavor;
+  /** Our build's token for this phone (sent with every request; never logged). Undefined on a stock WDA. */
+  token?: string;
+  /** The xcodebuild process of the runner now. */
+  runner?: ChildProcess;
+  /** What our build said of itself (GET /lotus/info) when it came up; null on a stock WDA. */
+  forkInfo: { lotus: number; upstream?: string } | null;
+  /** A switch of flavor in progress (src/fork.ts installs our build): a runner that exits isn't relaunched with a back-off. */
+  switching: boolean;
+  /** Why the runner last failed to start (xcodebuild's exit and the end of what it said), for whoever switches. */
+  launchError: string | null;
+  /** Our build's live touch stopped working since the runner started (what XCTest said): not used until it restarts. */
+  liveFailed: string | null;
+  /** Our build's runner ended this many times in a row without staying up FORK_STABLE_MS, and when it last came up. */
+  forkFails: number;
+  readyAt: number;
 }
 
 /** One self-heal: when (ms since the epoch) and why. */
@@ -133,6 +151,34 @@ export const FAST_TAP_HOLD_MS = 50;
 /** The route scripts/patch-wda.mjs adds to WebDriverAgent (keep the two in step). */
 export const FAST_TOUCH_ROUTE = '/wda/lotus/touch';
 
+/** Our build whose runner ends this many times in a row (outside an install) is given up on: the stock one comes back. */
+export const FORK_GIVE_UP = 3;
+/** A runner of our build that stayed up this long was fine: its next end starts the count afresh. */
+export const FORK_STABLE_MS = 60_000;
+/** A runner left failed by a switch nobody followed up on is started again after this long. */
+const SWITCH_RETRY_MS = 15_000;
+/** One live touch event gets this long to be answered (it's answered when queued on the phone). */
+export const LIVE_TOUCH_TIMEOUT_MS = 2500;
+
+/** The route a whole gesture goes to as one command: our build's, or the one scripts/patch-wda.mjs adds to a stock WDA. */
+export function gestureRoute(flavor: WdaFlavor): string {
+  return flavor === 'fork' ? FORK_ROUTES.gesture : FAST_TOUCH_ROUTE;
+}
+
+/**
+ * The body of a whole gesture in one command (both builds take the same): every point with its time, in portrait
+ * points; the phone plays all of it by itself, so a natural swipe's curve stays smooth whatever the link does
+ * meanwhile. `hold`: lift this long after the last point (a tap's hold).
+ */
+export function gestureBody(points: PathPoint[], hold?: number): { points: PathPoint[]; orientation: 1; hold?: number } {
+  return { ...(hold !== undefined ? { hold } : {}), points, orientation: 1 };
+}
+
+/** The body of one live touch event for our build (POST /lotus/touch): the place in portrait points and the mode its self-test found. */
+export function liveBody(phase: 'down' | 'move' | 'up', [x, y]: [number, number], mode: number): { phase: string; x: number; y: number; mode: number; orientation: 1 } {
+  return { phase, x, y, mode, orientation: 1 };
+}
+
 /** W3C pointer actions for one finger through the points (x, y in points, t = ms since start). */
 export function pointerActions(pts: PathPoint[]): unknown[] {
   const p0 = pts[0]!;
@@ -187,6 +233,65 @@ export class WdaManager {
     this.health.unref();
   }
 
+  // ---- stock WebDriverAgent or our own build (src/fork.ts) ----
+
+  /** Set by the backend: how a phone's WDA starts when the server does, and what our build needs to be launched on it. */
+  fork?: { flavorAtStart(udid: string): WdaFlavor; launch(udid: string): ForkLaunch; failed(udid: string, why: string): void; liveMode(udid: string): number };
+
+  /** Which WebDriverAgent the phone runs (or is being started with). */
+  flavor(udid: string): WdaFlavor {
+    return this.entries.get(udid)?.flavor ?? 'stock';
+  }
+
+  /** Our build is up on the phone and said so (GET /lotus/info answered); null on a stock WDA. */
+  forkInfo(udid: string): { lotus: number; upstream?: string } | null {
+    const e = this.entries.get(udid);
+    return e && e.status === 'ready' ? e.forkInfo : null;
+  }
+
+  /**
+   * Restart the phone's runner as `flavor` and wait until it answers: /status, and for our build its /lotus/info
+   * too. Resolves `{ok: false, why}` when it doesn't within `timeoutMs`, or xcodebuild gives up first (the install
+   * was refused: a locked phone, an expired profile). The caller decides what then (src/fork.ts puts the stock one back).
+   */
+  async switchFlavor(udid: string, flavor: WdaFlavor, timeoutMs = 4 * 60_000): Promise<{ ok: boolean; why?: string }> {
+    const e = this.entries.get(udid);
+    if (!e || !e.wanted) return { ok: false, why: 'WebDriverAgent is not running for this phone (is it plugged in and trusted?)' };
+    this.log(e, `switching the runner to ${flavor === 'fork' ? 'our own WebDriverAgent build' : 'the stock WebDriverAgent'}`);
+    e.flavor = flavor;
+    e.switching = true;
+    e.restarts = 0;
+    e.forkFails = 0;
+    e.launchError = null;
+    try {
+      this.restart(e);
+      const until = Date.now() + timeoutMs;
+      while (e.wanted && e.flavor === flavor && Date.now() < until) {
+        if (e.status === 'ready' && (flavor === 'stock' || e.forkInfo)) return { ok: true };
+        if (e.status === 'ready' && flavor === 'fork') return { ok: false, why: 'something answers on its port, but it is not our build (no /lotus/info)' };
+        if (e.status === 'failed') return { ok: false, why: e.launchError ?? 'xcodebuild exited before WebDriverAgent answered' };
+        await sleep(250);
+      }
+      return { ok: false, why: !e.wanted ? 'the phone was unplugged' : `WebDriverAgent did not answer within ${Math.round(timeoutMs / 1000)} s${e.launchError ? ` (${e.launchError})` : ''}` };
+    } finally {
+      e.switching = false;
+      // A runner left "failed" by the switch has no restart pending. Whoever asked usually switches again at once
+      // (src/fork.ts puts the stock one back), which takes over; if nobody does, it's started again by itself.
+      if (e.wanted && e.status === 'failed' && !e.timer) {
+        e.timer = setTimeout(() => {
+          e.timer = undefined;
+          if (e.wanted && e.status === 'failed') this.launch(e);
+        }, SWITCH_RETRY_MS);
+        e.timer.unref?.();
+      }
+    }
+  }
+
+  /** The phone's index (kept in data/ports.json): its Mac ports are the bases plus it. */
+  slotOf(udid: string): number {
+    return this.slot(udid);
+  }
+
   private slot(udid: string): number {
     if (this.ports[udid] === undefined) {
       const used = new Set(Object.values(this.ports));
@@ -199,12 +304,18 @@ export class WdaManager {
     return this.ports[udid]!;
   }
 
+  /** `m` with the phone's token (our build's secret) taken out, should anything that's printed ever hold it. */
+  private clean(e: Entry, m: string): string {
+    return e.token ? m.split(e.token).join('[token]') : m;
+  }
+
   private log(e: Entry, m: string): void {
-    console.log(`[wda ${e.udid.slice(-8)}] ${m}`); // UDID end: the start (00008110...) is the chip, same on both phones
+    console.log(`[wda ${e.udid.slice(-8)}] ${this.clean(e, m)}`); // UDID end: the start (00008110...) is the chip, same on both phones
   }
 
   /** A self-heal: counted, kept as the phone's last one and logged with its reason. */
   private healed(e: Entry, reason: string): void {
+    reason = this.clean(e, reason);
     e.heals++;
     e.lastHeal = { at: Date.now(), reason: reason.slice(0, 200) };
     console.log(`[wda-heal] ${e.udid.slice(-8)} ${reason}`);
@@ -279,12 +390,13 @@ export class WdaManager {
    * Whether this phone's WDA has its MJPEG server (WDA's screenshots as a JPEG stream; stock WDA: yes). A WDA built
    * without it gives stills as PNG screenshots only (src/stills.ts asks here).
    */
-  mjpegAvailable(_udid: string): boolean {
-    return true;
+  mjpegAvailable(udid: string): boolean {
+    return this.entries.get(udid)?.flavor !== 'fork';
   }
   mjpegPort(udid: string): number {
     const e = this.entries.get(udid);
     if (!e) throw new HttpError(503, 'WebDriverAgent is not running for this phone');
+    if (e.flavor === 'fork') throw new HttpError(503, 'this WebDriverAgent build has no MJPEG server');
     return e.mjpegPort;
   }
 
@@ -297,7 +409,10 @@ export class WdaManager {
       wanted: true, procs: [], restarts: 0, checking: false, lastOk: 0, orientation: null, orientAt: 0, tapRoute: 0, fast: 'unknown', fastFails: 0,
       mjpeg: { ...DEFAULT_MJPEG }, agent: newAgent(), heals: 0, lastHeal: null, inflight: 0,
       busy: 0, lastAnswer: 0, misses: 0, missAt: 0, unreadyAt: 0, recoveries: 0, runnerRestarts: 0,
+      flavor: 'stock', forkInfo: null, switching: false, launchError: null, liveFailed: null, forkFails: 0, readyAt: 0,
     };
+    // ours when it was installed on this phone and ran (src/fork.ts), else the stock one
+    e.flavor = this.fork?.flavorAtStart(udid) ?? 'stock';
     e.wanted = true;
     this.entries.set(udid, e);
     this.launch(e);
@@ -317,6 +432,7 @@ export class WdaManager {
     e.timer = undefined;
     for (const p of e.procs) p.kill('SIGTERM');
     e.procs = [];
+    e.runner = undefined; // killed on purpose: its exit isn't a failure to act on
     e.sessionId = undefined;
     e.sessionP = undefined;
     e.mjpegApplied = undefined;
@@ -348,6 +464,24 @@ export class WdaManager {
     e.status = 'failed';
     e.control = 'down';
     e.restarts++;
+    why = this.clean(e, why);
+    e.launchError = why.slice(0, 300);
+    // a switch of flavor is watching (switchFlavor): it decides what's launched next
+    if (e.switching) return void this.log(e, why);
+    // Our build's runner ended by itself. One that had stayed up a while starts the count afresh (a phone unplugged
+    // for a moment, an iOS hiccup); three in a row that didn't (it won't start, or dies right after it does): the
+    // stock one comes back, and ours is tried again later (src/fork.ts).
+    if (e.flavor === 'fork') {
+      if (e.readyAt && Date.now() - e.readyAt >= FORK_STABLE_MS) e.forkFails = 0;
+      e.readyAt = 0;
+      if (++e.forkFails >= FORK_GIVE_UP) {
+        e.flavor = 'stock';
+        e.restarts = 0;
+        e.forkFails = 0;
+        this.fork?.failed(e.udid, why);
+        this.healed(e, `our WebDriverAgent build did not stay up ${FORK_GIVE_UP} times in a row (${why}); back to the stock one`);
+      }
+    }
     const delay = Math.min(30000, 1000 * 2 ** Math.min(e.restarts, 5));
     this.log(e, `${why}; restart in ${delay / 1000}s`);
     e.timer = setTimeout(() => {
@@ -379,14 +513,21 @@ export class WdaManager {
       return p;
     };
 
-    // device ports are fixed (8100 / 9100); the Mac-side ports differ per phone. A forward that dies (a usbmuxd
+    // Stock: WDA's default ports on the phone (8100, and 9100 for MJPEG), forwarded to this phone's Mac ports. Ours:
+    // its own high port and its token, no MJPEG at all (src/fork.ts launchPlan). A forward that dies (a usbmuxd
     // hiccup, the phone re-enumerating after a long sleep) is started again by itself: WDA is still fine, and without
     // its forward every request looked like WDA being down (a slow full restart).
+    const plan = launchPlan(this.cfg, e.udid, this.slot(e.udid), e.flavor === 'fork' && this.fork ? this.fork.launch(e.udid) : null);
+    e.flavor = plan.flavor;
+    e.wdaPort = plan.wda.local;
+    e.token = plan.flavor === 'fork' ? plan.env[`TEST_RUNNER_${TOKEN_ENV}`] : undefined;
+    e.forkInfo = null;
+    e.liveFailed = null;
     const forward = (slot: 0 | 1, local: number, remote: number): ChildProcess => {
       const p = spawnLogged('iproxy', ['-u', e.udid, `${local}:${remote}`]);
       p.on('exit', (code) => {
         if (!e.wanted || e.procs[slot] !== p) return; // killed on purpose, or superseded
-        this.healed(e, `the ${remote === 8100 ? 'WDA' : 'MJPEG'} port forward (iproxy :${local}) exited (${code}); starting it again`);
+        this.healed(e, `the ${slot === 0 ? 'WDA' : 'MJPEG'} port forward (iproxy :${local}) exited (${code}); starting it again`);
         setTimeout(() => {
           if (!e.wanted || e.procs[slot] !== p) return;
           if (slot === 0) {
@@ -398,32 +539,37 @@ export class WdaManager {
       });
       return p;
     };
-    const fwdWda = forward(0, e.wdaPort, 8100);
-    const fwdMjpeg = forward(1, e.mjpegPort, 9100);
-    const xcode = spawnLogged(
-      'xcodebuild',
-      [
-        'test-without-building',
-        '-project', path.join(this.cfg.wdaProject, 'WebDriverAgent.xcodeproj'),
-        '-scheme', 'WebDriverAgentRunner',
-        '-destination', `id=${e.udid}`,
-        '-derivedDataPath', this.cfg.wdaDerivedData,
-      ],
-      { TEST_RUNNER_USE_PORT: '8100', TEST_RUNNER_MJPEG_SERVER_PORT: '9100' },
-    );
-    e.procs = [fwdWda, fwdMjpeg, xcode];
-    this.log(e, `starting (wda :${e.wdaPort}, mjpeg :${e.mjpegPort})`);
+    const fwdWda = forward(0, plan.wda.local, plan.wda.device);
+    const fwdMjpeg = plan.mjpeg ? forward(1, plan.mjpeg.local, plan.mjpeg.device) : null;
+    // the environment holds our build's token: it's handed to xcodebuild and never logged
+    const xcode = spawnLogged('xcodebuild', plan.args, plan.env);
+    e.runner = xcode;
+    e.procs = fwdMjpeg ? [fwdWda, fwdMjpeg, xcode] : [fwdWda, xcode];
+    this.log(e, plan.mjpeg ? `starting (wda :${plan.wda.local}, mjpeg :${plan.mjpeg.local})` : `starting our own build (wda :${plan.wda.local} on the Mac and the phone, token set, no MJPEG)`);
 
+    // what xcodebuild said about a refused install or signing (a locked phone, an expired profile), for the switch's "why"
+    const tail: string[] = [];
+    const keep = (d: Buffer) => {
+      for (const l of d.toString().split(/\r?\n/)) if (/error|fail|unable|cannot|locked|trust|profile|sign/i.test(l)) tail.push(l.trim().slice(0, 160));
+      if (tail.length > 4) tail.splice(0, tail.length - 4);
+    };
+    xcode.stdout?.on('data', keep);
+    xcode.stderr?.on('data', keep);
     xcode.on('exit', (code) => {
-      if (e.procs[2] !== xcode) return; // superseded
-      this.relaunchLater(e, `xcodebuild exited (${code})`);
+      if (e.runner !== xcode) return; // superseded
+      this.relaunchLater(e, `xcodebuild exited (${code})${tail.length ? `: ${tail.join(' | ')}` : ''}`);
     });
 
     // poll WDA /status until it answers, then warm a session
     const waitReady = async () => {
-      for (let i = 0; i < 360 && e.wanted && e.procs[2] === xcode; i++) {
+      for (let i = 0; i < 360 && e.wanted && e.runner === xcode; i++) {
         if ((await this.ping(e, 2000)).ok) {
-          if (e.procs[2] !== xcode) return;
+          if (e.runner !== xcode) return;
+          // which WebDriverAgent answered: ours says so (and its version); a stock one doesn't know the route
+          e.forkInfo = await this.askFork(e);
+          if (e.runner !== xcode) return;
+          if (e.forkInfo) this.log(e, `our own build answers (v${e.forkInfo.lotus}${e.forkInfo.upstream ? `, ${e.forkInfo.upstream}` : ''})`);
+          e.readyAt = Date.now();
           e.status = 'ready';
           e.restarts = 0;
           e.lastOk = Date.now();
@@ -438,7 +584,7 @@ export class WdaManager {
         }
         await sleep(500);
       }
-      if (e.wanted && e.procs[2] === xcode) this.relaunchLater(e, 'WDA did not answer within 3 minutes');
+      if (e.wanted && e.runner === xcode) this.relaunchLater(e, 'WDA did not answer within 3 minutes');
     };
     void waitReady();
   }
@@ -470,6 +616,8 @@ export class WdaManager {
         headers['content-type'] = 'application/json';
         headers['content-length'] = Buffer.byteLength(body);
       }
+      // our build answers nothing without its token (never logged: this header is the only place it goes)
+      if (e.token) headers[TOKEN_HEADER] = e.token;
       const req = http.request({ host: '127.0.0.1', port: e.wdaPort, path: p, method, agent: e.agent, headers }, (res) => {
         const chunks: Buffer[] = [];
         res.on('data', (c: Buffer) => chunks.push(c));
@@ -544,6 +692,23 @@ export class WdaManager {
     } catch {
       return { ok: false };
     }
+  }
+
+  /** GET /lotus/info: what our build says of itself; null when this WDA isn't ours (a stock one answers "unknown command"). */
+  private async askFork(e: Entry): Promise<{ lotus: number; upstream?: string } | null> {
+    // a stock WDA is never asked: it would only log an unknown route (and it's launched without a token anyway)
+    if (e.flavor !== 'fork') return null;
+    for (let n = 0; n < 2; n++) {
+      try {
+        const v = (await this.raw(e, 'GET', FORK_ROUTES.info, undefined, 4000))?.value;
+        const lotus = Number(v?.lotus);
+        return Number.isInteger(lotus) && lotus >= 1 ? { lotus, ...(typeof v.upstream === 'string' ? { upstream: v.upstream } : {}) } : null;
+      } catch (err) {
+        // "unknown command": not our build. Anything else (it answered /status a moment ago): asked once more.
+        if (err instanceof WdaError && err.kind === 'unknown') return null;
+      }
+    }
+    return null;
   }
 
   private session(e: Entry): Promise<string> {
@@ -1075,8 +1240,8 @@ export class WdaManager {
         }
         return [Math.round(x * 10) / 10, Math.round(y * 10) / 10, Math.round(t)];
       });
-      await this.callNoSession(udid, 'POST', FAST_TOUCH_ROUTE, { ...body, points, orientation: 1 }, Math.min(5000, this.timeouts.input));
-      if (e.fast !== 'yes') this.log(e, 'fast touch route answers (patched WDA)');
+      await this.callNoSession(udid, 'POST', gestureRoute(e.forkInfo ? 'fork' : 'stock'), gestureBody(points as PathPoint[], body.hold), Math.min(5000, this.timeouts.input));
+      if (e.fast !== 'yes') this.log(e, e.forkInfo ? 'whole gestures go as one command each (our build)' : 'fast touch route answers (patched WDA)');
       e.fast = 'yes';
       e.fastFails = 0;
       return true;
@@ -1177,6 +1342,112 @@ export class WdaManager {
       })().finally(() => {
         e.checking = false;
       });
+    }
+  }
+
+  // ---- our build only: live touch, stills, the self-test ----
+
+  /** A point of the upright screen as our build's portrait record wants it (turned onto the panel in landscape). */
+  private panel(e: Entry, x: number, y: number): [number, number] {
+    const turned = !!e.orientation && e.orientation !== 'portrait';
+    if (turned && e.screen) {
+      const up = uprightSize(e.screen, e.orientation);
+      const [px, py] = uprightToPanel(x / up.width, y / up.height, e.orientation);
+      [x, y] = [px * e.screen.width, py * e.screen.height];
+    }
+    return [Math.round(x * 10) / 10, Math.round(y * 10) / 10];
+  }
+
+  /**
+   * Why this phone's WDA can't hold a finger down across requests right now, or null when it can: our build is up,
+   * its self-test found a working mode (src/fork.ts), nothing broke since, and the phone is in portrait (or
+   * WDA_FAST_LANDSCAPE=1). WDA_LIVE_TOUCH=off turns it off; =on uses mode 1 without the self-test's word.
+   */
+  liveWhy(udid: string): string | null {
+    const e = this.entries.get(udid);
+    if ((this.cfg.wdaLiveTouch ?? 'auto') === 'off') return 'live touch through WebDriverAgent is turned off (WDA_LIVE_TOUCH=off)';
+    if (!e || e.status !== 'ready' || !e.forkInfo) return 'the stock WebDriverAgent cannot hold a finger down between requests: the drag plays on "up" (our own build can)';
+    if (e.liveFailed) return `live touch stopped working on this phone (${e.liveFailed}): the drag plays on "up"`;
+    if (!this.liveModeOf(udid)) return 'the self-test on this phone found no way to hold a finger down (or has not run yet): the drag plays on "up"';
+    if (e.orientation && e.orientation !== 'portrait' && process.env.WDA_FAST_LANDSCAPE !== '1') return `live touch is portrait only here and the phone is ${e.orientation}: the drag plays on "up"`;
+    return null;
+  }
+
+  private liveModeOf(udid: string): number {
+    const found = this.fork?.liveMode(udid) ?? 0;
+    return found || ((this.cfg.wdaLiveTouch ?? 'auto') === 'on' ? 1 : 0);
+  }
+
+  /**
+   * One event of a live touch to our build (POST /lotus/touch): the finger stays down on the phone between requests.
+   * Never recovers or restarts anything: a failure throws, and the caller lifts and says so.
+   */
+  async liveTouch(udid: string, phase: 'down' | 'move' | 'up', x: number, y: number): Promise<void> {
+    const e = this.entries.get(udid);
+    const why = this.liveWhy(udid);
+    if (!e || why) throw new HttpError(503, why ?? 'WebDriverAgent is not running for this phone');
+    const mode = this.liveModeOf(udid);
+    const at = this.panel(e, x, y);
+    const v = (await this.raw(e, 'POST', FORK_ROUTES.touch, liveBody(phase, at, mode), LIVE_TOUCH_TIMEOUT_MS))?.value;
+    if (typeof v?.failed === 'string' && v.failed) {
+      // XCTest refused (or never answered) a live record: not used again until the runner restarts. Whatever of the
+      // touch did reach the screen is lifted now (the phone would lift it by itself only after its own 10 s).
+      if (phase !== 'up') void this.raw(e, 'POST', FORK_ROUTES.touch, liveBody('up', at, mode), LIVE_TOUCH_TIMEOUT_MS).catch(() => {});
+      e.liveFailed = v.failed.slice(0, 160);
+      this.log(e, `live touch failed on the phone (${e.liveFailed}); drags play whole from now on`);
+      throw new HttpError(502, `the phone could not play the live touch (${e.liveFailed})`);
+    }
+  }
+
+  /**
+   * After a switch to our build: does it do the work, not just answer? A session could be made, the screen's size is
+   * known, and a still comes. Null when it does; else what's missing (the caller puts the stock one back).
+   */
+  async forkWorks(udid: string, waitMs = 20_000): Promise<string | null> {
+    const e = this.entries.get(udid);
+    if (!e || !e.forkInfo) return "our build isn't up";
+    const until = Date.now() + waitMs;
+    while (Date.now() < until && e.status === 'ready' && !(e.sessionId && e.screen)) {
+      await this.session(e).catch(() => {});
+      if (!(e.sessionId && e.screen)) await sleep(500);
+    }
+    if (e.status !== 'ready') return 'its runner stopped right after it started';
+    if (!e.sessionId) return 'it answers, but no session could be made';
+    if (!e.screen) return "it answers, but doesn't say the screen's size";
+    try {
+      const jpeg = await this.shot(udid, 25, 40, 10_000);
+      if (jpeg.length < 4 || jpeg[0] !== 0xff || jpeg[1] !== 0xd8) return 'its still is not a JPEG';
+    } catch (err) {
+      return `it gave no still (${(err as Error).message})`;
+    }
+    this.setControl(e, 'ready');
+    return null;
+  }
+
+  /** One still as a JPEG from our build (GET /lotus/shot), `scale` and `quality` 1-100; never recovers anything. */
+  async shot(udid: string, scale: number, quality: number, timeout = 8000): Promise<Buffer> {
+    const e = this.entries.get(udid);
+    if (!e || !e.wanted || e.status !== 'ready' || !e.forkInfo) throw new WdaError('rejected', `our WebDriverAgent build isn't up on ${this.nameOf(udid)}`);
+    const v = (await this.raw(e, 'GET', `${FORK_ROUTES.shot}?scale=${Math.round(scale)}&quality=${Math.round(quality)}`, undefined, timeout))?.value;
+    if (typeof v?.jpeg !== 'string' || !v.jpeg) throw new WdaError('rejected', 'the phone gave no still');
+    return Buffer.from(v.jpeg, 'base64');
+  }
+
+  /** The phone's own live-touch self-test (POST /lotus/selftest, our build): which way of holding a finger down works. */
+  async selftest(udid: string): Promise<{ tested: boolean; mode: number; why?: string | null; notes?: string[] }> {
+    const e = this.entries.get(udid);
+    if (!e || !e.wanted || e.status !== 'ready' || !e.forkInfo) return { tested: false, mode: 0, why: "our WebDriverAgent build isn't up on the phone" };
+    e.inflight++;
+    try {
+      const v = (await this.raw(e, 'POST', FORK_ROUTES.selftest, {}, 40_000))?.value;
+      return {
+        tested: v?.tested === true, mode: Number.isInteger(v?.mode) ? v.mode : 0, why: typeof v?.why === 'string' ? v.why : null,
+        notes: Array.isArray(v?.notes) ? v.notes.filter((n: unknown) => typeof n === 'string') : undefined,
+      };
+    } catch (err) {
+      return { tested: false, mode: 0, why: (err as Error).message };
+    } finally {
+      e.inflight--;
     }
   }
 

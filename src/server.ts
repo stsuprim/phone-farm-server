@@ -22,6 +22,8 @@ export interface ServerExtras {
   settings?: SettingsStore;
   idle?: IdleLock;
   resigner?: WdaResigner;
+  /** Our own WebDriverAgent build (src/fork.ts): its state per phone, said in GET /api/wda as `fork`. */
+  fork?: { status(): unknown };
   /** How often a watched phone's WDA and lock state are checked (ms; default WATCH_MS; 0 = never on its own). */
   watchMs?: number;
   /** Seed of natural touch's randomness (tests); default a random one. */
@@ -319,8 +321,11 @@ export function createServer(backend: Backend, token: string, updater?: Updater,
       stats: withInput(p.udid, p.stats), info: info.peek(p),
     };
   };
-  const wdaStatus = (): WdaSignStatus | { state: 'unavailable'; lastError: string } =>
-    resigner ? resigner.status() : { state: 'unavailable', lastError: backend.mock ? 'mock mode' : 'the WDA re-sign scheduler is off' };
+  const wdaStatus = (): WdaSignStatus | { state: 'unavailable'; lastError: string; fork?: unknown } => ({
+    ...(resigner ? resigner.status() : { state: 'unavailable' as const, lastError: backend.mock ? 'mock mode' : 'the WDA re-sign scheduler is off' }),
+    // which WebDriverAgent each phone runs: ours (and its version), or the stock one and why ours isn't on it yet
+    ...(extras.fork ? { fork: extras.fork.status() } : {}),
+  });
   /** WDA's signing as the detail card shows it. */
   const wdaSigning = (): WdaSigning => {
     const w = wdaStatus();

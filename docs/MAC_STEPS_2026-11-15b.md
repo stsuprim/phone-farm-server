@@ -256,3 +256,88 @@ phone at a time", "Staying responsive (WDA self-heal)" and "Info that keeps up" 
     **Report back** for steps 13-16: the suite's last line; step 14's two answers (no secrets in them) and whether the
     first phone really went dark; step 15's `[wda-heal]` lines and `heals` numbers, how the tap after 5 minutes felt;
     step 16 yes/no. Never include the token.
+
+---
+
+## Our own WebDriverAgent build (2026-11-16): nothing to do by hand
+
+From this version on the server runs **our own WebDriverAgent build** on the phones (`wda/` in this repo: Appium's
+WebDriverAgent v16.15.3 with our changes, see `wda/LOTUS.md`). **You don't have to build, sign or install anything.**
+The server does all of it by itself, with the same script, Apple team, certificate and bundle id as the 6-day
+re-sign, so each phone's developer trust stays as it is (no re-trust in Settings).
+
+**No manual re-sign is needed now.** Installing our build signs it afresh (a new 7-day profile), and the 6-day
+re-sign counts from then and builds from `wda/` from then on.
+
+### What the server does, per phone, after it pulls this version
+
+1. About 20 s after it starts it sees that the phone's build is older than the repo's (`wda/LOTUS_FORK.json`).
+2. It wakes the phone and **builds and signs** our build into `~/wda-fork-build` (3 to 8 minutes the first time).
+   The stock WebDriverAgent keeps running meanwhile: the phone stays usable.
+3. It **switches the phone's runner** to our build (the phone is out for about half a minute) and waits until it
+   answers with its token on its own port (28100 + the phone's index, on the phone and on the Mac). Nothing
+   listens on 8100 or 9100 any more for that phone.
+4. If our build doesn't answer within 4 minutes, or the phone refuses the install, it **puts the stock
+   WebDriverAgent back** at once and tries again later: after 2, 5, 15, 30, 60 and 180 minutes, then every 6 hours.
+   It wakes the phone before each try.
+5. Once our build runs it does a **live-touch self-test** on the phone (the WebDriverAgent app comes to the front
+   for a few seconds, the screen goes black and comes back to the Home Screen). If the phone was dark it tries the
+   self-test again every 10 minutes, six times.
+
+### Watch it (optional)
+
+```sh
+curl -s -H "$H" $B/api/wda | python3 -m json.tool        # "fork": the version and each phone's state and reason
+grep '\[wda-fork\]' server.log | tail -20
+```
+
+| `fork.perDevice.<udid>.state` | Meaning |
+|---|---|
+| `stock` | Not installed yet (it's about to be). |
+| `building` | Being built and signed; the stock one runs. |
+| `installing` | The runner is being switched. |
+| `fork` | Our build runs. `version` is its number; `live` says what the self-test found. |
+| `waiting` | The build failed; `reason` says why; `nextTryAt` says when it's tried again. The stock one runs. |
+| `rolled-back` | Our build was installed but didn't start; the stock one was put back; tried again at `nextTryAt`. |
+
+### When a hand IS needed (the same cases as the 6-day re-sign)
+
+`reason` in `GET /api/wda` says which one:
+
+- **"Xcode is not signed in to the Apple ID"**: open Xcode > Settings > Accounts, sign in, then nothing else: the
+  next try picks it up (or `curl -s -X POST -H "$H" $B/api/wda/resign`).
+- **"the phone needs attention (unlock it / Trust this computer)"**: unlock the phone once (or tap Trust). Our
+  phones have no passcode, so this should not come up.
+- **"the Apple Team ID is not known"**: only on a Mac where WebDriverAgent was never built. Put `WDA_TEAM_ID=` in
+  `.env` and restart the service. (On this Mac the team is read from the WebDriverAgent that's already built.)
+- **A compiler error** (`error: …` from a file under `wda/`): our changes were written without Xcode at hand. Send
+  SUPRIM the output of
+  `grep -E "error:" ~/wda-fork-build/build-wda-<UDID>.log | head -20`.
+  Nothing is broken meanwhile: the phones stay on the stock WebDriverAgent.
+
+To see a build's errors yourself: `WDA_BUILD_FLAVOR=fork scripts/build-wda.sh <TEAM_ID> <UDID>`.
+
+### Checks, when someone is at the Mac (not required)
+
+1. `curl -s -H "$H" $B/api/wda | python3 -m json.tool` -> every phone `"state": "fork"`, `"version": 1`.
+2. The token gate. Find the phone's port (`fork.perDevice.<udid>.port`, 28100 for the first phone):
+   `curl -i http://127.0.0.1:28100/status` -> `HTTP/1.1 404 Not Found`, `Content-Length: 0`, no JSON. That is what
+   anything without the token gets. (The token is in `data/wda-tokens.json`; never paste it anywhere.)
+3. Nothing on the old ports for that phone: `ps ax | grep '[i]proxy'` -> one `iproxy` per phone on our build
+   (`28100:28100`), none with `:9100`.
+4. `fork.perDevice.<udid>.live` -> `"tested": true` and `"mode": 1`, `2` or `3` (a live drag holds the finger down),
+   or `"mode": 0` (no way worked on this iOS: drags are played whole on release, as before). Send SUPRIM its `notes`.
+5. SUPRIM drags on the Phones page: the phone follows while the button is down.
+
+### Settings (`.env`, all optional)
+
+| Setting | Default | What |
+|---|---|---|
+| `WDA_FORK` | `true` | `false`: keep the stock WebDriverAgent (the server switches a phone back at its next start). |
+| `WDA_FORK_BASE_PORT` | `28100` | Our build's port for the first phone, on the phone and on the Mac; the next phone's is one higher. |
+| `WDA_FORK_PORTS` | none | A phone's own port: `udid=port,udid=port`. |
+| `WDA_FORK_DERIVED_DATA` | `~/wda-fork-build` | Where our build is built. The stock one's (`WDA_DERIVED_DATA`) stays, for a rollback. |
+| `WDA_LIVE_TOUCH` | `auto` | `auto`: live touch only with the mode the phone's self-test found. `off`: never. `on`: mode 1 without the self-test's word. |
+
+During the switch-over both kinds run side by side: a phone still on the stock WebDriverAgent is talked to on
+8100 (+ MJPEG on 9100) as before, one on ours on its own port with its token. The server knows which is which.

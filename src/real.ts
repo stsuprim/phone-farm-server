@@ -64,6 +64,10 @@ function helperCaps(): string[] {
   }
 }
 import { FAST_TAP_HOLD_MS, WdaError, WdaManager } from './wda.js';
+import type { WdaFlavor } from './fork.js';
+
+/** Our build's quick still (GET /lotus/shot): the size and quality the stock WDA's MJPEG frames had (percent). */
+const FORK_STILL = { scale: 50, quality: 50 };
 
 function run(cmd: string, args: string[], timeout = 10000): Promise<string> {
   return new Promise((resolve, reject) => {
@@ -429,7 +433,13 @@ export class RealBackend implements Backend {
    */
   private stills(udid: string, soft = false): StillSource {
     return {
-      mjpeg: this.wda.mjpegAvailable(udid) ? (maxAgeMs, waitMs) => this.source(udid).grab(maxAgeMs, waitMs) : null,
+      // a stock WDA: a frame of its MJPEG server. Our build has none: its quick JPEG still (GET /lotus/shot), at
+      // the size and quality the MJPEG frames had, takes that place; before it's up, the PNG says.
+      mjpeg: this.wda.mjpegAvailable(udid)
+        ? (maxAgeMs, waitMs) => this.source(udid).grab(maxAgeMs, waitMs)
+        : this.wda.forkInfo(udid)
+          ? (_maxAgeMs, waitMs) => this.wda.shot(udid, FORK_STILL.scale, FORK_STILL.quality, Math.max(3000, waitMs)).catch(() => null)
+          : null,
       png: async (timeoutMs) => {
         const j = soft ? await this.wda.callSoft(udid, 'GET', '/screenshot', undefined, timeoutMs ?? DARK_SHOT_MS) : await this.wda.callNoSession(udid, 'GET', '/screenshot', undefined, timeoutMs);
         if (typeof j?.value !== 'string') throw new HttpError(502, 'WDA gave no screenshot');
@@ -499,22 +509,71 @@ export class RealBackend implements Backend {
     return { why: `HID is ${h.state}${h.reason ? ` (${h.reason})` : ''}` };
   }
 
+  /**
+   * Live touch (a finger held down on the phone from "down" to "up", moved as the moves come) has two ways to the
+   * phone: CoreDevice HID (iOS 27+, while a live view holds its session), else our own WebDriverAgent build's
+   * /lotus/touch, once the phone's self-test found a way of holding a finger that works there (src/wda.ts liveWhy).
+   * A stock WebDriverAgent has neither: the touch is buffered and played whole on "up".
+   */
   liveTouchReady(udid: string): boolean {
-    return !!this.phones.get(udid)?.online && 'h' in this.hidReady(udid);
+    if (!this.phones.get(udid)?.online) return false;
+    return 'h' in this.hidReady(udid) || this.wda.liveWhy(udid) === null;
   }
 
   liveTouchWhy(udid: string): string | null {
     const r = this.hidReady(udid);
-    return 'h' in r ? null : r.why;
+    if ('h' in r) return null;
+    const w = this.wda.liveWhy(udid);
+    return w === null ? null : r.why ?? w;
   }
 
   async liveTouch(udid: string, phase: 'down' | 'move' | 'up', x: number, y: number): Promise<InputResult> {
     this.known(udid);
     const r = this.hidReady(udid);
-    if (!('h' in r)) throw new HttpError(503, r.why ?? 'live touch is not available on this phone');
-    const [hx, hy] = toHid(x, y, r.s, r.o);
-    await r.h.input(phase, { x: hx, y: hy });
-    return { via: 'hid' };
+    if ('h' in r) {
+      const [hx, hy] = toHid(x, y, r.s, r.o);
+      await r.h.input(phase, { x: hx, y: hy });
+      return { via: 'hid' };
+    }
+    if (this.wda.liveWhy(udid) !== null) throw new HttpError(503, r.why ?? this.wda.liveWhy(udid) ?? 'live touch is not available on this phone');
+    await this.wda.liveTouch(udid, phase, x, y);
+    return { via: 'wda-live' };
+  }
+
+  // ---- our own WebDriverAgent build (src/fork.ts installs it) ----
+
+  /** How each phone's WebDriverAgent starts and what our build needs (set once, before the phones are found). */
+  useFork(fork: NonNullable<WdaManager['fork']>): void {
+    this.wda.fork = fork;
+  }
+
+  /** Restart the phone's runner as the stock WebDriverAgent or our build, waiting until it answers. */
+  async switchWda(udid: string, flavor: WdaFlavor): Promise<{ ok: boolean; why?: string }> {
+    const r = await this.wda.switchFlavor(udid, flavor);
+    if (!r.ok || flavor !== 'fork') return r;
+    // ours answers: it must also do the work (a session, the screen's size, a still) before it's kept
+    const missing = await this.wda.forkWorks(udid);
+    return missing ? { ok: false, why: missing } : r;
+  }
+
+  /** The phone's index (its Mac ports are the bases plus it; our build's port on the phone too). */
+  wdaSlot(udid: string): number {
+    return this.wda.slotOf(udid);
+  }
+
+  /** The builds the plugged-in phones run now ("stock", "fork"). */
+  wdaFlavors(): WdaFlavor[] {
+    return [...new Set([...this.phones.values()].filter((p) => p.online).map((p) => this.wda.flavor(p.udid)))];
+  }
+
+  /** Which WebDriverAgent the phone runs, and our build's version when it's ours that answers. */
+  wdaBuild(udid: string): { flavor: WdaFlavor; version: number | null } {
+    return { flavor: this.wda.flavor(udid), version: this.wda.forkInfo(udid)?.lotus ?? null };
+  }
+
+  /** The phone's own live-touch self-test (our build). */
+  wdaSelftest(udid: string): Promise<{ tested: boolean; mode: number; why?: string | null; notes?: string[] }> {
+    return this.wda.selftest(udid);
   }
 
   warmInput(udid: string): () => void {
@@ -528,6 +587,9 @@ export class RealBackend implements Backend {
       hid: problem ? 'unsupported' : h?.state ?? 'off',
       hid_reason: problem ?? h?.reason ?? null,
       wda_fast: this.wda.fastStatus(udid),
+      wda: this.wda.forkInfo(udid) ? 'fork' : 'stock',
+      wda_live: this.wda.liveWhy(udid) === null ? 'ready' : 'off',
+      wda_live_reason: this.wda.liveWhy(udid),
     };
   }
 
@@ -791,6 +853,7 @@ export class RealBackend implements Backend {
   subscribe(udid: string, onFrame: (f: Buffer) => void, want: StreamSettings) {
     this.known(udid);
     if (this.wda.status(udid) !== 'ready') throw new HttpError(503, 'WebDriverAgent is not ready');
+    if (!this.wda.mjpegAvailable(udid)) throw new HttpError(503, 'this phone runs our own WebDriverAgent build, which has no MJPEG stream (the live view is WebRTC)');
     let set = this.streams.get(udid);
     if (!set) this.streams.set(udid, (set = new Set()));
     const mine = { ...want };

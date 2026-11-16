@@ -118,6 +118,27 @@ export function provisionDates(buf: Buffer | string): { createdAt: number | null
   return { createdAt: date('CreationDate'), expiresAt: date('ExpirationDate') };
 }
 
+/**
+ * One piece of WebDriverAgent work at a time on this Mac: the 6-day re-sign and the install of our own build
+ * (src/fork.ts) both build with xcodebuild and restart phones' runners, and must never do so on top of each other.
+ */
+let wdaWork: Promise<unknown> = Promise.resolve();
+export function exclusive<T>(fn: () => Promise<T>): Promise<T> {
+  const p = wdaWork.then(fn, fn);
+  wdaWork = p.catch(() => {});
+  return p;
+}
+
+/**
+ * The Apple team a built runner's profile was issued to (its TeamIdentifier), or null. With no WDA_TEAM_ID in .env
+ * the team the phones' WebDriverAgent is already signed with is read from here, so nothing has to be typed on the Mac.
+ */
+export function provisionTeam(buf: Buffer | string): string | null {
+  const text = typeof buf === 'string' ? buf : buf.toString('latin1');
+  const m = /<key>TeamIdentifier<\/key>\s*<array>\s*<string>([A-Z0-9]{6,12})<\/string>/.exec(text);
+  return m ? m[1]! : null;
+}
+
 /** Runs one phone's build/sign; resolves with the log, rejects with it on failure. */
 export type SignRunner = (udid: string) => Promise<{ ok: boolean; log: string }>;
 
@@ -130,8 +151,11 @@ export interface ResignOptions {
   installed?: (udid: string) => void;
   /** Before a phone's build: wake it (a locked phone can refuse the install). */
   prepare?: (udid: string) => Promise<unknown>;
-  /** The built runner's embedded.mobileprovision, read for the real expiry (optional). */
-  provisionFile?: string;
+  /**
+   * The built runner's embedded.mobileprovision, read for the real expiry (optional). A function: the files of every
+   * build in use now (the stock WebDriverAgent's and our own build's, src/fork.ts); the one that expires first counts.
+   */
+  provisionFile?: string | (() => string[]);
   now?: () => number;
   tickMs?: number; // default 10 min; 0 = no timer (tests)
   quietStartHour?: number;
@@ -170,6 +194,7 @@ export class WdaResigner {
   /** A manual build (scripts/build-wda.sh run by hand) counts: the built profile's dates win when newer. */
   private readProvision(): void {
     if (!this.o.provisionFile) return;
+    if (typeof this.o.provisionFile === 'function') return this.readProvisions(this.o.provisionFile());
     try {
       const { createdAt, expiresAt } = provisionDates(fs.readFileSync(this.o.provisionFile));
       if (createdAt && expiresAt && (!this.rec.signedAt || createdAt > this.rec.signedAt + 60_000)) {
@@ -181,6 +206,33 @@ export class WdaResigner {
     } catch {
       /* not built yet */
     }
+  }
+
+  /**
+   * Several builds in use (some phones on the stock WebDriverAgent, some on our own): the profile that expires first
+   * is the one the schedule goes by. A newer one moves the record forward (a build signed since); one clearly older
+   * than the record moves it back (a build still in use was signed before the last one recorded).
+   */
+  private readProvisions(files: string[]): void {
+    let first: { createdAt: number; expiresAt: number } | null = null;
+    for (const f of files) {
+      try {
+        const { createdAt, expiresAt } = provisionDates(fs.readFileSync(f));
+        if (createdAt && expiresAt && (!first || expiresAt < first.expiresAt)) first = { createdAt, expiresAt };
+      } catch {
+        /* not built (yet) */
+      }
+    }
+    if (!first) return;
+    const signed = this.rec.signedAt;
+    if (!signed || first.createdAt > signed + 60_000 || first.createdAt < signed - 2 * HOUR_MS) this.rec.signedAt = first.createdAt;
+    this.rec.expiresAt = first.expiresAt;
+  }
+
+  /** Look at the built profiles again now (our own build was just signed and installed: src/fork.ts) and keep what they say. */
+  refresh(): void {
+    this.readProvision();
+    this.save();
   }
 
   private save(): void {
@@ -231,14 +283,21 @@ export class WdaResigner {
       return false;
     }
     this.lastWait = null;
-    await this.resignNow();
-    return true;
+    // It may wait here behind the install of our own build (src/fork.ts), which signs afresh: looked at again once
+    // its turn comes, so a phone signed a minute ago isn't built and restarted a second time.
+    let ran = false;
+    await this.resignNow(() => {
+      this.readProvision();
+      const t = this.now();
+      return (ran = resignWait(this.rec, t, this.o.liveViewers(), isQuietHour(t, this.o.quietStartHour)) === null);
+    });
+    return ran;
   }
 
-  /** Re-sign every online phone now (POST /api/wda/resign); one run at a time. */
-  resignNow(): Promise<WdaSignStatus> {
+  /** Re-sign every online phone now (POST /api/wda/resign); one run at a time. `onlyIf`: asked when its turn comes. */
+  resignNow(onlyIf?: () => boolean): Promise<WdaSignStatus> {
     if (this.running) return this.running;
-    const p = this.doResign().finally(() => {
+    const p = exclusive(async () => (onlyIf && !onlyIf() ? this.status() : this.doResign())).finally(() => {
       this.running = undefined;
     });
     this.running = p;
@@ -312,14 +371,18 @@ export class WdaResigner {
   }
 }
 
-/** The real runner: scripts/build-wda.sh <team> <udid> (its log goes to the derived-data folder too). */
-export function buildWdaRunner(root: string, team: () => string, timeoutMs = 20 * 60_000): SignRunner {
+/**
+ * The real runner: scripts/build-wda.sh <team> <udid> (its log goes to the derived-data folder too). `env`: more
+ * environment for the script, per phone (WDA_BUILD_FLAVOR=fork builds our own WebDriverAgent, wda/ in this repo,
+ * with the same team and certificate).
+ */
+export function buildWdaRunner(root: string, team: () => string, timeoutMs = 20 * 60_000, env: (udid: string) => Record<string, string> = () => ({})): SignRunner {
   return (udid) =>
     new Promise((resolve) => {
       const p = spawn('bash', [path.join(root, 'scripts', 'build-wda.sh'), team(), udid], {
         cwd: root,
         stdio: ['ignore', 'pipe', 'pipe'],
-        env: { ...process.env, WDA_FRESH_PROFILE: '1' }, // a new 7-day profile, not the one about to expire
+        env: { ...process.env, WDA_FRESH_PROFILE: '1', ...env(udid) }, // a new 7-day profile, not the one about to expire
       });
       const out: string[] = [];
       const keep = (d: Buffer) => {
