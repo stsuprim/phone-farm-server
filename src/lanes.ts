@@ -1,6 +1,7 @@
 import { ChildProcess, spawn } from 'node:child_process';
 import { REMOTE_CEILING_BPS, REMOTE_KEY_SECONDS, REMOTE_LONG_SIDE, REMOTE_MAX_FPS, REMOTE_START_BPS } from './congestion.js';
-import { bitrateFor, H264Settings, helperArgs, Producer, ProducerHooks, RecordParser, StartProducer } from './h264.js';
+import { AUDIO_KIND } from './audio.js';
+import { bitrateFor, H264Settings, helperArgs, KIND, Producer, ProducerHooks, RecordParser, StartProducer } from './h264.js';
 import type { H264Want } from './types.js';
 
 /**
@@ -64,6 +65,20 @@ export function profileFor(want: H264Want, dfltBps: number, longSidePx: number |
 }
 
 export type Spawn = (bin: string, args: string[]) => ChildProcess;
+
+/** Where a host's sound goes (src/audio.ts AudioHub). */
+export interface AudioSink {
+  frame(f: { time: number; payload: Buffer }): void;
+  infoRecord(payload: Buffer): void;
+  /** The capture ended: the sound is back on the phone. */
+  ended(): void;
+  /** Why the capture runs without sound now (null: it has it again). */
+  unavailable(reason: string | null): void;
+}
+/** A capture that died before its first picture twice in a row with sound on runs without sound this long. */
+export const AUDIO_BACKOFF_MS = 10 * 60_000;
+/** The longest a hold keeps a capture nobody watches open (the phone's volume going back down). */
+export const HOLD_MOST_MS = 30_000;
 const realSpawn: Spawn = (bin, args) => spawn(bin, args, { stdio: ['pipe', 'pipe', 'pipe'] });
 
 /**
@@ -77,8 +92,23 @@ export class PhonecapHost {
   private lanes = new Map<number, ProducerHooks>();
   /** Turn the picture this many degrees clockwise before encoding (a helper with the "rotate" cap; 0 = as captured). */
   private rotation = 0;
+  // the phone's sound (src/audio.ts): asked for with --audio when there's a sink; "audio on|off" as listeners come
+  private audioWanted = false;
+  private withAudio = false; // the running process was started with --audio
+  private gotPicture = false; // the running process gave a picture
+  private audioStrikes = 0;
+  private noAudioUntil = 0;
+  // a capture held open after its last lane (the phone's volume going back down while the sound is still on the Mac)
+  private holds = 0;
+  private closing?: NodeJS.Timeout;
 
-  constructor(private bin: string, private args: string[], private label: string, private spawnFn: Spawn = realSpawn) {}
+  constructor(
+    private bin: string,
+    private args: string[],
+    private label: string,
+    private spawnFn: Spawn = realSpawn,
+    private sink?: AudioSink,
+  ) {}
 
   get running(): boolean {
     return !!this.proc;
@@ -92,6 +122,8 @@ export class PhonecapHost {
 
   private open(want: H264Settings, hooks: ProducerHooks): Producer {
     let id = 0;
+    // a capture held open after its last lane is taken up again (its lane 0 still runs)
+    if (this.closing) (clearTimeout(this.closing), (this.closing = undefined));
     if (!this.proc) {
       this.spawn(want);
     } else {
@@ -129,6 +161,36 @@ export class PhonecapHost {
     };
   }
 
+  /** Send the phone's sound (someone listens) or not; kept for the helper's next start too. */
+  setAudio(on: boolean): void {
+    if (this.audioWanted === on) return;
+    this.audioWanted = on;
+    if (this.withAudio) this.write(`audio ${on ? 'on' : 'off'}`);
+  }
+
+  /**
+   * Keep the capture open after its last lane until the returned release is called (at most HOLD_MOST_MS): the
+   * phone's sound stays on the Mac while its volume goes back down.
+   */
+  hold(): () => void {
+    this.holds++;
+    let done = false;
+    const t = setTimeout(() => release(), HOLD_MOST_MS);
+    t.unref?.();
+    const release = () => {
+      if (done) return;
+      done = true;
+      clearTimeout(t);
+      this.holds--;
+      if (!this.holds && this.closing) {
+        clearTimeout(this.closing);
+        this.closing = undefined;
+        if (!this.lanes.size) this.kill();
+      }
+    };
+    return release;
+  }
+
   private write(line: string): void {
     const stdin = this.proc?.stdin;
     if (stdin?.writable) stdin.write(`${line}\n`);
@@ -159,11 +221,31 @@ export class PhonecapHost {
   }
 
   private spawn(want: H264Settings): void {
-    const p = this.spawnFn(this.bin, [...this.args, ...helperArgs(want)]);
+    const sound = !!this.sink && Date.now() >= this.noAudioUntil;
+    const p = this.spawnFn(this.bin, [...this.args, ...helperArgs(want), ...(sound ? ['--audio'] : [])]);
     this.proc = p;
+    this.withAudio = sound;
+    this.gotPicture = false;
     if (this.rotation) this.write(`rotate ${this.rotation}`);
+    if (sound && this.audioWanted) this.write('audio on');
+    if (this.sink && !sound) this.sink.unavailable(`the capture failed with sound on, so it runs without sound until ${new Date(this.noAudioUntil).toLocaleTimeString()}`);
+    else if (this.sink) this.sink.unavailable(null);
     const tail: string[] = [];
-    const parser = new RecordParser((r) => this.lanes.get(r.lane ?? 0)?.record(r));
+    const parser = new RecordParser((r) => {
+      // the sound never reaches the lanes, and a sound that fails never touches the picture
+      if (r.kind === AUDIO_KIND.FRAME || r.kind === AUDIO_KIND.INFO) {
+        if (this.proc !== p) return;
+        try {
+          if (r.kind === AUDIO_KIND.FRAME) this.sink?.frame({ time: r.time, payload: r.payload });
+          else this.sink?.infoRecord(r.payload);
+        } catch (err) {
+          console.log(`[phonecap ${this.label}] sound: ${(err as Error).message}`);
+        }
+        return;
+      }
+      if (r.kind === KIND.KEY || r.kind === KIND.DELTA) this.gotPicture = true;
+      this.lanes.get(r.lane ?? 0)?.record(r);
+    });
     p.stdout?.on('data', (c: Buffer) => {
       try {
         parser.push(c);
@@ -188,16 +270,37 @@ export class PhonecapHost {
   private died(p: ChildProcess, why: string): void {
     if (this.proc !== p) return;
     this.proc = undefined;
+    if (this.closing) (clearTimeout(this.closing), (this.closing = undefined));
+    // a capture that dies before any picture with sound on, twice in a row: the next ones go without sound for a while
+    if (this.withAudio && !this.gotPicture) {
+      if (++this.audioStrikes >= 2) {
+        this.audioStrikes = 0;
+        this.noAudioUntil = Date.now() + AUDIO_BACKOFF_MS;
+        console.log(`[phonecap ${this.label}] the capture died twice before a picture with sound on; without sound for ${AUDIO_BACKOFF_MS / 60000} min`);
+      }
+    } else if (this.gotPicture) this.audioStrikes = 0;
+    this.sink?.ended();
     const hooks = [...this.lanes.values()];
     this.lanes.clear();
     for (const h of hooks) h.exit(why);
   }
 
   private kill(): void {
+    this.lanes.clear();
+    // held open (the phone's volume going back down while its sound is still on the Mac): closed on the release
+    if (this.holds > 0 && this.proc && !this.closing) {
+      this.closing = setTimeout(() => {
+        this.closing = undefined;
+        if (!this.lanes.size) this.kill();
+      }, HOLD_MOST_MS);
+      this.closing.unref?.();
+      return;
+    }
+    if (this.closing) return;
     const p = this.proc;
     this.proc = undefined;
-    this.lanes.clear();
     if (!p) return;
+    this.sink?.ended();
     if (p.stdin?.writable) p.stdin.write('quit\n');
     p.kill('SIGTERM');
     setTimeout(() => p.kill('SIGKILL'), 1500).unref();
@@ -205,6 +308,8 @@ export class PhonecapHost {
 
   /** Stops the process now (the phone was unplugged, the server stops); its sources are closed by the caller. */
   close(): void {
+    this.holds = 0;
+    if (this.closing) (clearTimeout(this.closing), (this.closing = undefined));
     this.kill();
   }
 }

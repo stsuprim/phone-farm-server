@@ -6,7 +6,8 @@ import { ChildProcess, spawn } from 'node:child_process';
  * Helper -> server framing (stdout), one record after another:
  *   1 byte lane << 4 | kind | 8 bytes capture time (float64 BE, ms since the epoch) | 4 bytes length (uint32 BE) | payload
  * Kinds: 0 info (JSON {width, height, fps, scale?}), 1 config (SPS+PPS, Annex B), 2 keyframe (Annex B),
- *        3 delta (Annex B), 4 stats (JSON {encode_ms, capture_to_encoded_ms}).
+ *        3 delta (Annex B), 4 stats (JSON {encode_ms, capture_to_encoded_ms}); with --audio also 5 an audio frame and
+ *        6 audio JSON (src/audio.ts), never handed to the video's lanes.
  * Lanes (a helper whose build/phonecap.caps says "lanes"): one capture, up to 8 encoders, each with its own size, fps
  * and bitrate (src/lanes.ts). Lane 0 comes from the command line; an older helper only has lane 0 (high nibble 0).
  * Server -> helper (stdin): "key [lane]\n" forces an IDR now, "bitrate [lane] <bit/s>\n" changes the encoder's target
@@ -64,7 +65,7 @@ export class RecordParser {
       const kind = head[0]! & 0x0f;
       const lane = head[0]! >> 4;
       const size = head.readUInt32BE(9);
-      if (kind > 4 || size > MAX_PAYLOAD) throw new Error(`bad record from the capture helper (kind ${head[0]}, ${size} bytes)`);
+      if (kind > 6 || size > MAX_PAYLOAD) throw new Error(`bad record from the capture helper (kind ${head[0]}, ${size} bytes)`);
       if (this.len < HEADER + size) return;
       const all = this.take(HEADER + size);
       this.onRecord({ kind, time: all.readDoubleBE(1), payload: all.subarray(HEADER), arrived: Date.now(), lane });
@@ -670,7 +671,7 @@ export function helperProducer(bin: string, args: string[], label: string): Star
     };
     const tail: string[] = [];
     // an older helper only has lane 0; a lanes helper run this way only gets lane 0 too
-    const parser = new RecordParser((r) => (r.lane ?? 0) === 0 && hooks.record(r));
+    const parser = new RecordParser((r) => (r.lane ?? 0) === 0 && r.kind <= KIND.STATS && hooks.record(r));
     p.stdout!.on('data', (c: Buffer) => {
       try {
         parser.push(c);

@@ -1,4 +1,5 @@
 import type NdcModule from 'node-datachannel';
+import { AudioFeed, AudioFrame, audioPlan, AudioRtpClock, parseOfferAudio } from './audio.js';
 import { bitrateAsk, DEFAULT_CEILING_BPS, DelayTracker, parseRtcp, RateControl, REMOTE_START_BPS } from './congestion.js';
 import { Control, touchAck } from './control.js';
 import { H264Info, H264Settings, H264Source, H264Viewer, KIND, Rec, REMOTE_DROP_BYTES, Transport } from './h264.js';
@@ -15,6 +16,11 @@ import { Backend, HttpError, Profile, QualityTier } from './types.js';
  *   client -> {type:"rtc-key"} (a keyframe now: its picture stalled), {type:"rtc-close"},
  *   or {type:"rtc-error", reason} (the client falls back to the H.264 WebSocket / MJPEG).
  * Host candidates only (no STUN/TURN): the path is always direct (LAN or Tailscale), never relayed.
+ * The phone's sound (2026-11-16, src/audio.ts): an offer with an audio m-section (recvonly, Opus) gets a sendonly track
+ * on it when the phone's sound can come (else that section is answered inactive): its own SSRC and RTP clock, the same
+ * stream id as the picture (so the browser keeps them in step from the RTCP sender reports; AUDIO_SYNC=0 puts it in a
+ * stream of its own, never waiting on the picture). rtc-hello says `audio` (true/false) and `audio_reason`;
+ * {type:"rtc-audio", audio, reason} follows when that changes. A sound that fails is dropped alone; the picture goes on.
  */
 type Ndc = typeof NdcModule;
 type PeerConnection = InstanceType<Ndc['PeerConnection']>;
@@ -304,6 +310,17 @@ export class RtcSession {
   private tOffer = 0;
   private connectMs: number | null = null;
   private warm = false;
+  // the phone's sound (src/audio.ts): its own track, RTP clock and config; null reason = it's on
+  private aTrack?: Track;
+  private aRtp?: RtpConfig;
+  private aClock?: AudioRtpClock;
+  private aOff?: () => void;
+  private aOpen = false;
+  private aFeed?: AudioFeed;
+  private aWanted = false; // the offer asked for sound
+  private aReason: string | null = null;
+  private aSent = 0;
+  private tsBaseA = (Math.random() * 0xffffffff) >>> 0;
 
   constructor(
     private backend: Backend,
@@ -424,6 +441,13 @@ export class RtcSession {
     });
     track.onClosed(() => this.close('track closed'));
 
+    // the phone's sound, when the offer asks for it; anything wrong here leaves the picture alone
+    try {
+      this.audioSetup(ndc, sdp);
+    } catch (err) {
+      this.audioDrop(`the sound couldn't be set up: ${errText(err)}`);
+    }
+
     pc.setRemoteDescription(sdp, 'offer');
     for (const [c, mid] of this.pendingIce) this.addIce(c, mid);
     this.pendingIce = [];
@@ -434,7 +458,7 @@ export class RtcSession {
         this.ready = true;
         this.signal({
           type: 'rtc-hello', codec: 'h264', ...(this.hooks.view?.() ?? {}), width: info.width, height: info.height, fps: info.fps, scale: info.scale,
-          lane: src.kind, server_time: Date.now(),
+          lane: src.kind, server_time: Date.now(), audio: this.aWanted && !this.aReason && !!this.aTrack, audio_reason: this.aWanted ? this.aReason : 'the viewer asked for no sound',
           // the offer -> the capture has a picture to send (the first frame leaves once ICE connects: "first-frame")
           connectMs: Math.round(performance.now() - this.tOffer), warm: this.warm,
         });
@@ -448,10 +472,89 @@ export class RtcSession {
     );
   }
 
+  // ---- the phone's sound ----
+
+  /** An Opus (or G.711) sendonly track on the offer's audio m-section, fed from the phone's capture. */
+  private audioSetup(ndc: Ndc, sdp: string): void {
+    const offer = parseOfferAudio(sdp);
+    if (!offer) return;
+    this.aWanted = true;
+    const feed = this.backend.audio?.(this.udid);
+    if (!feed) return void (this.aReason = 'this server has no sound for the phones');
+    if (typeof feed === 'string') return void (this.aReason = feed);
+    const plan = audioPlan(offer, feed.codec());
+    if (typeof plan === 'string') return void (this.aReason = plan);
+    this.aFeed = feed;
+    const ssrc = ((Math.random() * 0x7fffffff) >>> 0) || 2;
+    const audio = new ndc.Audio(offer.mid, 'SendOnly');
+    if (plan.codec === 'opus') audio.addOpusCodec(plan.pt, offer.opusFmtp.includes('useinbandfec') ? 'minptime=10;useinbandfec=1;stereo=1;sprop-stereo=1' : 'minptime=10;stereo=1;sprop-stereo=1');
+    else audio.addAudioCodec(plan.pt, 'PCMU/8000');
+    // the same stream id as the picture: the browser syncs the two from their sender reports
+    const stream = process.env.AUDIO_SYNC === '0' ? 'lotus-phone-sound' : 'lotus-phone';
+    audio.addSSRC(ssrc, 'phone', stream, 'sound');
+    const track = this.pc!.addTrack(audio);
+    this.aTrack = track;
+    const rtp = new ndc.RtpPacketizationConfig(ssrc, 'phone', plan.pt, plan.rate);
+    this.aRtp = rtp;
+    this.aClock = new AudioRtpClock(plan.rate, plan.frameSamples);
+    const packetizer = new ndc.RtpPacketizer(rtp);
+    packetizer.addToChain(new ndc.RtcpSrReporter(rtp));
+    track.setMediaHandler(packetizer);
+    track.onOpen(() => {
+      this.aOpen = true;
+      this.audioListen();
+    });
+    // the sound's own track closing (or failing) ends only the sound
+    track.onClosed(() => this.audioDrop(this.closed ? null : 'the sound track closed'));
+    this.aReason = feed.reason();
+  }
+
+  /** Frames from the capture onto the sound's track (from its open; the capture says "audio on" while anyone listens). */
+  private audioListen(): void {
+    if (this.aOff || !this.aFeed || this.closed) return;
+    this.aOff = this.aFeed.listen(
+      (f) => this.audioSend(f),
+      (reason) => {
+        if (this.closed || reason === this.aReason) return;
+        this.aReason = reason;
+        this.signal({ type: 'rtc-audio', audio: !reason, reason });
+      },
+    );
+  }
+
+  private audioSend(f: AudioFrame): void {
+    if (!this.aOpen || !this.aTrack || !this.aRtp || !this.aClock || this.closed) return;
+    this.aRtp.timestamp = (this.tsBaseA + this.aClock.stamp(f.time)) >>> 0;
+    try {
+      this.aTrack.sendMessageBinary(f.payload);
+      this.aSent++;
+    } catch (err) {
+      this.audioDrop(`sending the sound failed: ${errText(err)}`);
+    }
+  }
+
+  /** The sound stops (and says why); the picture goes on. */
+  private audioDrop(why: string | null): void {
+    this.aOff?.();
+    this.aOff = undefined;
+    this.aOpen = false;
+    if (why && !this.closed) {
+      console.error(`[rtc] ${this.udid.slice(-8)}: ${why}`);
+      this.aReason = why;
+      this.signal({ type: 'rtc-audio', audio: false, reason: why });
+    }
+  }
+
+  /** The sound's numbers for `stats.sessions`. */
+  audioInfo(): { on: boolean; reason: string | null; sent: number } | null {
+    if (!this.aWanted) return null;
+    return { on: this.aOpen && !this.aReason, reason: this.aReason, sent: this.aSent };
+  }
+
   /** This session for `stats.sessions` (null until its video runs). */
-  info(): { profile: Profile; quality: QualityTier; net: string | null; fps: number; latencyMs: number | null; lane: 'lan' | 'remote' | 'thumb' | null; since: number; connectMs: number | null; keysAsked: number } | null {
+  info(): { profile: Profile; quality: QualityTier; net: string | null; fps: number; latencyMs: number | null; lane: 'lan' | 'remote' | 'thumb' | null; since: number; connectMs: number | null; keysAsked: number; audio: { on: boolean; reason: string | null; sent: number } | null } | null {
     if (!this.viewer || this.closed) return null;
-    return { profile: this.remote ? 'remote' : 'lan', quality: this.tier, net: this.path, ...this.viewer.sessionStats(), since: this.since, connectMs: this.connectMs, keysAsked: this.keysAsked };
+    return { profile: this.remote ? 'remote' : 'lan', quality: this.tier, net: this.path, ...this.viewer.sessionStats(), since: this.since, connectMs: this.connectMs, keysAsked: this.keysAsked, audio: this.audioInfo() };
   }
 
   addIce(candidate: unknown, mid: unknown): void {
@@ -633,6 +736,12 @@ export class RtcSession {
     if (this.ccTimer) clearInterval(this.ccTimer);
     if (this.viewer) this.src?.remove(this.viewer);
     this.viewer = undefined;
+    this.audioDrop(null);
+    try {
+      this.aTrack?.close();
+    } catch {
+      /* ignore */
+    }
     this.control.release(this);
     try {
       this.track?.close();

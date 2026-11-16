@@ -573,6 +573,42 @@ Library: [node-datachannel](https://github.com/murat-dogan/node-datachannel) 0.3
 macOS arm64/x64, Linux and Windows), **MPL-2.0**, pinned exactly. `npm install` must keep optional dependencies (they hold the
 prebuilt binary). If it can't load, the server still runs and answers offers with `rtc-error`.
 
+### The phone's sound (2026-11-16)
+
+The owner hears each phone through the live view, and the phone itself stays quiet (it sits at Rinor's house).
+
+- **Capture**: `native/phonecap` (`--audio`, caps `audio`) adds an `AVCaptureAudioDataOutput` to the **same** capture session
+  as the picture: the iPhone's USB screen device is muxed (picture and sound), as QuickTime's "iPhone" audio input. Samples
+  are asked for as 48 kHz stereo float, cut into 20 ms frames and encoded with AudioToolbox's Opus encoder (~80 kbit/s;
+  a Mac without one sends G.711 u-law, 8 kHz mono). The sound runs on its own queue; a failure only says so.
+- **The phone goes quiet**: while its screen is captured this way, iOS plays the phone's sound out to the Mac instead of its
+  own speaker (QuickTime's behaviour). **Still to be confirmed on the phones themselves (iPhone-1 on iOS 18.5, iPhone-2
+  on iOS 18.7.8)**: the server can't check it from here. Apps that protect their content (some streaming apps) may go
+  silent while the screen is captured; that's the app's choice.
+- **Only while the live view is open**: the helper runs only while a viewer watches the phone (it stops 2.5 s after the
+  last one left), and it sends sound frames only while a WebRTC session listens (`audio on` / `audio off` on its stdin).
+- **WebRTC**: an offer with an audio m-section (recvonly, Opus) gets a sendonly Opus track on it: its own SSRC, a 48 kHz RTP
+  clock advancing exactly 960 ticks a frame (re-anchored to the capture clock after a gap), timestamps from the same
+  capture clock as the picture's, RTCP sender reports, and the **same stream id** as the picture so the browser lip-syncs
+  the two (`AUDIO_SYNC=0`: a stream of its own, never waiting on the picture). Without sound for the phone the section is
+  answered without a sender and the picture is untouched. `rtc-hello` has `audio` and `audio_reason`;
+  `{type:"rtc-audio", audio, reason}` follows a change. A sound that fails is dropped alone. A capture that dies before
+  any picture twice in a row with sound on runs without sound for 10 minutes (the picture first).
+- **The phone's volume**: the phones are kept at 0 % media volume. Whether that level scales what the USB capture carries
+  isn't documented; it's taken that it does (reports on QuickTime recordings; iOS also keeps a volume per output route).
+  So the server raises the phone's media volume to `AUDIO_PHONE_VOLUME` % (default 50: 8 of 16 presses of WDA's volume
+  button) **only once sound frames arrive from the capture** (the sound is on the Mac then) while someone listens, and
+  presses it all the way back to 0 (17 presses) when the last listener leaves, **while the capture is held open** (so
+  the sound never comes out of the phone meanwhile), and at once if the capture dies. `data/audio-volume.json` names each
+  raised phone before its first press, so after a crash or a restart the server puts it back to 0 at start (retried
+  while WDA isn't up). `AUDIO_PHONE_VOLUME=0` never touches the volume. Do Not Disturb doesn't mute media sound; the
+  Ring/Silent switch (or a silent mode) mutes some apps' sound (alerts, games that use the ambient category), not media.
+- **Numbers**: `GET /phones` -> `stats.audio` `{codec, reason, level_db, peak_db, frames, listeners, volume_raised}`
+  (`level_db` / `peak_db` every 2 s from the helper: a phone playing sound with `peak_db` near -120 means the capture
+  carries silence, e.g. a phone volume that does scale it), and `stats.sessions[].audio` `{on, reason, sent}`.
+- **TCC**: macOS may count the sound as Microphone. `phonecap --request-access` now asks for Microphone too; a denied
+  Microphone gives no sound (`stats.audio.reason` says so) and never stops the picture.
+
 ### H.264 over WebSocket (fallback)
 
 `WS /phones/:udid/stream?token=...&codec=h264&fps=&scale=&quality=&bitrate=` (`bitrate` in kbit/s wins; else `quality`
@@ -823,7 +859,7 @@ After `git pull`/code changes run `npm run build` and `launchctl kickstart -k gu
 `npm run check` type-checks. `npm test` runs `test/h264.ts` (helper framing, config-before-key, latest-only drop to keyframe,
 helper restarts, offer/RTCP parsing, WebRTC's keyframe unit, RTP clock and pacer queue), `test/input.ts` (live touch straight to the phone and its fallbacks, the HID sidecar's
 protocol, the WDA patch, latency metering, acks' `via`/`ms`), `test/orient.ts` (upright -> device mapping in all four orientations, units, the capture check, orientation in the list, hellos and on change), `test/touch.ts` (order, coalescing, acks, auto-release, wake first, fallbacks with a reason), `test/ui.ts` (UI tree flattening, the element finder, apps by name, `/ui`, `/tap-element`, `/type`, `/key`, `/launch`, `/act`, reports and verify), `test/info.ts` (the detail card: the battery / IORegistry / WDA parsers, the ~15 s cache, `GET /info`, `info` in the list, WDA's quiet read), `test/connect.ts` (a capture warmed ahead and kept warm, a keyframe at once on join, `connectMs` and `first-frame`, `POST /warm`), `test/reliability.ts` (an expired WDA session remade on a 4xx, never a stale UI tree, the settle wait and ids from a changed screen, a playing gesture holding the next action, HID inputs that time out or break off, HID reconnect), `test/heal.ts` (a fake WDA that expires its session, hangs or dies and an iproxy that exits, all healed and counted; a hung action's 504, bursts spaced, the probe before the first action after idle, wake-on-touch; units; `POST /focus`, `focused`, `percent` and `info` pushed), `test/rtc.ts` (WebRTC in mock mode with a node-datachannel client: signaling, ICE,
-RTP, PLI -> IDR, SPS/PPS with every keyframe, `rtc-key`, the RTP clock, data channels and acks, stats, rtc-error) and `test/smoke.ts` (a mock server: auth, every endpoint, MJPEG,
+RTP, PLI -> IDR, SPS/PPS with every keyframe, `rtc-key`, the RTP clock, data channels and acks, stats, rtc-error), `test/audio.ts` (the sound: the helper's audio records, `audio on/off`, the held capture, the Opus track beside the picture, a session without sound, the volume raised and put back, a crash's raise put right) and `test/smoke.ts` (a mock server: auth, every endpoint, MJPEG,
 H.264 WebSocket, the MJPEG fallback, ping/pong). Mock mode's H.264 is a real, decodable stream (a tiny built-in encoder:
 Constrained Baseline 208x448, I_PCM keyframes and skip-coded deltas), so clients can test decoding against it.
 Against a live server: `URL=http://<mac>:8787 API_TOKEN=<token> npm test` (needs at least one online phone).
@@ -852,6 +888,8 @@ and comes back by itself.
 Input: `HID_INPUT` (`auto` = iOS 27+ phones, `on` = try every phone, `off`), `HID_PYTHON` (the Python with pymobiledevice3;
 default `~/.phonefarm-hid/bin/python` if it exists, else `python3`), `HID_IDLE_SECONDS` (120), `HID_TUNNEL` (`auto`,
 `userspace`, `native`, `tunneld`), `WDA_FAST` (`0` = never try the fast route), `INPUT_LOG` (`0` = no per-action lines), `HID_LANDSCAPE` (`on` default, `swap`, `off`), `WDA_FAST_LANDSCAPE` (`1` = the fast route in landscape too), `CAPTURE_ROTATE` (`off` default; `cw`/`ccw` turn a sideways picture upright; `90`/`180`/`270` always turn it);
+Sound: `AUDIO` (true), `AUDIO_PHONE_VOLUME` (50 %; 0 = never touch the phone's volume), `AUDIO_SYNC` (`0` = the sound in a
+stream of its own, no lip sync).
 `WDA_PATCH=0` makes `scripts/build-wda.sh` build WDA unpatched. WDA re-sign: `WDA_TEAM_ID` (the Apple Team ID),
 `WDA_RESIGN` (true), `WDA_RESIGN_HOUR` (3: the quiet window is 03:00-06:00 local). Our own WebDriverAgent build:
 `WDA_FORK` (true; `false` keeps the stock one), `WDA_FORK_BASE_PORT` (28100), `WDA_FORK_PORTS` (`udid=port,…`),

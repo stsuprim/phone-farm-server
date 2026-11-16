@@ -13,5 +13,6 @@
   <key>LSMinimumSystemVersion</key><string>13.0</string>
   <key>LSUIElement</key><true/>
   <key>NSCameraUsageDescription</key><string>Lotus phone farm captures connected iPhone screens over USB for the live view.</string>
+  <key>NSMicrophoneUsageDescription</key><string>Lotus phone farm carries a connected iPhone's own sound (over the same USB screen capture) to the live view.</string>
 </dict>
 </plist>

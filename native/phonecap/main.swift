@@ -8,19 +8,28 @@
 // stdout, one record after another (big-endian):
 //   1 byte lane << 4 | kind | 8 bytes capture time (float64, ms since the epoch) | 4 bytes payload length | payload
 //   kinds: 0 info JSON {width,height,fps,scale,lane}, 1 config (SPS+PPS, Annex B), 2 keyframe, 3 delta (Annex B),
-//          4 stats JSON {encode_ms, capture_to_encoded_ms, fps}
+//          4 stats JSON {encode_ms, capture_to_encoded_ms, fps},
+//          5 audio frame (Opus, 20 ms at 48 kHz; G.711 u-law 8 kHz mono when this Mac has no Opus encoder), its time the
+//            capture time of its first sample, 6 audio JSON ({codec, rate, channels, frame_ms, reason?} once, then
+//            {level_db, peak_db} every 2 s while it runs). Audio records only with --audio (see "audio" below).
 // Lanes: one capture feeds up to 8 encoders (lanes 0-7), each with its own size, fps and bitrate, so a far viewer gets a
 //   small 30 fps stream while the LAN keeps full size at 60 fps. Lane 0 starts from the command line (--fps --scale
 //   --bitrate --key-seconds); its records have the high nibble 0, exactly as before lanes.
 // stdin: "key [lane]" forces an IDR now (re-encoding the current screen if nothing new arrived), "bitrate [lane] <bit/s>"
 //   and "fps <lane> <fps>" change a running lane, "lane <id> <fps> <scale %> <bit/s> [<key seconds>]" adds or changes
 //   a lane, "unlane <id>" stops one, "rotate <0|90|180|270>" turns the picture that many degrees clockwise before
-//   encoding (every lane; a new info record and keyframe follow), "quit" exits. A lane without the number is lane 0.
+//   encoding (every lane; a new info record and keyframe follow), "audio on|off" starts or stops sending the phone's
+//   sound (with --audio; off at start), "quit" exits. A lane without the number is lane 0.
+// Audio (--audio, 2026-11-16): the iPhone screen device is muxed (video and sound), so an AVCaptureAudioDataOutput is
+//   added to the SAME session (never a second device). While the phone is captured, iOS plays its sound out to the Mac
+//   (as with QuickTime's "iPhone" audio input) and its own speaker goes quiet; this must still be confirmed on the
+//   phones (iOS 18.5 and 18.7.8). The sound has its own queue and never touches the video's; anything wrong with it
+//   says so in a kind 6 record (codec "none", reason) and the video goes on.
 // Rotation: the picture follows the phone as it turns (the buffers change size: each lane gets a new encoder, info
 //   record and keyframe). If the buffers keep the size the session started with (the turned picture squashed into
 //   it), the output is asked for the screen's own size; if that doesn't take, phonecap exits 8 and the server starts
 //   it again (a new session takes the screen's size as it is).
-// phonecap-caps: lanes rotate
+// phonecap-caps: lanes rotate audio
 //   (scripts/build-native.mjs copies the caps above to build/phonecap.caps, so the server knows what this build speaks)
 // stderr: human-readable log lines. Exit codes: 2 no device, 3 camera access denied, 4 capture failed,
 //          5 device disconnected, 6 encoder failed, 7 several iPhones share a name and can't be told apart,
@@ -30,6 +39,7 @@
 //
 // Build: scripts/build-native.mjs (npm run build): swiftc, then wraps it in build/PhoneCap.app and signs the bundle.
 
+import AudioToolbox
 import AVFoundation
 import CoreImage
 import CoreMedia
@@ -62,6 +72,8 @@ struct Options {
     var requestAccess = false
     var anyIfSingle = false
     var waitSeconds = 12.0
+    var audio = false
+    var audioBitrate = 80_000
 }
 
 func parseOptions() -> Options {
@@ -79,6 +91,8 @@ func parseOptions() -> Options {
         case "--key-seconds": o.keySeconds = max(0.5, min(10, Double(next()) ?? 2))
         case "--wait": o.waitSeconds = max(1, Double(next()) ?? 12)
         case "--any-if-single": o.anyIfSingle = true
+        case "--audio": o.audio = true
+        case "--audio-bitrate": o.audioBitrate = max(24_000, min(160_000, Int(next()) ?? 80_000))
         case "--list": o.list = true
         case "--request-access": o.requestAccess = true
         default: break
@@ -572,6 +586,17 @@ func requestAccessAndExit() {
     }
     if answer == true {
         log("camera access OK: the server can capture the iPhones now")
+        // the phone's sound comes over the same capture; macOS may count it as Microphone
+        if AVCaptureDevice.authorizationStatus(for: .audio) == .notDetermined {
+            log("asking macOS for Microphone access (the iPhones' sound): click Allow (waits up to 2 minutes)")
+            var mic: Bool?
+            AVCaptureDevice.requestAccess(for: .audio) { mic = $0 }
+            let until = Date().addingTimeInterval(120)
+            while mic == nil && Date() < until { spin(0.1) }
+        }
+        let micOK = AVCaptureDevice.authorizationStatus(for: .audio) == .authorized
+        log(micOK ? "microphone access OK: the iPhones' sound can reach the live view"
+                  : "microphone access NOT granted: the live view has no sound (System Settings > Privacy & Security > Microphone: turn phonecap on)")
         print("authorized")
         exit(0)
     }
@@ -819,6 +844,309 @@ final class Encoder {
     }
 }
 
+// MARK: - audio
+//
+// The phone's sound from the same capture session (the screen device is muxed). Samples come as 32-bit float,
+// interleaved, asked for at 48 kHz stereo (resampled here if macOS gives another rate), cut into 20 ms frames and
+// encoded with AudioToolbox's Opus encoder; a Mac without one gets G.711 u-law (8 kHz mono), which every browser
+// plays too. Runs on its own queue; nothing here can stop the video: a failure only says so (kind 6, codec "none").
+// Each frame's time is the capture time of its first sample (the host clock turned into wall-clock ms, as the video's).
+
+let audioNoMore: OSStatus = 0x6e6f6d72 // "nomr": the converter's input proc has nothing more for this call
+
+private let audioInputProc: AudioConverterComplexInputDataProc = { _, ioPackets, ioData, _, user in
+    guard let user = user else {
+        ioPackets.pointee = 0
+        return audioNoMore
+    }
+    return Unmanaged<AudioTap>.fromOpaque(user).takeUnretainedValue().supply(ioPackets, ioData)
+}
+
+/// G.711 u-law of one sample (-1...1).
+func ulaw(_ x: Float) -> UInt8 {
+    var s = Int32(max(-1, min(1, x)) * 32767)
+    let sign: Int32 = s < 0 ? 0x80 : 0
+    if s < 0 { s = -s }
+    s = min(s + 132, 32635)
+    var exp: Int32 = 7
+    var mask: Int32 = 0x4000
+    while exp > 0 && (s & mask) == 0 {
+        exp -= 1
+        mask >>= 1
+    }
+    let mant = (s >> (exp + 3)) & 0x0f
+    return UInt8(truncatingIfNeeded: ~(sign | (exp << 4) | mant))
+}
+
+final class AudioTap: NSObject, AVCaptureAudioDataOutputSampleBufferDelegate {
+    let output = AVCaptureAudioDataOutput()
+    let queue = DispatchQueue(label: "phonecap.audio", qos: .userInitiated)
+    static let rate = 48000.0
+    static let frame = 960 // 20 ms at 48 kHz
+    let channels = 2
+    private let bitrate: Int
+    private var converter: AudioConverterRef?
+    private(set) var codec = "none"
+    private var fifo: [Float] = [] // interleaved stereo at 48 kHz
+    private var fifoTime = 0.0 // capture time (ms) of fifo's first sample
+    private var feed: UnsafeMutablePointer<Float>?
+    private var feedFrames: UInt32 = 0
+    private var peak: Float = 0
+    private var sumSq: Double = 0
+    private var nSq = 0
+    private var lastLevel = 0.0
+    private var warned = Set<String>()
+    private var on = false // "audio on" from the server: frames are sent only while someone listens
+
+    init(bitrate: Int) {
+        self.bitrate = bitrate
+        super.init()
+    }
+
+    /// Adds the audio output to the session (between its begin/commitConfiguration); false (and why, in a kind 6
+    /// record) when it can't be.
+    func attach(to session: AVCaptureSession) -> Bool {
+        let mic = AVCaptureDevice.authorizationStatus(for: .audio)
+        if mic == .denied || mic == .restricted {
+            say(reason: "macOS denies Microphone to phonecap, so the phone's sound can't be captured (System Settings > Privacy & Security > Microphone: turn phonecap on)")
+            return false
+        }
+        output.audioSettings = [
+            AVFormatIDKey: kAudioFormatLinearPCM,
+            AVLinearPCMIsFloatKey: true,
+            AVLinearPCMBitDepthKey: 32,
+            AVLinearPCMIsNonInterleaved: false,
+            AVLinearPCMIsBigEndianKey: false,
+            AVSampleRateKey: AudioTap.rate,
+            AVNumberOfChannelsKey: channels,
+        ]
+        guard session.canAddOutput(output) else {
+            say(reason: "the phone's capture device takes no audio output")
+            return false
+        }
+        output.setSampleBufferDelegate(self, queue: queue)
+        session.addOutput(output)
+        makeEncoder()
+        var info: [String: Any] = ["codec": codec, "rate": codec == "pcmu" ? 8000 : 48000, "channels": codec == "pcmu" ? 1 : channels, "frame_ms": 20]
+        if mic == .notDetermined { info["note"] = "Microphone access for phonecap was never asked (phonecap --request-access asks it)" }
+        emitJSON(6, info)
+        log("audio: \(codec) from the same capture session")
+        return true
+    }
+
+    private func say(reason: String) {
+        log("audio off: \(reason)")
+        emitJSON(6, ["codec": "none", "reason": reason])
+    }
+
+    private func makeEncoder() {
+        var inFmt = AudioStreamBasicDescription(
+            mSampleRate: AudioTap.rate, mFormatID: kAudioFormatLinearPCM,
+            mFormatFlags: kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked,
+            mBytesPerPacket: UInt32(4 * channels), mFramesPerPacket: 1, mBytesPerFrame: UInt32(4 * channels),
+            mChannelsPerFrame: UInt32(channels), mBitsPerChannel: 32, mReserved: 0)
+        var outFmt = AudioStreamBasicDescription(
+            mSampleRate: AudioTap.rate, mFormatID: kAudioFormatOpus, mFormatFlags: 0, mBytesPerPacket: 0,
+            mFramesPerPacket: UInt32(AudioTap.frame), mBytesPerFrame: 0, mChannelsPerFrame: UInt32(channels),
+            mBitsPerChannel: 0, mReserved: 0)
+        var conv: AudioConverterRef?
+        let st = AudioConverterNew(&inFmt, &outFmt, &conv)
+        if st == noErr, let c = conv {
+            var br = UInt32(bitrate)
+            let bst = AudioConverterSetProperty(c, kAudioConverterEncodeBitRate, UInt32(MemoryLayout<UInt32>.size), &br)
+            if bst != noErr { log("audio: Opus bitrate not set (\(bst)); the encoder's own") }
+            converter = c
+            codec = "opus"
+        } else {
+            log("audio: no Opus encoder on this Mac (AudioConverterNew \(st)); G.711 u-law instead")
+            codec = "pcmu"
+        }
+    }
+
+    /// From the server's stdin: send frames (someone listens) or not. Called on any thread.
+    func set(_ wanted: Bool) {
+        queue.async {
+            if self.on == wanted { return }
+            self.on = wanted
+            self.fifo.removeAll(keepingCapacity: true)
+            log("audio \(wanted ? "on" : "off")")
+        }
+    }
+
+    private func warnOnce(_ s: String) {
+        if warned.insert(s).inserted { log("audio: \(s)") }
+    }
+
+    func captureOutput(_ output: AVCaptureOutput, didOutput sb: CMSampleBuffer, from connection: AVCaptureConnection) {
+        guard on, codec != "none" else { return }
+        guard let fmt = CMSampleBufferGetFormatDescription(sb),
+              let asbdPtr = CMAudioFormatDescriptionGetStreamBasicDescription(fmt) else { return }
+        let asbd = asbdPtr.pointee
+        let frames = CMSampleBufferGetNumSamples(sb)
+        guard frames > 0, let block = CMSampleBufferGetDataBuffer(sb) else { return }
+        let ch = max(1, Int(asbd.mChannelsPerFrame))
+        let isFloat = asbd.mFormatFlags & kAudioFormatFlagIsFloat != 0
+        let nonInterleaved = asbd.mFormatFlags & kAudioFormatFlagIsNonInterleaved != 0
+        let usable = asbd.mFormatID == kAudioFormatLinearPCM && !nonInterleaved
+            && ((isFloat && asbd.mBitsPerChannel == 32) || (!isFloat && asbd.mBitsPerChannel == 16))
+        if !usable {
+            warnOnce("unexpected sample format (id \(asbd.mFormatID), flags \(asbd.mFormatFlags), \(asbd.mBitsPerChannel) bits); no sound")
+            return
+        }
+        let total = CMBlockBufferGetDataLength(block)
+        var raw = Data(count: total)
+        let ok = raw.withUnsafeMutableBytes { (b: UnsafeMutableRawBufferPointer) -> OSStatus in
+            CMBlockBufferCopyDataBytes(block, atOffset: 0, dataLength: total, destination: b.baseAddress!)
+        }
+        guard ok == noErr else { return }
+        // to stereo float
+        let n = min(frames, total / (ch * (isFloat ? 4 : 2)))
+        guard n > 0 else { return }
+        var stereo = [Float](repeating: 0, count: n * 2)
+        raw.withUnsafeBytes { (b: UnsafeRawBufferPointer) in
+            for i in 0..<n {
+                var l: Float
+                var r: Float
+                if isFloat {
+                    let f = b.baseAddress!.assumingMemoryBound(to: Float.self)
+                    l = f[i * ch]
+                    r = ch > 1 ? f[i * ch + 1] : l
+                } else {
+                    let s16 = b.baseAddress!.assumingMemoryBound(to: Int16.self)
+                    l = Float(s16[i * ch]) / 32768
+                    r = ch > 1 ? Float(s16[i * ch + 1]) / 32768 : l
+                }
+                stereo[i * 2] = l
+                stereo[i * 2 + 1] = r
+            }
+        }
+        // another rate than asked: resampled to 48 kHz (linear; plenty for watching a phone)
+        let srcRate = asbd.mSampleRate > 0 ? asbd.mSampleRate : AudioTap.rate
+        if abs(srcRate - AudioTap.rate) > 1 {
+            warnOnce("the phone's sound comes at \(Int(srcRate)) Hz; resampled to 48 kHz")
+            let outN = Int(Double(n) * AudioTap.rate / srcRate)
+            var res = [Float](repeating: 0, count: outN * 2)
+            for j in 0..<outN {
+                let pos = Double(j) * srcRate / AudioTap.rate
+                let i0 = min(n - 1, Int(pos))
+                let i1 = min(n - 1, i0 + 1)
+                let t = Float(pos - Double(i0))
+                res[j * 2] = stereo[i0 * 2] * (1 - t) + stereo[i1 * 2] * t
+                res[j * 2 + 1] = stereo[i0 * 2 + 1] * (1 - t) + stereo[i1 * 2 + 1] * t
+            }
+            stereo = res
+        }
+        // the buffer's capture time on the wall clock (its age from the host clock, as the video's)
+        let wall = nowMs()
+        var captured = wall
+        let pts = CMSampleBufferGetPresentationTimeStamp(sb)
+        if pts.isValid {
+            let age = CMTimeGetSeconds(CMTimeSubtract(CMClockGetTime(CMClockGetHostTimeClock()), pts)) * 1000
+            if age >= 0 && age < 2000 { captured = wall - age }
+        }
+        let have = fifo.count / 2
+        let expected = fifoTime + Double(have) * 1000 / AudioTap.rate
+        // a gap or a jump (the sound stopped and started again): the queue's time follows the capture
+        if have == 0 || abs(captured - expected) > 80 { fifoTime = captured - Double(have) * 1000 / AudioTap.rate }
+        fifo.append(contentsOf: stereo)
+        // at most 200 ms waiting: the sound never drifts behind the picture
+        let most = AudioTap.frame * 10 * 2
+        if fifo.count > most {
+            let drop = (fifo.count - most) / 2
+            fifo.removeFirst(drop * 2)
+            fifoTime += Double(drop) * 1000 / AudioTap.rate
+        }
+        let step = AudioTap.frame * 2
+        while fifo.count >= step {
+            let chunk = Array(fifo[0..<step])
+            fifo.removeFirst(step)
+            let t = fifoTime
+            fifoTime += 20
+            meter(chunk)
+            encode(chunk, time: t)
+        }
+    }
+
+    private func meter(_ chunk: [Float]) {
+        for v in chunk {
+            let a = abs(v)
+            if a > peak { peak = a }
+            sumSq += Double(v * v)
+        }
+        nSq += chunk.count
+        let now = nowMs()
+        if now - lastLevel >= 2000 {
+            let rms = nSq > 0 ? (sumSq / Double(nSq)).squareRoot() : 0
+            func db(_ x: Double) -> Double { x > 0 ? (20 * log10(x) * 10).rounded() / 10 : -120 }
+            emitJSON(6, ["level_db": db(rms), "peak_db": db(Double(peak))])
+            peak = 0
+            sumSq = 0
+            nSq = 0
+            lastLevel = now
+        }
+    }
+
+    /// The converter's input: the 20 ms frame being encoded, then nothing more for this call.
+    func supply(_ n: UnsafeMutablePointer<UInt32>, _ data: UnsafeMutablePointer<AudioBufferList>) -> OSStatus {
+        guard let p = feed, feedFrames > 0 else {
+            n.pointee = 0
+            return audioNoMore
+        }
+        let give = min(n.pointee, feedFrames)
+        data.pointee.mNumberBuffers = 1
+        data.pointee.mBuffers.mNumberChannels = UInt32(channels)
+        data.pointee.mBuffers.mDataByteSize = give * UInt32(4 * channels)
+        data.pointee.mBuffers.mData = UnsafeMutableRawPointer(p)
+        feed = p + Int(give) * channels
+        feedFrames -= give
+        n.pointee = give
+        return noErr
+    }
+
+    private func encode(_ chunk: [Float], time: Double) {
+        if codec == "pcmu" {
+            // 48 kHz stereo -> 8 kHz mono: each output sample the mean of six input frames
+            let outN = AudioTap.frame / 6
+            var out = [UInt8](repeating: 0, count: outN)
+            for j in 0..<outN {
+                var s: Float = 0
+                for k in 0..<6 {
+                    let i = (j * 6 + k) * 2
+                    s += chunk[i] + chunk[i + 1]
+                }
+                out[j] = ulaw(s / 12)
+            }
+            emit(5, time, Data(out))
+            return
+        }
+        guard let conv = converter else { return }
+        var input = chunk
+        var bytes = [UInt8](repeating: 0, count: 1500)
+        var desc = AudioStreamPacketDescription()
+        var packets: UInt32 = 1
+        var size: UInt32 = 0
+        let st: OSStatus = input.withUnsafeMutableBufferPointer { ib in
+            bytes.withUnsafeMutableBytes { ob in
+                feed = ib.baseAddress
+                feedFrames = UInt32(AudioTap.frame)
+                var list = AudioBufferList(mNumberBuffers: 1, mBuffers: AudioBuffer(mNumberChannels: UInt32(channels), mDataByteSize: 1500, mData: ob.baseAddress))
+                let r = AudioConverterFillComplexBuffer(conv, audioInputProc, Unmanaged.passUnretained(self).toOpaque(), &packets, &list, &desc)
+                size = desc.mDataByteSize > 0 ? desc.mDataByteSize : list.mBuffers.mDataByteSize
+                feed = nil
+                feedFrames = 0
+                return r
+            }
+        }
+        if st != noErr && st != audioNoMore {
+            warnOnce("Opus encode failed (\(st))")
+            return
+        }
+        if packets > 0 && size > 0 && size <= 1500 {
+            emit(5, time, Data(bytes[0..<Int(size)]))
+        }
+    }
+}
+
 // MARK: - capture
 
 /// One encoder fed by the capture: its own size (scale of the native screen), frame rate and bitrate. Used on the
@@ -856,6 +1184,7 @@ final class Capturer: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate {
     private var lastRaw: CVPixelBuffer? // the last frame as captured (before any turn)
     private var lastFrameAt = 0.0
     private var input: AVCaptureDeviceInput?
+    var audio: AudioTap?
     // the buffers' shape against the screen's own (see followSource); used on the capture queue only
     private var frameCount = 0
     private var disagreed = 0
@@ -891,6 +1220,13 @@ final class Capturer: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate {
         output.setSampleBufferDelegate(self, queue: queue)
         guard session.canAddOutput(output) else { throw NSError(domain: "phonecap", code: 2, userInfo: [NSLocalizedDescriptionKey: "cannot add the video output"]) }
         session.addOutput(output)
+        // the phone's sound, from the same (muxed) device and session; the video never depends on it
+        if o.audio && (device.hasMediaType(.muxed) || device.hasMediaType(.audio)) {
+            let tap = AudioTap(bitrate: o.audioBitrate)
+            if tap.attach(to: session) { audio = tap }
+        } else if o.audio {
+            emitJSON(6, ["codec": "none", "reason": "the phone's capture device carries no sound"])
+        }
         session.commitConfiguration()
 
         do {
@@ -1311,6 +1647,9 @@ Thread.detachNewThread {
             if n >= 2, let id = Int(parts[1]) {
                 capturer.queue.async { capturer.removeLane(id) }
             }
+        case "audio":
+            // "audio on" / "audio off": send the phone's sound (someone listens) or not
+            capturer.audio?.set(n >= 2 && parts[1] == "on")
         case "rotate":
             // "rotate <0|90|180|270>": degrees clockwise
             if n >= 2, let d = Int(parts[1]) {

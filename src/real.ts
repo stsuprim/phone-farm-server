@@ -4,6 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parseInstalled, withKnown } from './apps.js';
+import { AudioFeed, AudioHub, VolumeGuard } from './audio.js';
 import { Config } from './config.js';
 import { jpegMaybeBlack, pngIsBlack, wakeScreen } from './dark.js';
 import { H264Info, H264Source, helperProducer, phoneStats, StartProducer } from './h264.js';
@@ -104,11 +105,21 @@ export class RealBackend implements Backend {
   private appCache = new Map<string, { at: number; apps: AppInfo[] }>();
   private seen = new Map<string, number>(); // when each phone was last plugged in (Date.now())
   private playFails = new Map<string, { at: number; error: string }>(); // a queued HID gesture that failed while playing
+  private audioHubs = new Map<string, AudioHub>(); // each phone's sound (src/audio.ts)
+  private volume: VolumeGuard; // the phone's media volume while its sound is on the Mac
   /** Set by the server: a phone's orientation or upright size changed. */
   onOrientation?: (udid: string) => void;
 
   constructor(private cfg: Config) {
     this.wda = new WdaManager(cfg, (udid) => this.phones.get(udid)?.name ?? udid);
+    this.volume = new VolumeGuard({
+      percent: cfg.audio === false ? 0 : cfg.audioPhoneVolume ?? 50,
+      press: (udid, dir) => this.wda.pressButton(udid, dir === 'up' ? 'volumeUp' : 'volumeDown'),
+      file: path.join(cfg.dataDir, 'audio-volume.json'),
+      gapMs: 60,
+    });
+    // a phone left raised by a crash or a restart goes back to 0 first (tried again while its WDA isn't up yet)
+    this.volume.recover();
     this.wda.onOrientation = (udid) => {
       const c = this.capture.get(udid);
       if (c) c.tries = 0; // the phone turned: a new chance for the capture to follow
@@ -290,6 +301,7 @@ export class RealBackend implements Backend {
     return {
       ...phoneStats(srcs, { fps: m?.viewers ? m.meter.rate() : 0, viewers: m?.viewers ?? 0 }, reason, this.buildError()),
       capture_mismatch: this.capture.get(udid)?.mismatch ?? null,
+      audio: this.audioStats(udid),
       ...this.wda.healStats(udid),
       wda_link: this.wda.linkHealth(udid),
     };
@@ -350,7 +362,9 @@ export class RealBackend implements Backend {
       if (lanes) {
         let host = this.hosts.get(udid);
         if (!host) {
-          this.hosts.set(udid, (host = new PhonecapHost(HELPER, args, tag)));
+          const sound = this.cfg.audio !== false && helperCaps().includes('audio') ? this.audioHub(udid) : undefined;
+          this.hosts.set(udid, (host = new PhonecapHost(HELPER, args, tag, undefined, sound)));
+          if (sound?.listeners) host.setAudio(true);
           const fixed = this.rotateMode();
           if (typeof fixed === 'number' && helperCaps().includes('rotate')) host.rotate(fixed);
         }
@@ -367,6 +381,45 @@ export class RealBackend implements Backend {
     if (down) return down;
     src.setWant(prof.settings);
     return src;
+  }
+
+  // ---- the phone's sound (src/audio.ts) ----
+
+  private audioHub(udid: string): AudioHub {
+    let hub = this.audioHubs.get(udid);
+    if (hub) return hub;
+    const tag = udid.slice(-8);
+    hub = new AudioHub(tag, {
+      enable: (on) => this.hosts.get(udid)?.setAudio(on),
+      // the first frame: the sound is on the Mac now, so the phone's volume can go up (it plays nowhere else)
+      flowing: () => void this.volume.raise(udid),
+      // nobody listens: back to 0 while the capture still holds the sound (held open until it's done); the capture
+      // ended: back to 0 at once
+      quiet: (ended) => {
+        const release = ended ? undefined : this.hosts.get(udid)?.hold();
+        void this.volume.lower(udid).finally(() => release?.());
+      },
+    });
+    this.audioHubs.set(udid, hub);
+    return hub;
+  }
+
+  /** The phone's sound for a WebRTC live view, or why there's none. */
+  audio(udid: string): AudioFeed | string {
+    this.known(udid);
+    if (this.cfg.audio === false) return 'sound is turned off on the server (AUDIO=false)';
+    if (this.helperProblem()) return 'no capture helper on the Mac';
+    if (!helperCaps().includes('lanes')) return 'the capture helper on the Mac is too old for sound';
+    if (!helperCaps().includes('audio')) return "the capture helper on the Mac has no sound yet (it's rebuilt with the next update)";
+    return this.audioHub(udid);
+  }
+
+  /** The sound's numbers for GET /phones `stats.audio` (null before anyone asked for it). */
+  private audioStats(udid: string) {
+    const hub = this.audioHubs.get(udid);
+    if (!hub) return null;
+    const i = hub.info();
+    return { ...i, listeners: hub.listeners, volume_raised: this.volume.isRaised(udid) };
   }
 
   // ---- the detail card (src/info.ts) ----
@@ -876,6 +929,7 @@ export class RealBackend implements Backend {
     for (const s of this.h264Sources.values()) s.close();
     for (const h of this.hosts.values()) h.close();
     for (const h of this.hid.values()) h.close();
+    this.volume.close();
     this.wda.shutdown();
   }
 }

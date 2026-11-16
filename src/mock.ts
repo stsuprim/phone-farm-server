@@ -1,5 +1,6 @@
 import crypto from 'node:crypto';
 import { withKnown } from './apps.js';
+import { AudioFeed, AudioHub } from './audio.js';
 import { H264Source, phoneStats, RateMeter } from './h264.js';
 import { appName } from './info.js';
 import { mockProducer } from './h264mock.js';
@@ -23,6 +24,8 @@ export interface MockOptions {
   h264KeySeconds?: number;
   /** A mock phone's gestures and text are answered at once and "play" this long, like HID's queued ones. Default 0. */
   playMs?: number;
+  /** The mock phones' sound: true (default) fake Opus frames every 20 ms while captured and listened to; a string says why there's none. */
+  audio?: boolean | string;
 }
 
 /** The mock home screen's apps (GET /ui shows them as buttons; tapping one opens it). */
@@ -83,6 +86,10 @@ export class MockBackend implements Backend {
   private battTimer: NodeJS.Timeout;
   private streams = new Set<NodeJS.Timeout>();
   private h264Sources = new Map<string, H264Source>();
+  private audioHubs = new Map<string, AudioHub>();
+  private audioTimers = new Map<string, NodeJS.Timeout>();
+  /** What the mock sound did, in order (tests): "on", "off", "flowing", "quiet", "ended". */
+  readonly audioLog: string[] = [];
   private mjpeg = new Map<string, { viewers: number; meter: RateMeter }>();
   private born = Date.now();
   /** How often each phone's facts were gathered (tests: the ~15 s cache). */
@@ -182,6 +189,37 @@ export class MockBackend implements Backend {
       this.h264Sources.set(udid, src);
     }
     return src;
+  }
+
+  /**
+   * The mock phone's sound: fake Opus frames (a silence frame's bytes) every 20 ms, only while its capture runs and
+   * someone listens, as the real helper's.
+   */
+  audio(udid: string): AudioFeed | string {
+    this.live(udid);
+    if (this.opts.audio === false) return 'no sound in this mock';
+    if (typeof this.opts.audio === 'string') return this.opts.audio;
+    let hub = this.audioHubs.get(udid);
+    if (!hub) {
+      const h: AudioHub = new AudioHub(udid.slice(0, 8), {
+        enable: (on) => {
+          this.audioLog.push(on ? 'on' : 'off');
+          clearInterval(this.audioTimers.get(udid));
+          this.audioTimers.delete(udid);
+          if (!on) return;
+          this.audioTimers.set(udid, setInterval(() => {
+            if (this.capturing(udid)) h.frame({ time: Date.now() - 5, payload: Buffer.from([0xf8, 0xff, 0xfe]) });
+          }, 20));
+        },
+        flowing: () => this.audioLog.push('flowing'),
+        quiet: (ended) => this.audioLog.push(ended ? 'ended' : 'quiet'),
+        log: () => {},
+      });
+      hub = h;
+      this.audioHubs.set(udid, hub);
+      hub.infoRecord(Buffer.from(JSON.stringify({ codec: 'opus', rate: 48000, channels: 2, frame_ms: 20 })));
+    }
+    return hub;
   }
 
   /** Whether the mock capture runs now (a viewer opened it, or left a moment ago). */
@@ -428,6 +466,7 @@ export class MockBackend implements Backend {
     for (const t of this.streams) clearInterval(t);
     this.streams.clear();
     for (const s of this.h264Sources.values()) s.close();
+    for (const t of this.audioTimers.values()) clearInterval(t);
   }
 }
 

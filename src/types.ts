@@ -312,5 +312,10 @@ export interface Backend {
   ): { contentType: string; unsubscribe: () => void } & StreamSettings;
   /** The phone's shared H.264 capture, or the reason H.264 isn't available (then clients get MJPEG). */
   h264(udid: string, want: H264Want): H264Source | string;
+  /**
+   * The phone's sound for a live view (src/audio.ts), or why there's none. It flows only while the phone's capture runs
+   * (a live view is open) and someone listens.
+   */
+  audio?(udid: string): import('./audio.js').AudioFeed | string;
   close(): Promise<void>;
 }

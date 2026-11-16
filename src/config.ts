@@ -18,6 +18,13 @@ export interface Config {
   autoUpdateMinutes: number; // same interval in minutes (what index.ts passes to updater.start)
   h264: boolean; // H.264 live view through native/phonecap (macOS)
   h264BitrateMbps: number;
+  /** The phone's sound in the live view (AUDIO, on by default; src/audio.ts). */
+  audio?: boolean;
+  /**
+   * The phone's media volume while its sound is routed to the Mac, percent (AUDIO_PHONE_VOLUME, default 50; 0 = the
+   * phone's volume is never touched). Back to 0 when nobody listens.
+   */
+  audioPhoneVolume?: number;
   /** CoreDevice HID live touch (docs/BEST_METHOD.md): auto = on iOS 27+ phones, on = try on every phone, off. */
   hidInput: 'auto' | 'on' | 'off';
   /** The Python that has pymobiledevice3 (native/hid/hid_input.py runs with it). */
@@ -98,6 +105,8 @@ export function loadConfig(envFile = '.env'): Config {
     autoUpdateMinutes: autoUpdateSeconds / 60,
     h264: bool(e.H264, true),
     h264BitrateMbps: Math.min(50, Math.max(1, num(e.H264_BITRATE_MBPS, 8))),
+    audio: bool(e.AUDIO, true),
+    audioPhoneVolume: Math.min(100, Math.max(0, num(e.AUDIO_PHONE_VOLUME, 50))),
     hidInput: /^(on|off)$/i.test(e.HID_INPUT ?? '') ? (e.HID_INPUT!.toLowerCase() as 'on' | 'off') : 'auto',
     hidPython: expand(e.HID_PYTHON || 'python3'),
     hidIdleSeconds: Math.max(10, num(e.HID_IDLE_SECONDS, 120)),
