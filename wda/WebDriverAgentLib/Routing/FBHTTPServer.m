@@ -15,6 +15,79 @@
 #import "FBTCPSocket.h"
 #import "FBSession.h"
 
+// >>> LOTUS (phone-farm): token authentication and the short list of routes this build serves.
+#import <CommonCrypto/CommonDigest.h>
+
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Weverything"
+
+// The secret this WebDriverAgent was launched with (LOTUS_WDA_TOKEN, given by the Mac's server through
+// xcodebuild's TEST_RUNNER_ environment). Without one of at least 16 characters nothing is served at all.
+static NSString *LotusToken(void)
+{
+  static NSString *token;
+  static dispatch_once_t onceToken;
+  dispatch_once(&onceToken, ^{
+    NSString *value = NSProcessInfo.processInfo.environment[@"LOTUS_WDA_TOKEN"];
+    token = (nil != value && value.length >= 16) ? [value copy] : nil;
+  });
+  return token;
+}
+
+// Whether `candidate` (a request's X-Lotus-Token header) is the token. Both are hashed first and the two
+// digests compared byte by byte without an early exit, so the time taken says nothing about how much matched
+// or how long the token is.
+static BOOL LotusTokenMatches(NSString *candidate)
+{
+  NSString *token = LotusToken();
+  if (nil == token || nil == candidate || 0 == candidate.length) {
+    return NO;
+  }
+  NSData *a = [token dataUsingEncoding:NSUTF8StringEncoding];
+  NSData *b = [candidate dataUsingEncoding:NSUTF8StringEncoding];
+  if (nil == a || nil == b) {
+    return NO;
+  }
+  unsigned char da[CC_SHA256_DIGEST_LENGTH];
+  unsigned char db[CC_SHA256_DIGEST_LENGTH];
+  CC_SHA256(a.bytes, (CC_LONG)a.length, da);
+  CC_SHA256(b.bytes, (CC_LONG)b.length, db);
+  unsigned char diff = 0;
+  for (int i = 0; i < CC_SHA256_DIGEST_LENGTH; i++) {
+    diff |= (unsigned char)(da[i] ^ db[i]);
+  }
+  return 0 == diff;
+}
+
+// The routes the Mac's server uses (status, session, screenshot, the UI tree, taps and W3C actions, keys, apps,
+// lock and unlock, orientation, the app in front, battery and device info, and our own /lotus/ ones). Every other
+// WebDriverAgent route is answered as an unknown command: it is not reachable in this build.
+static BOOL LotusRouteAllowed(NSString *path)
+{
+  static NSRegularExpression *allowed;
+  static dispatch_once_t onceToken;
+  dispatch_once(&onceToken, ^{
+    NSString *pattern = @"^(?:"
+      @"/status"
+      @"|/session(?:/[^/]+)?"
+      @"|(?:/session/[^/]+)?/(?:screenshot|source|orientation|actions|window/size|appium/settings)"
+      @"|(?:/session/[^/]+)?/wda/(?:screen|activeAppInfo|device/info|batteryInfo|pressButton|homescreen|keys"
+      @"|lock|unlock|locked|tap|apps/launch|apps/activate|apps/terminate|apps/state|apps/list)"
+      @"|/lotus/(?:info|gesture|touch|shot|selftest)"
+      @")/?$";
+    allowed = [NSRegularExpression regularExpressionWithPattern:pattern
+                                                        options:NSRegularExpressionCaseInsensitive
+                                                          error:nil];
+  });
+  if (nil == allowed || nil == path) {
+    return NO;
+  }
+  return nil != [allowed firstMatchInString:path options:(NSMatchingOptions)0 range:NSMakeRange(0, path.length)];
+}
+
+#pragma clang diagnostic pop
+// <<< LOTUS
+
 static NSData *FBCRLFCRLFData(void)
 {
   static NSData *data;
@@ -570,6 +643,12 @@ static const int64_t FBStaleConnectionSweepIntervalSec = 10;
   if (nil == requestHeaders) {
     return nil;
   }
+  // >>> LOTUS: no valid token, no WebDriverAgent (checked before the body is read or any route is looked at)
+  if (!LotusTokenMatches(requestHeaders[@"x-lotus-token"])) {
+    [self lotus_refuseClient:client];
+    return nil;
+  }
+  // <<< LOTUS
   NSUInteger contentLength = 0;
   if (![self resolveBodyLength:&contentLength fromHeaderFields:requestHeaders forClient:client]) {
     return nil;
@@ -636,13 +715,28 @@ static const int64_t FBStaleConnectionSweepIntervalSec = 10;
   [self writeResponse:response toClient:client thenCloseConnection:YES];
 }
 
+// >>> LOTUS
+// What anything without the token gets, whatever it asked: a bare 404 with no body, none of WebDriverAgent's
+// headers and no JSON, and the connection closed. The port looks like a plain server with nothing on it.
+- (void)lotus_refuseClient:(nw_connection_t)client
+{
+  @synchronized (self.connectionBuffers) {
+    [self.connectionBuffers removeObjectForKey:client];
+    [self.pendingRequestHeaders removeObjectForKey:client];
+  }
+  NSData *payload = FBUTF8Data(@"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+  __weak typeof(self) weakSelf = self;
+  [self.socket writeData:payload toClient:client completion:^(BOOL didSucceed) {
+    [weakSelf closeClient:client];
+  }];
+}
+// <<< LOTUS
+
 - (void)respondBadRequestToClient:(nw_connection_t)client
 {
-  RouteResponse *badRequest = [RouteResponse new];
-  id<FBResponsePayload> payload = FBResponseWithStatus([FBCommandStatus invalidArgumentErrorWithMessage:@"The request could not be parsed as valid HTTP"
-                                                                                                traceback:nil]);
-  [payload dispatchWithResponse:badRequest];
-  [self failClient:client withResponse:badRequest];
+  // LOTUS: a request that can't be parsed never showed a token, so it gets the same bare answer as any
+  // other request without one (upstream answered WebDriverAgent's JSON error here).
+  [self lotus_refuseClient:client];
 }
 
 - (void)applyDefaultHeadersToResponse:(RouteResponse *)response
@@ -657,7 +751,13 @@ static const int64_t FBStaleConnectionSweepIntervalSec = 10;
   NSURLComponents *requestTarget = [NSURLComponents componentsWithString:pathAndQuery];
   NSString *path = requestTarget.path ?: pathAndQuery;
 
-  for (FBHTTPRoute *route in self.routes) {
+  // >>> LOTUS: a route that isn't on the list is not looked up at all (it falls through to "unknown command")
+  NSArray<FBHTTPRoute *> *servedRoutes = self.routes;
+  if (!LotusRouteAllowed(path)) {
+    servedRoutes = @[];
+  }
+  // <<< LOTUS
+  for (FBHTTPRoute *route in servedRoutes) {
     if (![route.verb isEqualToString:method]) {
       continue;
     }

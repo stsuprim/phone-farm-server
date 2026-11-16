@@ -846,3 +846,6 @@
 }
 
 @end
+
+// LOTUS (phone-farm): our own routes (/lotus/...). Included here, so the file needs no entry in the Xcode project.
+#include "FBLotusCommands.inc"

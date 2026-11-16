@@ -9,8 +9,8 @@
 #import "FBWebServer.h"
 
 #import "FBHTTPServer.h"
-#import "FBMjpegServer.h"
-#import "FBTCPSocket.h"
+// LOTUS: no MJPEG server in this build (FBMjpegServer is gone from the project): the live picture is the Mac's
+// USB capture and stills come from GET /lotus/shot, so nothing ever listens on the MJPEG port (9100).
 
 #import "FBCommandHandler.h"
 #import "FBCommandStatus.h"
@@ -32,17 +32,10 @@ static NSString *const FBServerURLEndMarker = @"<-ServerURLHere";
 @interface FBWebServer ()
 @property (nonatomic, strong) FBExceptionHandler *exceptionHandler;
 @property (nonatomic, strong) FBHTTPServer *server;
-@property (nonatomic, nullable) FBTCPSocket *screenshotsBroadcaster;
-@property (nonatomic, nullable, strong) FBMjpegServer *mjpegServer;
 @property (atomic, assign) BOOL keepAlive;
 @end
 
 @implementation FBWebServer
-
-- (void)dealloc
-{
-  [self stopScreenshotsBroadcaster];
-}
 
 + (NSArray<Class<FBCommandHandler>> *)collectCommandHandlerClasses
 {
@@ -66,8 +59,6 @@ static NSString *const FBServerURLEndMarker = @"<-ServerURLHere";
   if (![self startHTTPServer]) {
     return;
   }
-  [self initScreenshotsBroadcaster];
-
   self.keepAlive = YES;
   NSRunLoop *runLoop = [NSRunLoop mainRunLoop];
   while (self.keepAlive &&
@@ -127,56 +118,6 @@ static NSString *const FBServerURLEndMarker = @"<-ServerURLHere";
   return YES;
 }
 
-- (void)initScreenshotsBroadcaster
-{
-  [self readMjpegSettingsFromEnv];
-  self.mjpegServer = [[FBMjpegServer alloc] init];
-  self.screenshotsBroadcaster = [[FBTCPSocket alloc]
-                                 initWithPort:(uint16_t)FBConfiguration.sharedInstance.mjpegServerPort];
-  // Bind to the same address as the HTTP server when USE_IP is set.
-  // nil (the default) keeps listening on all interfaces.
-  self.screenshotsBroadcaster.interface = FBConfiguration.sharedInstance.bindingIPAddress;
-  self.mjpegServer.socket = self.screenshotsBroadcaster;
-  self.screenshotsBroadcaster.delegate = self.mjpegServer;
-  NSError *error;
-  if (![self.screenshotsBroadcaster startWithError:&error]) {
-    [FBLogger logFmt:@"Cannot init screenshots broadcaster service on port %@. Original error: %@", @(FBConfiguration.sharedInstance.mjpegServerPort), error.description];
-    [self.mjpegServer stopStreaming];
-    self.mjpegServer = nil;
-    self.screenshotsBroadcaster = nil;
-  }
-}
-
-- (void)stopScreenshotsBroadcaster
-{
-  if (nil == self.screenshotsBroadcaster) {
-    self.mjpegServer = nil;
-    return;
-  }
-
-  id<FBTCPSocketDelegate> delegate = self.screenshotsBroadcaster.delegate;
-  if ([(NSObject *)delegate respondsToSelector:@selector(stopStreaming)]) {
-    [(FBMjpegServer *)delegate stopStreaming];
-  }
-  self.screenshotsBroadcaster.delegate = nil;
-  [self.screenshotsBroadcaster stop];
-  self.screenshotsBroadcaster = nil;
-  self.mjpegServer = nil;
-}
-
-- (void)readMjpegSettingsFromEnv
-{
-  NSDictionary *env = NSProcessInfo.processInfo.environment;
-  NSString *scalingFactor = [env objectForKey:@"MJPEG_SCALING_FACTOR"];
-  if (scalingFactor != nil && [scalingFactor length] > 0) {
-    FBConfiguration.sharedInstance.mjpegScalingFactor = [scalingFactor floatValue];
-  }
-  NSString *screenshotQuality = [env objectForKey:@"MJPEG_SERVER_SCREENSHOT_QUALITY"];
-  if (screenshotQuality != nil && [screenshotQuality length] > 0) {
-    FBConfiguration.sharedInstance.mjpegServerScreenshotQuality = [screenshotQuality integerValue];
-  }
-}
-
 - (void)sessionWasKilled:(NSNotification *)notification
 {
   FBSession *session = notification.object;
@@ -198,7 +139,6 @@ static NSString *const FBServerURLEndMarker = @"<-ServerURLHere";
 {
   [NSNotificationCenter.defaultCenter removeObserver:self name:FBSessionWasKilledNotification object:nil];
   [FBSession.activeSession kill];
-  [self stopScreenshotsBroadcaster];
   if (self.server.isRunning) {
     [self.server stop:NO];
   }
