@@ -553,16 +553,18 @@ export class RealBackend implements Backend {
     }
   }
 
-  async tap(udid: string, x: number, y: number): Promise<InputResult> {
+  async tap(udid: string, x: number, y: number, holdMs?: number): Promise<InputResult> {
     this.known(udid);
+    const hold = typeof holdMs === 'number' && Number.isFinite(holdMs) && holdMs > 0 ? Math.min(2000, Math.round(holdMs)) : undefined;
+    const fields = hold ? { hold_ms: hold } : {};
     const hid = await this.viaHid(udid, 'tap', ({ h, s, o }) => {
       const [hx, hy] = toHid(x, y, s, o);
-      return h.input('tap', { x: hx, y: hy });
+      return h.input('tap', { x: hx, y: hy, ...fields });
     });
     // both quick routes answer at the press; the lift follows a moment later
-    if ('done' in hid) return { ...hid.done, play_ms: hidPlayMs('tap', {}) };
-    const via = await this.wda.tap(udid, x, y);
-    const play = via === 'wda-fast' ? { play_ms: FAST_TAP_HOLD_MS } : {};
+    if ('done' in hid) return { ...hid.done, play_ms: hidPlayMs('tap', fields) };
+    const via = await this.wda.tap(udid, x, y, hold);
+    const play = via === 'wda-fast' ? { play_ms: hold ?? FAST_TAP_HOLD_MS } : {};
     return hid.why ? { via, reason: hid.why, ...play } : { via, ...play };
   }
   async gesture(udid: string, points: PathPoint[]): Promise<InputResult> {

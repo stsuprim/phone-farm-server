@@ -232,8 +232,11 @@ export interface Backend {
   /** Set by the server: called when a phone's orientation or upright size changed. */
   onOrientation?: (udid: string) => void;
   screenshot(udid: string, format: ImageFormat): Promise<Image>;
-  /** Quick tap at a point. Resolves once it's injected (or queued on the phone), saying how it went. */
-  tap(udid: string, x: number, y: number): Promise<InputResult | void>;
+  /**
+   * Quick tap at a point, held `holdMs` (a natural tap's 50-120 ms; the route's own short hold when not given).
+   * Resolves once it's injected (or queued on the phone), saying how it went.
+   */
+  tap(udid: string, x: number, y: number, holdMs?: number): Promise<InputResult | void>;
   /** One continuous touch through the points (>= 2), with their timing; used for swipe, path and hold. */
   gesture(udid: string, points: PathPoint[]): Promise<InputResult | void>;
   type(udid: string, text: string): Promise<InputResult | void>;

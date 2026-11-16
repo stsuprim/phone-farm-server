@@ -344,10 +344,10 @@ export class MockBackend implements Backend {
   async screenshot(udid: string, _format: ImageFormat): Promise<Image> {
     return { data: this.render(this.live(udid)), contentType: 'image/png' }; // mock always serves PNG
   }
-  async tap(udid: string, x: number, y: number): Promise<InputResult> {
+  async tap(udid: string, x: number, y: number, holdMs?: number): Promise<InputResult> {
     const p = this.live(udid);
     p.marks.push({ x, y, at: Date.now() });
-    p.log.push(`tap ${Math.round(x)},${Math.round(y)}`);
+    p.log.push(`tap ${Math.round(x)},${Math.round(y)}${holdMs ? ` hold ${Math.round(holdMs)}` : ''}`);
     this.hit(p, x, y);
     return MOCK;
   }

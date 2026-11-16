@@ -391,7 +391,10 @@ export class Agent {
       throw new HttpError(409, `${el.type} ${JSON.stringify(el.label ?? el.name ?? el.id)} is off the screen (its middle is at ${cx.toFixed(2)}, ${cy.toFixed(2)}): scroll it into view first`);
     }
     const [x, y] = centerOf(el);
-    const report = await this.action(udid, { type: 'tap', x, y, unit: 'norm' }, { verify: body.verify, settleMs: body.settleMs }, owner);
+    // its box goes along: a natural tap lands a little off the middle, never outside the element
+    const tap: Record<string, unknown> = { type: 'tap', x, y, unit: 'norm', bounds: [el.x, el.y, el.w, el.h] };
+    if (body.natural === false) tap.natural = false;
+    const report = await this.action(udid, tap, { verify: body.verify, settleMs: body.settleMs }, owner);
     return { ...report, element: el, matches: found.length, ...(moved ? { moved } : {}) };
   }
 

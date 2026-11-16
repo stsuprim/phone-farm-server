@@ -949,8 +949,9 @@ export class WdaManager {
   }
 
   /** Tap: the fast route, else /wda/tap, else the older /wda/tap/0, else a W3C pointer tap. */
-  async tap(udid: string, x: number, y: number): Promise<'wda-fast' | 'wda'> {
-    if (await this.fast(udid, { points: [[x, y, 0]], hold: FAST_TAP_HOLD_MS })) return 'wda-fast';
+  async tap(udid: string, x: number, y: number, holdMs?: number): Promise<'wda-fast' | 'wda'> {
+    const hold = holdMs && holdMs > 0 ? Math.round(holdMs) : undefined;
+    if (await this.fast(udid, { points: [[x, y, 0]], hold: hold ?? FAST_TAP_HOLD_MS })) return 'wda-fast';
     const e = this.entries.get(udid);
     const unknown = (err: unknown) => err instanceof WdaError && err.kind === 'unknown';
     if (!e || e.tapRoute === 0) {
@@ -971,7 +972,7 @@ export class WdaManager {
         if (e) e.tapRoute = 2;
       }
     }
-    await this.w3c(udid, [[x, y, 0], [x, y, 50]]);
+    await this.w3c(udid, [[x, y, 0], [x, y, hold ?? 50]]);
     return 'wda';
   }
 

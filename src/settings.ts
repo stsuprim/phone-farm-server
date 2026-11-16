@@ -9,9 +9,14 @@ import { HttpError } from './types.js';
 export interface Settings {
   /** Minutes with no input and no viewer before a phone is locked (screen off). 0 = never. */
   idleLockMinutes: number;
+  /**
+   * Natural touch (src/human.ts): the AI's swipes bow slightly with ease-in and ease-out over a time that fits their
+   * length, its taps land a few points off (inside their element) and are held 50-120 ms. Off: exact and straight.
+   */
+  naturalTouch: boolean;
 }
 
-export const DEFAULT_SETTINGS: Settings = { idleLockMinutes: 10 };
+export const DEFAULT_SETTINGS: Settings = { idleLockMinutes: 10, naturalTouch: true };
 const MAX_IDLE_LOCK_MINUTES = 24 * 60;
 
 export class SettingsStore {
@@ -54,6 +59,9 @@ export class SettingsStore {
         if (typeof val === 'number' && Number.isFinite(val) && val >= 0 && val <= MAX_IDLE_LOCK_MINUTES) {
           out.idleLockMinutes = Math.round(val * 100) / 100;
         } else if (!lenient) throw new HttpError(400, `"idleLockMinutes" must be a number from 0 (off) to ${MAX_IDLE_LOCK_MINUTES}`);
+      } else if (k === 'naturalTouch') {
+        if (typeof val === 'boolean') out.naturalTouch = val;
+        else if (!lenient) throw new HttpError(400, '"naturalTouch" must be true or false');
       } else if (!lenient) throw new HttpError(400, `unknown setting ${JSON.stringify(k)}`);
     }
     return out;

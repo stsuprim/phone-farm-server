@@ -31,9 +31,9 @@ recovering) or `WDA refused the request on <name>: ...` (WDA answered but said n
 | GET | `/phones/:udid/screenshot` | `?format=png` (default) or `jpeg` | image bytes, always upright at the screen's true shape (`jpeg` = latest MJPEG frame, or a PNG when that frame isn't the phone's shape; mock always returns PNG, check `Content-Type`). Headers `x-orientation`, `x-width`, `x-height` (the picture's own size) |
 | WS | `/phones/:udid/stream` | `?codec=` (`h264` or `mjpeg`; absent = MJPEG as before), `?fps=` (1-60, default 60), `?quality=`, `?scale=` (10-100 %; MJPEG default 50, H.264 default 100) | MJPEG: first a text message `{"type":"hello", udid, contentType, fps, scale, quality, orientation, point_width, point_height, screen_width, screen_height, width, height, connectMs}` with the settings actually used, then `{"type":"orientation", ...}` with the frames' real size (and again whenever the phone turns), then one binary message per frame (JPEG from WDA's MJPEG server in real mode, PNG in mock); latest frame only. H.264: see [Live view](#live-view-webrtc-h264-mjpeg). Every hello says `connectMs` (the request -> the first frame, ms) and a `{"type":"first-frame", udid, transport, connectMs}` follows the first frame: see [Opening a view fast](#opening-a-view-fast) |
 | WS | `/phones/:udid/control` | JSON text messages, see below | low-latency control over one connection |
-| POST | `/phones/:udid/tap` | `{x, y, unit?}` | the [action report](#action-reports) `{ok, ms, total_ms, via, reason?, changed, app, orientation, verified?, error?}`: `via` how it reached the phone (`hid`, `wda-fast`, `wda`; see [Input](#input-taps-swipes-typing)), `ms` the server's receive -> injected time. Every action below answers with it; with `"fast": true` in the body (or `?fast=1`) it answers just `{ok:true, via, ms}`, without the look before and after |
+| POST | `/phones/:udid/tap` | `{x, y, unit?, hold?, bounds?, natural?}` (`hold` ms; `bounds` `[x, y, w, h]` of the element aimed at; see [Natural touch](#natural-touch)) | the [action report](#action-reports) `{ok, ms, total_ms, via, reason?, changed, app, orientation, verified?, error?}`: `via` how it reached the phone (`hid`, `wda-fast`, `wda`; see [Input](#input-taps-swipes-typing)), `ms` the server's receive -> injected time. Every action below answers with it; with `"fast": true` in the body (or `?fast=1`) it answers just `{ok:true, via, ms}`, without the look before and after |
 | GET | `/phones/:udid/input` | - | input latency on the server: `{udid, via, tap_avg_ms, tap_p90_ms, last, samples, touch: {move_avg_ms, move_p90_ms, coalesced, auto_released, fallbacks, fallback_reason}, methods: {hid, hid_reason, wda_fast}, recent: [{at, type, via, ok, wait_ms, inject_ms, total_ms, reason?, error?}]}` (the last 50 actions; `touch` = live touch: move latency, moves folded into a newer one, touches the server lifted itself, gestures that took a slower route and why) |
-| POST | `/phones/:udid/swipe` | `{x1, y1, x2, y2, ms, unit?}` (`ms` default 300, max 10000) | the report; a swipe from a point to itself is a long press |
+| POST | `/phones/:udid/swipe` | `{x1, y1, x2, y2, ms?, hold?, unit?, natural?}` (`ms` max 10000; without it 300, or with natural touch a time that fits the length; `hold` ms makes it a drag: pressed first, rested 150 ms before the lift) | the report; a swipe from a point to itself is a long press |
 | POST | `/phones/:udid/path` | `{points: [[x, y, ms], ...], unit?}` (`ms` since the gesture began; 1-5000 points, up to 60 s) | the report: one continuous touch with that timing |
 | POST | `/phones/:udid/hold` | `{x, y, ms, unit?}` (`ms` default 1000, max 30000) | the report |
 | POST | `/phones/:udid/touch` | `{phase, x, y, t, seq, id, unit?}` | `{ok:true, via, ms, ack: seq, id, phase, ...}`; same as a live `touch` message (fallback when the WebSocket can't open) |
@@ -51,7 +51,7 @@ recovering) or `WDA refused the request on <name>: ...` (WDA answered but said n
 | POST | `/phones/:udid/wake` (also `/api/devices/:udid/wake`) | `{}` | wakes and unlocks (WDA `/wda/unlock`: past the lock screen when there's no passcode): `{ok, udid, locked, screenOn, lastActive, warning?}`; 404 `{"error":"unknown phone"}` |
 | POST | `/phones/:udid/lock` (also `/api/devices/:udid/lock`) | `{}` | locks, screen off (WDA `/wda/lock`): same answer |
 | GET | `/api/devices` | - | the same list as `/phones` (every `/phones/:udid/...` route also answers under `/api/devices/:udid/...`) |
-| GET / PUT | `/api/settings` (also `/settings`) | PUT `{idleLockMinutes}` (0 = off, default 10) | the settings; kept in `data/settings.json` |
+| GET / PUT | `/api/settings` (also `/settings`) | PUT `{idleLockMinutes?, naturalTouch?}` (`idleLockMinutes` 0 = off, default 10; `naturalTouch` default true, see [Natural touch](#natural-touch)) | the settings; kept in `data/settings.json` |
 | GET | `/api/wda` (also `/wda`) | - | `{signedAt, expiresAt, daysLeft, state: "ok"\|"soon"\|"expired"\|"resigning"\|"failed", lastError?, nextAttemptAt, perDevice: {udid: {signedAt, lastError?}}}` (mock: `{state:"unavailable"}`) |
 | POST | `/api/wda/resign` (also `/wda/resign`) | - | 202 + the status (`state:"resigning"`): re-signs WDA for every phone now |
 | GET | `/api/status` (also `/status`) | - | `{mock, settings, wda, devices}` (`devices` as `/api/devices`) |
@@ -66,6 +66,25 @@ first, inside the queue, and then the action runs**: a tap on a sleeping phone i
 Discrete actions (taps, swipes, typing, keys, a touch's `down`) start at least 40 ms after the one before ended, so a
 burst reaches WDA spaced and never in parallel; an action that gets no answer in time is answered 504 and the phone is
 healed (see [Staying responsive](#staying-responsive-wda-self-heal)).
+
+### Natural touch
+
+`naturalTouch` (GET / PUT `/api/settings`, on by default; `src/human.ts`) makes the touches sent as commands (`tap`,
+`swipe`, `hold`, `tap-element`, their `/act` steps and the control socket's) move like a finger:
+
+- **Swipes** follow a slight bow (3-8 % of their length to one side, at most 24 pt) with minimum-jerk speed (slow off
+  the mark, fastest mid-way, slow into the end), sampled every 8 ms. The two ends are exact. Without `ms` they take a
+  time that fits the length (about 200 ms for a flick, 330 ms for 300 pt, 460 ms for 800 pt, +-10 %); a given `ms` is
+  kept +-8 %. A drag (`hold`) is pressed in place first, moved the same way and rested before the lift.
+- **Taps** land up to 3 pt off the place (most within 1-2 pt), inside the element's `bounds` when given (`tap-element`
+  sends them) and the screen, and are held 50-120 ms (HID's `hold_ms`, the fast WDA route's `hold`). A long press
+  (`hold`) lands the same way.
+- **The owner's own touches** are never reshaped: live touch (`down`/`move`/`up`) goes to the phone as it comes, or,
+  buffered, is played on `up` through every point at its own time; a whole swipe (`points`) keeps its points and
+  timing; a quick buffered tap keeps its real hold (30-250 ms).
+- **Off** (or `natural: false` on a message): exact places, straight lines at even speed, the routes' own tap hold.
+
+The randomness is seeded (`createServer(..., { touchSeed })` for tests); `test/human.ts` checks it.
 
 ### One live phone at a time
 

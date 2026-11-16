@@ -24,6 +24,8 @@ export interface ServerExtras {
   resigner?: WdaResigner;
   /** How often a watched phone's WDA and lock state are checked (ms; default WATCH_MS; 0 = never on its own). */
   watchMs?: number;
+  /** Seed of natural touch's randomness (tests); default a random one. */
+  touchSeed?: number;
 }
 
 /** A phone someone watches (an open control socket or stream, or the focused one) is health-checked this often. */
@@ -158,7 +160,8 @@ export function createServer(backend: Backend, token: string, updater?: Updater,
   };
 
   const wss = new WebSocketServer({ noServer: true, maxPayload: 1_000_000 });
-  const control = new Control(backend);
+  // natural touch (the `naturalTouch` setting, on by default): the AI's taps and swipes move like a finger
+  const control = new Control(backend, undefined, { natural: () => settings.get().naturalTouch, seed: extras.touchSeed });
   control.onInput = (udid, discrete) => idle.activity(udid, discrete);
   if (idle.supported) control.power = { lock: (u) => idle.lock(u), wake: (u) => idle.wake(u) };
   // the first action after a quiet spell (and one that hung) has the phone's WDA probed and healed first

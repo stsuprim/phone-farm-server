@@ -97,7 +97,11 @@ export function hidPlayMs(op: string, fields: Record<string, unknown>): number {
     return Number.isFinite(t) && t > 0 ? Math.min(t, 120_000) : 0;
   }
   if (op === 'type' && typeof fields.text === 'string') return fields.text.length * TYPE_MS_PER_KEY;
-  return op === 'tap' ? 40 : 0;
+  if (op === 'tap') {
+    const h = Number(fields.hold_ms);
+    return Number.isFinite(h) && h > 0 ? Math.min(h, 2000) : 40;
+  }
+  return 0;
 }
 
 export class HidHost {

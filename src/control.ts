@@ -1,3 +1,5 @@
+import crypto from 'node:crypto';
+import { Box, curvePath, dragPath, Rng, seeded, swipeMs, tapPlan } from './human.js';
 import { InputMeter, InputResult, InputVia } from './inputlog.js';
 import { guessUnit, parseUnit, toPoints, Unit } from './orient.js';
 import { Backend, ButtonName, ControlState, HttpError, PathPoint } from './types.js';
@@ -144,6 +146,13 @@ export interface ControlOptions {
   actionTimeoutMs?: number;
   /** The first discrete action after this long without one probes the phone first (ms; default IDLE_PROBE_MS). */
   idleProbeMs?: number;
+  /**
+   * Natural touch on now (the server's `naturalTouch` setting; default off here): taps, swipes, holds and drags sent
+   * as commands move like a finger (src/human.ts). A message with `natural: false` is always exact.
+   */
+  natural?: () => boolean;
+  /** Seed of natural touch's randomness (tests); default a random one. */
+  seed?: number;
 }
 
 /** Bursts are spaced: WDA (and the phone) get a breath between two discrete actions. */
@@ -226,6 +235,8 @@ export class Control {
   private minGapMs: number;
   private actionTimeoutMs: number;
   private idleProbeMs: number;
+  private naturalOn: () => boolean;
+  private rng: Rng;
 
   constructor(private backend: Backend, meter?: InputMeter, opts: ControlOptions = {}) {
     this.meter = meter ?? new InputMeter();
@@ -233,6 +244,18 @@ export class Control {
     this.minGapMs = opts.minGapMs ?? MIN_GAP_MS;
     this.actionTimeoutMs = opts.actionTimeoutMs ?? ACTION_TIMEOUT_MS;
     this.idleProbeMs = opts.idleProbeMs ?? IDLE_PROBE_MS;
+    this.naturalOn = opts.natural ?? (() => false);
+    this.rng = seeded(opts.seed ?? crypto.randomInt(0, 2 ** 31));
+  }
+
+  /** Whether this message's touch is made natural: the setting is on and the message didn't ask for exact. */
+  private natural(msg: Record<string, unknown>): boolean {
+    if (msg.natural === false || msg.exact === true) return false;
+    try {
+      return this.naturalOn();
+    } catch {
+      return false;
+    }
   }
 
   /** Actions waiting in (or running from) the phone's queue now. */
@@ -263,7 +286,13 @@ export class Control {
     switch (msg.type) {
       case 'tap': {
         const [[x, y]] = this.map(udid, msg, [numbers(msg, 'x', 'y') as [number, number]]) as [[number, number]];
-        return this.run(udid, 'tap', tRecv, () => this.backend.tap(udid, x, y), { discrete: true });
+        // `hold`: the tap's own hold (ms), e.g. the owner's real one; natural: a few points off and held 50-120 ms
+        const given = typeof msg.hold === 'number' && Number.isFinite(msg.hold) && msg.hold > 0 ? Math.min(2000, Math.round(msg.hold)) : undefined;
+        if (this.natural(msg)) {
+          const t = tapPlan(x, y, this.rng, this.box(udid, msg), this.backend.screen(udid));
+          return this.run(udid, 'tap', tRecv, () => this.backend.tap(udid, t.x, t.y, given ?? t.hold), { discrete: true });
+        }
+        return this.run(udid, 'tap', tRecv, () => (given ? this.backend.tap(udid, x, y, given) : this.backend.tap(udid, x, y)), { discrete: true });
       }
       case 'swipe': {
         if (msg.points !== undefined) {
@@ -274,10 +303,11 @@ export class Control {
         }
         const [x1, y1, x2, y2] = numbers(msg, 'x1', 'y1', 'x2', 'y2') as [number, number, number, number];
         const [a, b] = this.map(udid, msg, [[x1, y1], [x2, y2]]) as [[number, number], [number, number]];
-        return this.gesture(udid, [[a[0], a[1], 0], [b[0], b[1], duration(msg.ms, 300, 10000)]], 'swipe', tRecv);
+        return this.gesture(udid, this.swipePoints(udid, msg, a, b), 'swipe', tRecv);
       }
       case 'hold': {
-        const [[x, y]] = this.map(udid, msg, [numbers(msg, 'x', 'y') as [number, number]]) as [[number, number]];
+        let [[x, y]] = this.map(udid, msg, [numbers(msg, 'x', 'y') as [number, number]]) as [[number, number]];
+        if (this.natural(msg)) ({ x, y } = tapPlan(x, y, this.rng, this.box(udid, msg), this.backend.screen(udid)));
         return this.gesture(udid, [[x, y, 0], [x, y, duration(msg.ms, 1000, 30000)]], 'hold', tRecv);
       }
       case 'path': {
@@ -407,6 +437,42 @@ export class Control {
     const mx = s ? Math.max(0, s.width - 1) : Infinity;
     const my = s ? Math.max(0, s.height - 1) : Infinity;
     return [Math.min(Math.max(0, x), mx), Math.min(Math.max(0, y), my)];
+  }
+
+  /**
+   * A two-point swipe's gesture. `hold` (ms) makes it a drag: pressed there first, then moved, then rested before the
+   * lift (no fling). Natural: a slight bow with ease-in and ease-out, over `ms` (±8 %) or, without one, a time that
+   * fits the length (src/human.ts). Exact: a straight line at even speed over `ms` (300 by default).
+   */
+  private swipePoints(udid: string, msg: Record<string, unknown>, a: [number, number], b: [number, number]): PathPoint[] {
+    const natural = this.natural(msg);
+    const given = typeof msg.ms === 'number' && Number.isFinite(msg.ms) && msg.ms > 0;
+    const hold = typeof msg.hold === 'number' && Number.isFinite(msg.hold) && msg.hold > 0 ? Math.min(msg.hold, 10000) : 0;
+    const clamp = (x: number, y: number) => this.clamp(udid, x, y);
+    if (!natural) {
+      const ms = duration(msg.ms, 300, 10000);
+      if (hold) return dragPath(a, b, hold, ms, null);
+      return [[a[0], a[1], 0], [b[0], b[1], ms]];
+    }
+    const ms = given ? Math.min(10000, Math.max(50, Math.round((msg.ms as number) * (0.92 + 0.16 * this.rng())))) : swipeMs(Math.hypot(b[0] - a[0], b[1] - a[1]), this.rng);
+    if (hold) return dragPath(a, b, hold, ms, this.rng, clamp);
+    return curvePath(a, b, ms, this.rng, { clamp });
+  }
+
+  /** The element a tap or hold aims at (`bounds: [x, y, w, h]` in the message's unit), in points; null without one. */
+  private box(udid: string, msg: Record<string, unknown>): Box | null {
+    const v = msg.bounds;
+    if (!Array.isArray(v) || v.length !== 4 || !v.every((n) => typeof n === 'number' && Number.isFinite(n))) return null;
+    const [bx, by, bw, bh] = v as number[];
+    if (!(bw! > 0) || !(bh! > 0)) return null;
+    try {
+      const m = this.map(udid, msg, [[bx!, by!], [bx! + bw!, by! + bh!]]);
+      const [x1, y1] = m[0]!;
+      const [x2, y2] = m[1]!;
+      return x2 > x1 && y2 > y1 ? [x1, y1, x2 - x1, y2 - y1] : null;
+    } catch {
+      return null;
+    }
   }
 
   /** `pts` are upright points already (mapped and clamped). */
@@ -673,7 +739,11 @@ export class Control {
   private play(udid: string, g: Touch): Promise<Result> {
     const pts = g.pts;
     const [fx, fy] = pts[0]!;
-    if (this.isTap(g)) return this.backend.tap(udid, fx, fy);
+    if (this.isTap(g)) {
+      // the owner's own tap: where it landed, held as long as it really was (natural touch on; exact: the route's own)
+      const held = Math.round(pts[pts.length - 1]![2]);
+      return this.natural({}) && held > 0 ? this.backend.tap(udid, fx, fy, Math.min(TAP_MS, Math.max(MIN_CONTACT_MS, held))) : this.backend.tap(udid, fx, fy);
+    }
     if (pts.length === 1) pts.push([fx, fy, pts[0]![2]]);
     return this.backend.gesture(udid, pts);
   }
