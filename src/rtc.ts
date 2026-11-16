@@ -18,6 +18,9 @@ type Track = ReturnType<PeerConnection['addTrack']>;
 type DataChannel = ReturnType<PeerConnection['createDataChannel']>;
 type RtpConfig = InstanceType<Ndc['RtpPacketizationConfig']>;
 
+/** A frame this much older than now when it's sent (a cached keyframe) is stamped as just captured (sendFrame). */
+export const STALE_FRAME_MS = 500;
+
 const PLAYOUT_DELAY_URI = 'http://www.webrtc.org/experiments/rtp-hdrext/playout-delay';
 
 /**
@@ -188,6 +191,7 @@ export class RtcSession {
   private lastMoveT = -1;
   private inputR?: DataChannel;
   private lastTsMsg = 0;
+  private lag: number | null = null; // capture -> sent of the frames flowing (ms, smoothed)
   // congestion control (libdatachannel has none): the browser's loss reports and NACKs set the bitrate
   private rc?: RateControl;
   private ccTimer?: NodeJS.Timeout;
@@ -444,9 +448,19 @@ export class RtcSession {
       data = Buffer.concat([this.pendingConfig, r.payload]);
       this.pendingConfig = undefined;
     }
-    if (!this.t0) this.t0 = r.time;
-    // 90 kHz RTP clock from the capture time; never backwards (a re-sent cached keyframe is older)
-    let ts = Math.round((r.time - this.t0) * 90);
+    // 2026-11-16: the RTP clock follows the capture time, but a frame much older than the ones flowing (the cached
+    // keyframe a new viewer is primed with: up to REMOTE_KEY_SECONDS old on a far lane) is stamped as if it had just
+    // been captured. Stamped with its real age, the next frame's timestamp jumped seconds ahead of its arrival, which
+    // threw Chrome's playout timing (its render times seconds in the future): frames decoded but never shown, a frozen
+    // picture with framesDropped climbing (the 2026-11-16 freeze on the remote profile).
+    const now = Date.now();
+    const age = now - r.time;
+    const stale = age > STALE_FRAME_MS;
+    const time = stale ? now - (this.lag ?? 0) : r.time;
+    if (!stale) this.lag = this.lag === null ? age : this.lag + (age - this.lag) * 0.1;
+    if (!this.t0) this.t0 = time;
+    // 90 kHz RTP clock from the capture time; never backwards
+    let ts = Math.round((time - this.t0) * 90);
     if (ts <= this.lastTs) ts = this.lastTs + 1;
     this.lastTs = ts;
     this.rtp.timestamp = (this.tsBase + ts) >>> 0;
@@ -464,8 +478,7 @@ export class RtcSession {
     }
     // about once a second: which RTP timestamp is which capture time (ms since the epoch, server clock),
     // so the client can measure glass-to-glass latency with the ping/pong clock offset
-    const now = Date.now();
-    if (now - this.lastTsMsg >= 1000 && this.inputR?.isOpen()) {
+    if (!stale && now - this.lastTsMsg >= 1000 && this.inputR?.isOpen()) {
       this.lastTsMsg = now;
       try {
         this.inputR.sendMessage(JSON.stringify({ type: 'ts', rtp: this.rtp.timestamp, capture_time: r.time }));

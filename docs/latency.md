@@ -145,3 +145,16 @@ that event, so the client's own send -> ack time minus `ms` is the network's sha
 Estimates, as the rest of this page. `fallbacks` counts gestures that should have been live and weren't; `fallback_reason`
 is the last why (HID closed or starting, a failed report, landscape with `HID_LANDSCAPE=off`). A reported action
 (`tap`, `tap-element`, `/act` steps) costs a look before and after on top: ~0.4 s, most of it the 350 ms settle.
+
+## 2026-11-16: the WebRTC freeze from afar, and the lock on a switch
+
+- The owner's remote profile (Tailscale): WebRTC sent 27-31 fps, the page showed 0 (framesDropped climbing), where
+  H.264 over the WebSocket ran at 30 fps. One sender bug fixed in `src/rtc.ts` `sendFrame`: a new WebRTC viewer is
+  primed with the lane's cached keyframe, which on a far lane (`REMOTE_KEY_SECONDS` = 10) can be seconds old; its RTP
+  timestamp came from that old capture time, so the next frame's timestamp jumped seconds ahead of its arrival and threw
+  Chrome's playout timing. A frame older than `STALE_FRAME_MS` (500 ms) when sent is now stamped as just captured (and
+  gives no `ts` pair). Not yet confirmed on the Mac; Lotus now uses the H.264 WebSocket from afar and drops a stalled
+  WebRTC picture by itself.
+- `POST /phones/:udid/focus` no longer waits for the previous phone's lock (fire-and-forget, logged). `RealBackend.lock`
+  is short (3 s) and soft (`WdaManager.callSoft`: no recovery, no heal): WDA's "Timed out while waiting until the
+  screen gets locked" never marks the session or the phone down; the lock state is asked afterwards instead.

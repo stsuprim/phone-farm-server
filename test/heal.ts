@@ -315,7 +315,9 @@ const fakeSpawn = ((cmd: string, args: string[]) => {
     // the alias; the one before sleeps (locks) and its capture stops
     const f2 = await post(`/api/devices/${b2}/focus`);
     assert.equal(f2.status, 200);
-    assert.deepEqual([f2.body.focused, f2.body.previous], [b2, { udid: a, slept: true }]);
+    // 2026-11-16: the lock is fire-and-forget: the answer never waits for it, the phone sleeps soon after
+    assert.deepEqual([f2.body.focused, f2.body.previous], [b2, { udid: a, slept: false, reason: 'locking' }]);
+    for (let i = 0; i < 50 && !(await backend.isLocked(a!)); i++) await sleep(20);
     assert.equal(await backend.isLocked(a!), true, 'the previous phone is asleep');
     assert.deepEqual(stopped, [`${a} another phone is in focus`]);
     assert.deepEqual((await get('/phones')).map((p: any) => p.focused), [false, true, false]);

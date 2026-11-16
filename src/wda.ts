@@ -773,6 +773,22 @@ export class WdaManager {
     }
   }
 
+  /**
+   * A best-effort call that never heals (2026-11-16, for the lock): WDA must be ready already, nothing is waited for or
+   * recovered, and any failure (a timeout, WDA's own "Timed out while waiting until the screen gets locked") comes back
+   * as a plain rejection, so it never marks the session or the phone down.
+   */
+  async callSoft(udid: string, method: string, p: string, body?: unknown, timeout = 3000): Promise<any> {
+    const e = this.entries.get(udid);
+    if (!e || !e.wanted || e.status !== 'ready' || e.recovering) throw new WdaError('rejected', `WebDriverAgent on ${this.nameOf(udid)} isn't ready`);
+    try {
+      return await this.raw(e, method, p, body, timeout);
+    } catch (err) {
+      if (err instanceof WdaError && err.kind === 'unknown') throw err; // an older WDA: the caller tries the session route
+      throw new WdaError('rejected', (err as Error)?.message ?? String(err));
+    }
+  }
+
   callNoSession(udid: string, method: string, p: string, body?: unknown, timeout = 30000): Promise<any> {
     return this.withRecovery(udid, (e) => this.raw(e, method, p, body, timeout));
   }

@@ -72,6 +72,9 @@ async function info(udid: string, args: string[]): Promise<string> {
   }
 }
 
+/** The lock's own wait (2026-11-16): short; the state is asked afterwards. */
+const LOCK_TIMEOUT_MS = 3000;
+
 export class RealBackend implements Backend {
   readonly mock = false;
   private phones = new Map<string, PhoneInfo>();
@@ -656,9 +659,29 @@ export class RealBackend implements Backend {
     }
   }
 
+  /**
+   * 2026-11-16: a short, soft lock. WDA's /wda/lock can time out ("Timed out while waiting until the screen gets
+   * locked") while the screen does go dark: that never marks the WDA session or the phone down (no recovery, no heal);
+   * the lock state is asked afterwards instead, and only a phone still unlocked is a failure.
+   */
   async lock(udid: string): Promise<void> {
     this.known(udid);
-    await this.wdaPower(udid, 'POST', '/wda/lock', 8000);
+    let why = '';
+    try {
+      await this.wda.callSoft(udid, 'POST', '/wda/lock', {}, LOCK_TIMEOUT_MS);
+      return;
+    } catch (err) {
+      if (err instanceof WdaError && err.kind === 'unknown') {
+        await this.wda.call(udid, 'POST', '/wda/lock', {}, LOCK_TIMEOUT_MS).catch((e2: Error) => (why = e2.message));
+        if (!why) return;
+      } else why = (err as Error).message;
+    }
+    const locked = await this.wda.callSoft(udid, 'GET', '/wda/locked', undefined, 2000).then(
+      (j) => (typeof j?.value === 'boolean' ? j.value : null),
+      () => null,
+    );
+    if (locked === true) return;
+    throw new Error(`the lock didn't take (${why.slice(0, 120)})`);
   }
 
   async unlock(udid: string): Promise<void> {

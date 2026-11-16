@@ -29,7 +29,6 @@ export interface ServerExtras {
 /** A phone someone watches (an open control socket or stream, or the focused one) is health-checked this often. */
 export const WATCH_MS = 12_000;
 /** Focusing a phone waits this long at most for the previous one to lock. */
-const FOCUS_LOCK_WAIT_MS = 8_000;
 
 /**
  * A viewer's connection profile: `profile=lan|remote` from the client wins; else from its address (the LAN and
@@ -376,17 +375,13 @@ export function createServer(backend: Backend, token: string, updater?: Updater,
       } else if (!idle.supported) {
         previous = { udid: prev, slept: false, reason: 'this backend cannot lock phones' };
       } else {
-        // in the phone's queue, so it never lands on top of an action; a slow lock doesn't hold the new phone up long
-        const lock = control.handle(prev, { type: 'key', key: 'lock' }).then(
-          () => ({ udid: prev, slept: true }),
-          (err: Error) => ({ udid: prev, slept: false, reason: `lock failed: ${err.message}` }),
+        // in the phone's queue, so it never lands on top of an action. 2026-11-16: fire-and-forget: the new phone is
+        // never held up by the lock (a slow or timed-out lock only shows in the log, and never marks anything down)
+        void control.handle(prev, { type: 'key', key: 'lock' }).then(
+          () => console.log(`[focus] ${prev.slice(-8)} is asleep`),
+          (err: Error) => console.log(`[focus] ${prev.slice(-8)} stays awake: lock failed: ${err.message}`),
         );
-        previous = await Promise.race([
-          lock,
-          new Promise<{ udid: string; slept: boolean; reason: string }>((r) =>
-            setTimeout(() => r({ udid: prev, slept: false, reason: 'still locking' }), FOCUS_LOCK_WAIT_MS).unref(),
-          ),
-        ]);
+        previous = { udid: prev, slept: false, reason: 'locking' };
       }
       console.log(`[focus] ${prev.slice(-8)} -> ${udid.slice(-8)}${previous.slept ? ' (the previous one is asleep)' : ` (the previous one stays awake: ${previous.reason})`}`);
     }
