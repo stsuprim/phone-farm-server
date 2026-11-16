@@ -18,6 +18,8 @@ if [ "$FLAVOR" = "fork" ]; then
   PROJ="$(pwd)/wda"
   OUT="${WDA_FORK_DERIVED_DATA:-$HOME/wda-fork-build}"; OUT="${OUT/#\~/$HOME}"
   [ -d "$PROJ/WebDriverAgent.xcodeproj" ] || { echo "error: $PROJ/WebDriverAgent.xcodeproj is missing from this checkout"; exit 1; }
+  # Its build-phase scripts must be runnable, whatever this clone's core.fileMode says (the server does it too).
+  find "$PROJ" -type f \( -name '*.sh' -o -name '*.command' \) -not -path '*/node_modules/*' -exec chmod +x {} + 2>/dev/null || true
   # Upstream builds with -Weverything and warnings as errors: a newer Xcode's new warning must not fail our build.
   EXTRA=(GCC_TREAT_WARNINGS_AS_ERRORS=NO RUN_CLANG_STATIC_ANALYZER=NO)
 else

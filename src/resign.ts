@@ -379,6 +379,13 @@ export class WdaResigner {
 export function buildWdaRunner(root: string, team: () => string, timeoutMs = 20 * 60_000, env: (udid: string) => Record<string, string> = () => ({})): SignRunner {
   return (udid) =>
     new Promise((resolve) => {
+      // 2026-11-17: our WDA's build-phase scripts must be runnable (a clone with core.fileMode false, or one made
+      // before they were 100755 in git, failed the Xcode build right after signing: "permission denied")
+      try {
+        makeScriptsRunnable(path.join(root, 'wda'));
+      } catch {
+        /* no wda/ (the stock build only): nothing to do */
+      }
       const p = spawn('bash', [path.join(root, 'scripts', 'build-wda.sh'), team(), udid], {
         cwd: root,
         stdio: ['ignore', 'pipe', 'pipe'],
@@ -401,4 +408,49 @@ export function buildWdaRunner(root: string, team: () => string, timeoutMs = 20 
         resolve({ ok: code === 0, log: out.join('') + (code === null ? '\nerror: the build timed out' : '') });
       });
     });
+}
+
+/**
+ * The shell scripts of our WebDriverAgent (`wda/`) that its Xcode build runs: every `*.sh` / `*.command` under it, and
+ * every script a scheme or the project names (`"${SRCROOT}/Scripts/embed-runner-icon.sh"` in a scheme's pre/post
+ * action, a Run Script phase's shellScript), as absolute paths that exist. node_modules, build output and .git are
+ * skipped.
+ */
+export function wdaScripts(wdaDir: string): string[] {
+  const found = new Set<string>();
+  const skip = new Set(['node_modules', '.git', 'build', 'DerivedData']);
+  const named: string[] = [];
+  const walk = (dir: string, depth: number) => {
+    if (depth > 8) return;
+    for (const d of fs.readdirSync(dir, { withFileTypes: true })) {
+      const full = path.join(dir, d.name);
+      if (d.isDirectory()) {
+        if (!skip.has(d.name)) walk(full, depth + 1);
+      } else if (d.isFile()) {
+        if (/\.(sh|command)$/.test(d.name)) found.add(full);
+        else if (/\.(xcscheme|pbxproj)$/.test(d.name)) named.push(full);
+      }
+    }
+  };
+  walk(wdaDir, 0);
+  for (const f of named) {
+    const text = fs.readFileSync(f, 'utf8');
+    for (const m of text.matchAll(/\$\{?(?:SRCROOT|PROJECT_DIR)\}?\/([A-Za-z0-9_.\-/]+)/g)) {
+      const p = path.join(wdaDir, m[1]!);
+      if (path.resolve(p).startsWith(path.resolve(wdaDir)) && fs.existsSync(p) && fs.statSync(p).isFile() && !/\.(xcodeproj|plist|xcconfig|h|m|swift)$/.test(p)) found.add(p);
+    }
+  }
+  return [...found].sort();
+}
+
+/** chmod u+x,g+x,o+x (keeping the rest) every script of `wdaScripts`; the ones changed. */
+export function makeScriptsRunnable(wdaDir: string): string[] {
+  const changed: string[] = [];
+  for (const f of wdaScripts(wdaDir)) {
+    const mode = fs.statSync(f).mode & 0o7777;
+    if ((mode & 0o111) === 0o111) continue;
+    fs.chmodSync(f, mode | 0o111);
+    changed.push(f);
+  }
+  return changed;
 }
