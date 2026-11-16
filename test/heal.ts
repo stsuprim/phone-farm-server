@@ -289,7 +289,7 @@ const fakeSpawn = ((cmd: string, args: string[]) => {
   const backend = new MockBackend(3);
   const stopped: string[] = [];
   (backend as unknown as Backend).stopCapture = (u: string, why: string) => void stopped.push(`${u} ${why}`);
-  const server = createServer(backend, token, undefined, { watchMs: 0 });
+  const server = createServer(backend, token, undefined, { watchMs: 0, focusLockMs: 0 });
   await new Promise<void>((r) => server.listen(0, '127.0.0.1', r));
   const host = `127.0.0.1:${(server.address() as AddressInfo).port}`;
   const base = `http://${host}`;

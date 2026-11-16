@@ -23,6 +23,7 @@ interface Entry extends PowerState {
   busy?: Promise<void>; // a lock or wake in progress
   checkedAt: number; // when the phone was last asked whether it's locked before an input
   unsure?: boolean; // the last ask got no answer: every input asks again until one comes
+  asked?: boolean; // locked on request (an idle lock, a lock key, a switch of the live phone), not found dark
 }
 
 /** A phone can't have gone dark by itself sooner than this after its last input (iOS's shortest Auto-Lock is 30 s). */
@@ -133,7 +134,8 @@ export class IdleLock {
 
   /**
    * What a health check learned about the lock (not activity): a phone found locked is woken by the next input
-   * before it acts, without asking first.
+   * before it acts, without asking first. 2026-11-16: one found locked or dark that nobody asked to lock, while a
+   * viewer watches it (it went dark by itself: iOS's Auto-Lock), is woken now, so a watched phone never stays black.
    */
   note(udid: string, locked: boolean | null): void {
     if (locked === null) return;
@@ -142,6 +144,11 @@ export class IdleLock {
     e.unsure = false;
     e.locked = locked;
     e.screenOn = !locked;
+    if (!locked) e.asked = false;
+    else if (!e.asked && e.viewers > 0 && this.supported) {
+      this.log(`${udid.slice(-8)} went dark while watched: waking`);
+      void this.wake(udid).catch(() => {});
+    }
   }
 
   /** A viewer opened (stream or WebRTC session): activity, and the phone wakes. Returns the release. */
@@ -150,8 +157,9 @@ export class IdleLock {
     e.viewers++;
     e.lastActive = this.now();
     e.known = true;
-    // a viewer isn't latency-critical: ask the phone whether it's locked when we don't know
-    if (this.supported && e.locked !== false) void this.wake(udid, e.locked === null).catch(() => {});
+    // a viewer isn't latency-critical: the phone is asked whether it's locked or dark unless it's known to be
+    // (2026-11-16: also when it's thought awake: a phone that went dark by itself says nothing, and showed black)
+    if (this.supported) void this.wake(udid, e.locked !== true).catch(() => {});
     let done = false;
     return () => {
       if (done) return;
@@ -178,6 +186,7 @@ export class IdleLock {
       }
       await this.backend.unlock(udid);
       const still = this.backend.isLocked ? await this.backend.isLocked(udid).catch(() => null) : false;
+      e.asked = false;
       e.screenOn = true;
       e.locked = still === null ? false : still;
       e.error = still ? 'still locked after wake (a passcode is set: enter it on the phone once, or remove it)' : null;
@@ -193,6 +202,7 @@ export class IdleLock {
       await this.backend.lock(udid);
       e.locked = true;
       e.screenOn = false;
+      e.asked = true;
       e.error = null;
     }).then(() => this.state(udid));
   }

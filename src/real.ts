@@ -6,6 +6,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parseInstalled, withKnown } from './apps.js';
 import { Config } from './config.js';
+import { jpegMaybeBlack, pngIsBlack, wakeScreen } from './dark.js';
 import { H264Info, H264Source, helperProducer, phoneStats, StartProducer } from './h264.js';
 import { imageSize } from './imgsize.js';
 import { basicFacts, mergeBattery, parseActiveApp, parseBatteryDomain, parseDeviceInfo, parseIoreg, parseWdaBattery } from './info.js';
@@ -74,6 +75,9 @@ async function info(udid: string, args: string[]): Promise<string> {
 
 /** The lock's own wait (2026-11-16): short; the state is asked afterwards. */
 const LOCK_TIMEOUT_MS = 3000;
+/** The screenshot that says whether the screen is dark waits this long at most. */
+const DARK_SHOT_MS = 5000;
+
 
 export class RealBackend implements Backend {
   readonly mock = false;
@@ -668,6 +672,8 @@ export class RealBackend implements Backend {
    */
   async lock(udid: string): Promise<void> {
     this.known(udid);
+    // already dark: nothing to press (the lock button on a dark phone would turn its screen on)
+    if ((await this.dark(udid)) === true) return;
     let why = '';
     try {
       await this.wda.callSoft(udid, 'POST', '/wda/lock', {}, LOCK_TIMEOUT_MS);
@@ -678,29 +684,77 @@ export class RealBackend implements Backend {
         if (!why) return;
       } else why = (err as Error).message;
     }
-    const locked = await this.wda.callSoft(udid, 'GET', '/wda/locked', undefined, 2000).then(
-      (j) => (typeof j?.value === 'boolean' ? j.value : null),
-      () => null,
-    );
+    const locked = await this.wdaLocked(udid, 2000);
     if (locked === true) return;
+    // 2026-11-16: a phone without a passcode never says "locked" (so WDA's lock times out waiting for it) while its
+    // screen did go off: a dark screen is a lock that took
+    if ((await this.dark(udid)) === true) return;
     throw new Error(`the lock didn't take (${why.slice(0, 120)})`);
   }
 
-  async unlock(udid: string): Promise<void> {
-    this.known(udid);
-    // home press + swipe up: past the lock screen when the phone has no passcode
-    await this.wdaPower(udid, 'POST', '/wda/unlock', 20000);
+  /** WDA's own word on the lock (SpringBoard's lock state: always false on a phone without a passcode); null when it doesn't say. */
+  private wdaLocked(udid: string, timeout = 5000): Promise<boolean | null> {
+    return this.wda.callSoft(udid, 'GET', '/wda/locked', undefined, timeout).then(
+      (j) => (typeof j?.value === 'boolean' ? j.value : null),
+      (err) =>
+        err instanceof WdaError && err.kind === 'unknown'
+          ? this.wda.call(udid, 'GET', '/wda/locked', undefined, timeout).then((j) => (typeof j?.value === 'boolean' ? j.value : null), () => null)
+          : null,
+    );
   }
 
-  async isLocked(udid: string): Promise<boolean | null> {
-    const p = this.phones.get(udid);
-    if (!p?.online || this.wda.status(udid) !== 'ready') return null;
+  /**
+   * Whether the screen is dark (off), from a screenshot (src/dark.ts); null when it can't be told. A frame WDA's MJPEG
+   * gives within a moment settles a screen that plainly shows something without the PNG.
+   */
+  private async dark(udid: string): Promise<boolean | null> {
+    if (!this.phones.get(udid)?.online || this.wda.status(udid) !== 'ready') return null;
     try {
-      const j = await this.wdaPower(udid, 'GET', '/wda/locked', 5000);
-      return typeof j?.value === 'boolean' ? j.value : null;
+      const f = await this.source(udid).grab(300, 900);
+      if (f && jpegMaybeBlack(f) === false) return false;
+    } catch {
+      /* no MJPEG frame: the screenshot says */
+    }
+    try {
+      const j = await this.wda.callSoft(udid, 'GET', '/screenshot', undefined, DARK_SHOT_MS);
+      return typeof j?.value === 'string' ? pngIsBlack(Buffer.from(j.value, 'base64')) : null;
     } catch {
       return null;
     }
+  }
+
+  /**
+   * Wake and unlock. WDA's /wda/unlock gets a locked phone past its lock screen, but does nothing on one that says
+   * it isn't locked; 2026-11-16: a phone without a passcode never says so, its screen is just off (after a lock, or
+   * iOS's own Auto-Lock), so a dark screen gets what WDA's unlock does: Home (the screen comes on), a moment, Home
+   * again (past the lock screen). Never pressed on a screen that shows something (it would leave the app in front).
+   */
+  async unlock(udid: string): Promise<void> {
+    this.known(udid);
+    await wakeScreen({
+      locked: () => this.wdaLocked(udid),
+      // home press + swipe up: past the lock screen when the phone has no passcode
+      unlock: () => this.wdaPower(udid, 'POST', '/wda/unlock', 20000),
+      dark: () => this.dark(udid),
+      home: () => this.wda.homeSoft(udid),
+      log: (m) => console.log(`[wake ${udid.slice(-8)}] ${m}`),
+    });
+  }
+
+  /**
+   * Locked, or dark: WDA's word, and the screen itself when WDA says "not locked", since a phone without a passcode
+   * says that with its screen off. `quick`: no look at the screen, so only "locked" (true) or can't tell (null).
+   * null when it can't tell.
+   */
+  async isLocked(udid: string, quick = false): Promise<boolean | null> {
+    const p = this.phones.get(udid);
+    if (!p?.online || this.wda.status(udid) !== 'ready') return null;
+    const locked = await this.wdaLocked(udid);
+    if (locked === true) return true;
+    // "not locked" alone says nothing of the screen: without a look it can't be told
+    if (quick) return null;
+    const dark = await this.dark(udid);
+    return dark === true ? true : locked;
   }
 
   restartWda(udid: string): void {

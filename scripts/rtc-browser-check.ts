@@ -4,7 +4,7 @@
 //
 //   npx tsx scripts/rtc-browser-check.ts [--profile remote|lan] [--seconds 20] [--delay 90] [--jitter 30] [--loss 0]
 //       [--key-seconds 10] [--stale 6] [--buffer 80] [--live <path to phones-live.js>] [--browser <exe>]
-//       [--bare-keys] [--break-at 8] [--blackout 8:4] [--no-watchdog] [--no-again] [--json]
+//       [--bare-keys] [--break-at 8] [--blackout 8:4] [--json]
 //
 // --delay/--jitter/--loss put a UDP relay between the browser and the server (one way ms, +- ms, % lost), like a far
 // link. --stale waits that many seconds after the capture's first keyframe before the viewer joins, so it is primed
@@ -143,22 +143,18 @@ const ws = new WebSocket("ws://127.0.0.1:" + q.get("port") + "/phones/" + q.get(
 let id = 1, relayed = false;
 const relay = +q.get("relay");
 const want = { fps: 60, scale: q.get("profile") === "remote" ? 50 : 100, bitrate: q.get("profile") === "remote" ? 4000 : 10000, profile: q.get("profile") };
-let live;
-function make() {
-  live = PhonesLive.create({
-    udid: q.get("udid"), canvas: () => cv, video: () => vid,
-    // through the relay the page's own candidates stay here, so the relay's is the only path
-    signal: async (m) => { if (!(relay && m.type === "rtc-ice")) ws.send(JSON.stringify({ id: id++, ...m })); },
-    drawn: (w, h, kind) => { if (kind === "rtc" && vid.hidden) (vid.hidden = false), (cv.hidden = true), say("video shown " + w + "x" + h); },
-    rtc: (state, why, was, stalled) => { say("rtc " + state + (why ? ": " + why : "") + (state !== "up" ? " (was the picture: " + !!was + ")" : "")); if (state !== "up") live.setPath(""); if (state !== "up" && q.get("again") !== "0") setTimeout(() => live.startRtc(want), 3000); },
-    watch: () => q.get("watchdog") !== "0",
-    buffer: () => +q.get("buffer") || 0,
-    // like the page's keepPicture: the last frame on the canvas while the peer connection is made anew
-    heal: (what, why) => { say("heal " + what + ": " + why); if (what === "rebuild" && vid.videoWidth) { cv.width = vid.videoWidth; cv.height = vid.videoHeight; cv.getContext("2d").drawImage(vid, 0, 0); cv.hidden = false; vid.hidden = true; } },
-    fallback: (why) => say("fallback: " + why), ack() {}, note() {},
-  });
-}
-make();
+// WebRTC only (2026-11-16): the engine keeps itself up (a keyframe, an ICE restart, the connection made anew)
+const live = PhonesLive.create({
+  udid: q.get("udid"), video: () => vid, want: () => want,
+  // through the relay the page's own candidates stay here, so the relay's is the only path
+  signal: async (m) => { if (!(relay && m.type === "rtc-ice")) ws.send(JSON.stringify({ id: id++, ...m })); },
+  drawn: (w, h) => { if (vid.hidden) (vid.hidden = false), (cv.hidden = true), say("video shown " + w + "x" + h); },
+  state: (k, why) => say("state " + k + (why ? ": " + why : "")),
+  buffer: () => +q.get("buffer") || 0,
+  // like the page's keepPicture: the last frame on the canvas while the peer connection is made anew
+  heal: (what, why) => { say("heal " + what + ": " + why); if (what === "rebuild" && vid.videoWidth) { cv.width = vid.videoWidth; cv.height = vid.videoHeight; cv.getContext("2d").drawImage(vid, 0, 0); cv.hidden = false; vid.hidden = true; } },
+  ack() {}, note() {},
+});
 ws.onmessage = (e) => {
   const m = JSON.parse(e.data);
   if (m.type === "pong") return live.pong({ t: m.t, server_time: m.server_time, back: now() });
@@ -176,7 +172,7 @@ ws.onmessage = (e) => {
 };
 ws.onopen = () => {
   setInterval(() => ws.send(JSON.stringify({ type: "ping", t: now() })), 1000);
-  setTimeout(() => live.startRtc(want).then((ok) => say("offer sent: " + ok)), +q.get("wait") || 0);
+  setTimeout(() => live.start(), +q.get("wait") || 0);
 };
 window.__rep = () => {
   const r = live.report(), pq = vid.getVideoPlaybackQuality?.();
@@ -198,7 +194,7 @@ const webPort = (web.address() as AddressInfo).port;
 // ---- the browser, over the DevTools protocol ----
 const dir = fs.mkdtempSync(path.join(path.resolve(opt('profile-dir', os.tmpdir())), 'rtc-check-'));
 const useRelay = delay > 0 || jitter > 0 || loss > 0;
-const url = `http://127.0.0.1:${webPort}/?port=${serverPort}&udid=${udid}&token=${token}&profile=${profile}&relay=${useRelay ? relay.port : 0}&watchdog=${flag('no-watchdog') ? 0 : 1}&again=${flag('no-again') ? 0 : 1}&wait=${stale * 1000}&buffer=${num('buffer', 0)}`;
+const url = `http://127.0.0.1:${webPort}/?port=${serverPort}&udid=${udid}&token=${token}&profile=${profile}&relay=${useRelay ? relay.port : 0}&wait=${stale * 1000}&buffer=${num('buffer', 0)}`;
 const proc = spawn(browser, [
   flag('headed') ? '--new-window' : '--headless=new', '--remote-debugging-port=0', `--user-data-dir=${dir}`, '--no-first-run', '--no-default-browser-check',
   '--disable-extensions', '--autoplay-policy=no-user-gesture-required', '--window-size=500,700', ...(opt('browser-args', '') ? opt('browser-args', '').split(' ') : []), 'about:blank',
@@ -255,7 +251,7 @@ try {
       `${String(Math.round(rep.at / 1000)).padStart(3)} s ${rep.transport.padEnd(7)} shown ${String(shown).padStart(3)} | came ${String(d('framesReceived')).padStart(3)} decoded ${String(d('framesDecoded')).padStart(3)} ` +
         `dropped ${String(d('dropped')).padStart(3)} pkts ${String(d('packetsReceived')).padStart(4)} lost ${c.lost ?? 0} keys ${c.keyFramesDecoded ?? 0} pli ${c.pliCount ?? 0} nack ${c.nackCount ?? 0} freezes ${c.freezeCount ?? 0} ` +
         `jb ${c.jitterMs == null ? '-' : Math.round(c.jitterMs)} ms lat ${rep.latency?.p50 ?? '-'} ms rtt ${c.rtt == null ? '-' : Math.round(c.rtt)} | el ${rep.element ? `${rep.element.total}/${rep.element.dropped}` : '-'} ` +
-        `${c.video ? `rs${c.video.readyState}${c.video.paused ? ' paused' : ''}${c.video.hidden ? ' hidden' : ''}` : ''}${rep.stalled ? ` STALLED` : ''}${rep.heal && (rep.heal.keysAsked || rep.heal.rebuilds || rep.heal.replays) ? ` heal k${rep.heal.keysAsked} r${rep.heal.rebuilds} p${rep.heal.replays}` : ''}`,
+        `${c.video ? `rs${c.video.readyState}${c.video.paused ? ' paused' : ''}${c.video.hidden ? ' hidden' : ''}` : ''}${rep.state !== 'live' ? ` ${String(rep.state).toUpperCase()}` : ''}${rep.heal && (rep.heal.keysAsked || rep.heal.linkWaits || rep.heal.rebuilds || rep.heal.replays) ? ` heal k${rep.heal.keysAsked} w${rep.heal.linkWaits} r${rep.heal.rebuilds} p${rep.heal.replays}` : ''}`,
     );
     last = rep;
   }

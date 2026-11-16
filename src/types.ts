@@ -256,8 +256,11 @@ export interface Backend {
   lock?(udid: string): Promise<void>;
   /** Wake and unlock the phone (past the lock screen when it has no passcode): WDA /wda/unlock. */
   unlock?(udid: string): Promise<void>;
-  /** Whether the phone is locked now (WDA /wda/locked); null when it can't tell. */
-  isLocked?(udid: string): Promise<boolean | null>;
+  /**
+   * Whether the phone is locked or its screen is dark now (WDA /wda/locked, and a look at the screen: a phone without
+   * a passcode never says "locked"); `quick`: no look at the screen (true, or null). null when it can't tell.
+   */
+  isLocked?(udid: string, quick?: boolean): Promise<boolean | null>;
   /** WDA's /source tree (format=json) of what's on screen (src/ui.ts flattens it). */
   uiSource?(udid: string): Promise<unknown>;
   /** The foreground app's bundle id; null when it can't tell. */

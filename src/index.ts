@@ -1,3 +1,4 @@
+import { execFileSync } from 'node:child_process';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { loadConfig } from './config.js';
@@ -11,6 +12,15 @@ import { SettingsStore } from './settings.js';
 import { createUpdater } from './updater.js';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+/** The commit this build runs (GET /health says it): read once at start; null outside a git checkout. */
+function commitNow(): string | null {
+  try {
+    return execFileSync('git', ['rev-parse', '--short=7', 'HEAD'], { cwd: ROOT, timeout: 5000, stdio: ['ignore', 'pipe', 'ignore'] }).toString().trim() || null;
+  } catch {
+    return null;
+  }
+}
+const version = { commit: commitNow(), startedAt: new Date().toISOString() };
 const cfg = loadConfig();
 if (!cfg.mock && !cfg.wdaProject) {
   console.error('WDA_PROJECT is not set in .env (see README), or set MOCK=true.');
@@ -38,10 +48,10 @@ const resigner =
         problem: () =>
           process.platform !== 'darwin' ? 'WDA signing needs macOS' : cfg.wdaTeamId ? null : 'WDA_TEAM_ID is not set in .env (the Apple Team ID build-wda.sh signs with)',
       });
-const server = createServer(backend, cfg.token, updater, { settings, idle, resigner });
+const server = createServer(backend, cfg.token, updater, { settings, idle, resigner, version });
 
 server.listen(cfg.port, cfg.host, () => {
-  console.log(`phone-farm-server listening on http://${cfg.host}:${cfg.port} (${cfg.mock ? 'MOCK' : 'real'} mode)`);
+  console.log(`phone-farm-server ${version.commit ?? '(no commit)'} listening on http://${cfg.host}:${cfg.port} (${cfg.mock ? 'MOCK' : 'real'} mode)`);
 });
 // the WebRTC library (a native module) loads now rather than under the first viewer's offer
 void loadRtc();

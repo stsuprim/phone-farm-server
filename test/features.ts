@@ -86,6 +86,7 @@ function powerBackend() {
 
   // a viewer keeps it awake however long; its close starts the idle time
   const release = idle.viewer('P1');
+  await new Promise((r) => setTimeout(r, 10)); // the viewer's own look at the phone (2026-11-16: always asked; awake: nothing to do)
   now += 60 * 60_000;
   assert.deepEqual(await idle.tick(), []);
   release();

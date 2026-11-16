@@ -24,7 +24,7 @@ recovering) or `WDA refused the request on <name>: ...` (WDA answered but said n
 
 | Method | Path | Body / query | Result |
 |---|---|---|---|
-| GET | `/health` | - | `{ok, mock}` (no auth) |
+| GET | `/health` | - | `{ok, mock, commit, startedAt}` (no auth): alive, and which build runs (the commit's first 7 characters, when it started), so a client can tell whether the Mac has pulled a change |
 | GET | `/phones` | - | `[{udid, name, model, ios, battery, online, ready, control, scale, point_width, point_height, width, height, orientation}]`: `battery` 0-100 or null; `model` the product type (`iPhone14,5`); `ready` = WDA running; `control` = `"ready"` (session warm), `"recovering"` (WDA starting or session being remade) or `"down"`; `orientation` how the phone is turned now (`portrait`, `landscape-left`, `landscape-right`, `portrait-upside-down`; null until WDA has said; see [Orientation and coordinates](#orientation-and-coordinates)); `scale` from WDA (`/wda/screen`); `point_width`/`point_height` the screen in points **as it's turned now** (390 x 844 upright, 844 x 390 on its side), null until known; `width`/`height` the same in pixels (points x scale); `stats` the live view numbers (see [Live view](#live-view-webrtc-h264-mjpeg)); `lan` the Mac's own base URLs on its LAN (private IPv4 only, `["http://192.168.1.20:8787", ...]`, same for every phone); `tailnet` its Tailscale ones (100.64/10), listed apart because a Tailscale address is not a local path; `info` the detail card's data as it was last gathered (see [Device info](#device-info-the-detail-card)); `focused` true for the one phone in focus (see [One live phone at a time](#one-live-phone-at-a-time)); `stats.heals` / `stats.lastHeal` WDA's self-heals (see [Staying responsive](#staying-responsive-wda-self-heal)) |
 | GET | `/phones/:udid/info` | `?fresh=1` (ask the phone now) | `{ok, udid, battery: {level, percent, charging}, temperatureC, app: {bundleId, name}, uptimeSec, model, ios, bootedAt, wda: {expiresAt, daysLeft, state}, thermal, connectedAt, at, fresh}`: the detail card, kept ~15 s; anything unknown is `null`. See [Device info](#device-info-the-detail-card) |
 | POST | `/phones/:udid/warm` | `{}` | `{ok, udid, capture: "warm"\|"starting"\|"unavailable", reason?, input}`: gets the phone ready for a viewer that's about to open it (capture started, live touch channel opened, phone woken). See [Opening a view fast](#opening-a-view-fast) |
@@ -51,11 +51,11 @@ recovering) or `WDA refused the request on <name>: ...` (WDA answered but said n
 | POST | `/phones/:udid/wake` (also `/api/devices/:udid/wake`) | `{}` | wakes and unlocks (WDA `/wda/unlock`: past the lock screen when there's no passcode): `{ok, udid, locked, screenOn, lastActive, warning?}`; 404 `{"error":"unknown phone"}` |
 | POST | `/phones/:udid/lock` (also `/api/devices/:udid/lock`) | `{}` | locks, screen off (WDA `/wda/lock`): same answer |
 | GET | `/api/devices` | - | the same list as `/phones` (every `/phones/:udid/...` route also answers under `/api/devices/:udid/...`) |
-| GET / PUT | `/api/settings` (also `/settings`) | PUT `{idleLockMinutes?, naturalTouch?}` (`idleLockMinutes` 0 = off, default 10; `naturalTouch` default true, see [Natural touch](#natural-touch)) | the settings; kept in `data/settings.json` |
+| GET / PUT | `/api/settings` (also `/settings`) | PUT `{idleLockMinutes?}` (0 = off, default 10) | the settings, kept in `data/settings.json`, plus `naturalTouch: true` (not a setting since 2026-11-16: it only says this server has [natural touch](#natural-touch); a PUT of it is taken without a word and changes nothing) |
 | GET | `/api/wda` (also `/wda`) | - | `{signedAt, expiresAt, daysLeft, state: "ok"\|"soon"\|"expired"\|"resigning"\|"failed", lastError?, nextAttemptAt, perDevice: {udid: {signedAt, lastError?}}}` (mock: `{state:"unavailable"}`) |
 | POST | `/api/wda/resign` (also `/wda/resign`) | - | 202 + the status (`state:"resigning"`): re-signs WDA for every phone now |
 | GET | `/api/status` (also `/status`) | - | `{mock, settings, wda, devices}` (`devices` as `/api/devices`) |
-| POST | `/phones/:udid/focus` (also `/api/devices/:udid/focus`) | `{}` | `{ok, udid, focused, previous: {udid, slept, reason?} \| null, capture, reason?, input}`: makes this the one live phone. The phone in focus before it stops its capture and locks first (unless an agent action is running on it: `slept: false` with why), then this one wakes and its capture starts (`capture` as `/warm`). See [One live phone at a time](#one-live-phone-at-a-time); 404 `{"ok":false,"error":"unknown phone"}`, 503 offline |
+| POST | `/phones/:udid/focus` (also `/api/devices/:udid/focus`) | `{}` | `{ok, udid, focused, previous: {udid, slept, reason?} \| null, capture, reason?, input}`: makes this the one live phone. This one wakes and its capture starts (`capture` as `/warm`); the phone in focus before it stops its capture and locks about 1.5 s later, and only if nobody watches it by then (`previous.reason: "locking"`; an agent action running on it keeps it awake: `slept: false` with why). See [One live phone at a time](#one-live-phone-at-a-time); 404 `{"ok":false,"error":"unknown phone"}`, 503 offline |
 | GET | `/update/status` | - | `{current, remote, upToDate, lastCheck, lastError}` (runs `git fetch`, compares local HEAD with `origin/main`) |
 | POST | `/update/now` | - | force-updates to GitHub main now: `{started:true}` (built; process exits and launchd restarts it) or `{started:false, reason}` (up to date, GitHub unreachable, build failed and rolled back...). 503 in mock mode |
 
@@ -69,8 +69,8 @@ healed (see [Staying responsive](#staying-responsive-wda-self-heal)).
 
 ### Natural touch
 
-`naturalTouch` (GET / PUT `/api/settings`, on by default; `src/human.ts`) makes the touches sent as commands (`tap`,
-`swipe`, `hold`, `tap-element`, their `/act` steps and the control socket's) move like a finger:
+Always on (2026-11-16: no setting; `src/human.ts`): the touches sent as commands (`tap`, `swipe`, `hold`,
+`tap-element`, their `/act` steps and the control socket's) move like a finger:
 
 - **Swipes** follow a slight bow (3-8 % of their length to one side, at most 24 pt) with minimum-jerk speed (slow off
   the mark, fastest mid-way, slow into the end), sampled every 8 ms. The two ends are exact. Without `ms` they take a
@@ -82,7 +82,8 @@ healed (see [Staying responsive](#staying-responsive-wda-self-heal)).
 - **The owner's own touches** are never reshaped: live touch (`down`/`move`/`up`) goes to the phone as it comes, or,
   buffered, is played on `up` through every point at its own time; a whole swipe (`points`) keeps its points and
   timing; a quick buffered tap keeps its real hold (30-250 ms).
-- **Off** (or `natural: false` on a message): exact places, straight lines at even speed, the routes' own tap hold.
+- **`natural: false` on a message** (the owner's own whole tap or hold): exact places, straight lines at even speed,
+  the routes' own tap hold.
 
 The randomness is seeded (`createServer(..., { touchSeed })` for tests); `test/human.ts` checks it.
 
@@ -91,10 +92,11 @@ The randomness is seeded (`createServer(..., { touchSeed })` for tests); `test/h
 `POST /phones/:udid/focus` (or `/api/devices/:udid/focus`) picks the phone on show; a client calls it when the owner
 switches phones, before opening the view.
 
-- **Only it streams.** The phone in focus before it has its capture stopped at once (its viewers are told `another
-  phone is in focus`; no warm time) and is **locked first** (in its own queue, so never on top of an action; the answer
-  waits up to 8 s for it). An agent action running or waiting on that phone keeps it awake: `previous.slept: false`,
-  `reason: "an agent action is running on it"`.
+- **Only it streams.** The phone in focus before it has its capture stopped and is **locked** about 1.5 s after the
+  switch (`FOCUS_LOCK_MS`), in its own queue (never on top of an action), without holding the answer up, and **only
+  if nobody watches it by then**: the viewer that switched has let go of it, while another Lotus still on it keeps its
+  picture and its screen (2026-11-16: a lock under a viewer left a black picture). An agent action running or waiting
+  on that phone keeps it awake: `previous.slept: false`, `reason: "an agent action is running on it"`.
 - **The new one is ready.** It wakes (past the lock screen), its live touch channel opens and its capture starts, as
   `POST /warm`. While a viewer (a control socket or a stream) is attached to it, its capture is kept warm all the
   time, so its view reopens at once.
@@ -102,6 +104,29 @@ switches phones, before opening the view.
   in the server's memory: after a restart nobody is in focus until a client says so.
 - **FPS:** each phone's `stats.fps` (the live view's frames per second now), each lane's `stats.lanes[].fps` and
   each open view's `stats.sessions[].fps` (frames sent to that viewer in the last second).
+
+### A dark screen (2026-11-16)
+
+A phone without a passcode never says "locked": WDA's `/wda/locked` reads SpringBoard's lock state, which stays 0, so
+after a lock (the idle lock, a switch of the live phone) or iOS's own Auto-Lock its screen is off while everything said
+it was awake. WDA's `/wda/lock` timed out waiting ("Timed out while waiting until the screen gets locked"),
+`/wda/unlock` did nothing ("not locked"), the H.264 capture had no frames to give (so WebRTC failed and the stream fell
+back to MJPEG) and every picture was black. Now the screen itself says (`src/dark.ts`):
+
+- **Dark is told from a screenshot.** WDA's PNG, black all over (at most 0.1 % of its pixels brighter than near-black:
+  a screen that's on always has a clock). A frame WDA's MJPEG gives within a moment settles a screen that plainly shows
+  something without the PNG.
+- **`isLocked` means locked or dark**, so the idle lock's own checks work on these phones: before an input after a
+  quiet spell, when a viewer opens (every time, also when the phone is thought awake) and with each `rtc-offer`.
+- **Waking a dark phone** is what WDA's unlock does, pressed here: Home (the screen comes on), 0.9 s, Home again (past
+  the lock screen), twice at most. Home is never pressed on a screen that shows something (it would leave the app in
+  front) nor when the screen can't be told.
+- **A lock that left the screen dark took**, whatever WDA said, so the list says `locked: true` and the next viewer
+  or input wakes it. A phone that's already dark isn't locked again (the lock button would turn its screen on).
+- **A watched phone never stays black.** The watch (every 12 s; the screen itself every 4th tick) wakes a phone found
+  locked or dark while a viewer is attached, unless it was locked on request (the Lock key, `POST /lock`).
+
+`test/dark.ts` checks the screenshot test, the wake, the idle lock's part and the switch.
 
 ### Staying responsive (WDA self-heal)
 
@@ -451,6 +476,10 @@ this WDA build has no fast route, `unknown` = not tried yet).
 
 ## Live view: WebRTC, H.264, MJPEG
 
+**Lotus's Phones page uses WebRTC only since 2026-11-16** (no H.264 WebSocket, no MJPEG, no snapshots): its engine
+keeps the picture up by itself (a keyframe asked with `rtc-key`, a few seconds for the link to come back, then a new
+offer) and says why when it can't connect. The other two transports below stay for older clients.
+
 Three transports, best first. The client tries WebRTC, then the H.264 WebSocket, then MJPEG; the server tells it when it
 has to step down (`rtc-error`, or a `codec:"mjpeg"` hello with a `reason`).
 
@@ -713,6 +742,13 @@ repo inside Lotus, else `--live <path>`) and prints, each second, the frames tha
 the keyframes, PLIs, NACKs, freezes and the jitter buffer. `--delay/--jitter/--loss` put a UDP relay in between (a far
 link); `--bare-keys`, `--break-at <s>` and `--blackout <s>:<s>` break the stream to watch the page heal. Exit code 1 when
 the picture stalls.
+
+**Lotus's Phones page against a real browser** (not part of `npm test` either): `npx tsx scripts/page-check.ts`. The
+page's own `phones.js`, `phones-live.js`, `phones-chat.js` and `phones.css` run in a headless browser with a small
+stand-in for Lotus and for its Rust commands, against the mock server: the page mounts without an error, the list is on
+the left, the phone in the middle and Lotus on the right, the open phone goes live over WebRTC with its numbers on its
+card, a click switches phones, a press reaches the phone, and a dropped link says Reconnecting with the last frame kept
+and comes back by itself.
 
 ## Settings (.env)
 

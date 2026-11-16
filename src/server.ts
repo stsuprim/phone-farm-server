@@ -26,11 +26,23 @@ export interface ServerExtras {
   watchMs?: number;
   /** Seed of natural touch's randomness (tests); default a random one. */
   touchSeed?: number;
+  /** Tests only: every touch exactly where and how it was asked (checks of places and timing). Natural touch is always on otherwise. */
+  exactTouch?: boolean;
+  /** What GET /health says of this build: `{ commit, startedAt }` (index.ts reads the commit once at start). */
+  version?: { commit: string | null; startedAt: string };
+  /** How long after a switch of the live phone the one before is locked, if nobody watches it by then (ms; default FOCUS_LOCK_MS). */
+  focusLockMs?: number;
 }
 
 /** A phone someone watches (an open control socket or stream, or the focused one) is health-checked this often. */
 export const WATCH_MS = 12_000;
-/** Focusing a phone waits this long at most for the previous one to lock. */
+/**
+ * After a switch of the live phone, the one before is locked this long later, and only if nobody watches it by then
+ * (the viewer that switched has let go of it; another Lotus still on it keeps it awake and streaming).
+ */
+export const FOCUS_LOCK_MS = 1500;
+/** Every this many watch ticks a watched phone's screen itself is looked at (dark with nothing said: iOS's Auto-Lock). */
+const DARK_EVERY = 4;
 
 /**
  * A viewer's connection profile: `profile=lan|remote` from the client wins; else from its address (the LAN and
@@ -160,8 +172,9 @@ export function createServer(backend: Backend, token: string, updater?: Updater,
   };
 
   const wss = new WebSocketServer({ noServer: true, maxPayload: 1_000_000 });
-  // natural touch (the `naturalTouch` setting, on by default): the AI's taps and swipes move like a finger
-  const control = new Control(backend, undefined, { natural: () => settings.get().naturalTouch, seed: extras.touchSeed });
+  // natural touch, always (2026-11-16: no setting): the AI's taps and swipes move like a finger; a message with
+  // `natural: false` (the owner's own whole tap or hold) stays exact
+  const control = new Control(backend, undefined, { natural: () => !extras.exactTouch, seed: extras.touchSeed });
   control.onInput = (udid, discrete) => idle.activity(udid, discrete);
   if (idle.supported) control.power = { lock: (u) => idle.lock(u), wake: (u) => idle.wake(u) };
   // the first action after a quiet spell (and one that hung) has the phone's WDA probed and healed first
@@ -372,21 +385,33 @@ export function createServer(backend: Backend, token: string, updater?: Updater,
     focused = udid;
     let previous: { udid: string; slept: boolean; reason?: string } | null = null;
     if (prev && prev !== udid) {
-      backend.stopCapture?.(prev, 'another phone is in focus');
       if (agent.busy(prev) || control.pending(prev) > 0) {
+        backend.stopCapture?.(prev, 'another phone is in focus');
         previous = { udid: prev, slept: false, reason: 'an agent action is running on it' };
       } else if (!idle.supported) {
+        backend.stopCapture?.(prev, 'another phone is in focus');
         previous = { udid: prev, slept: false, reason: 'this backend cannot lock phones' };
       } else {
-        // in the phone's queue, so it never lands on top of an action. 2026-11-16: fire-and-forget: the new phone is
-        // never held up by the lock (a slow or timed-out lock only shows in the log, and never marks anything down)
-        void control.handle(prev, { type: 'key', key: 'lock' }).then(
-          () => console.log(`[focus] ${prev.slice(-8)} is asleep`),
-          (err: Error) => console.log(`[focus] ${prev.slice(-8)} stays awake: lock failed: ${err.message}`),
-        );
+        // 2026-11-16: a moment later, and only if nobody watches it by then: the viewer that switched has closed its
+        // link to it, while another Lotus still on it keeps its picture and its screen (a lock under a viewer left a
+        // black picture). In the phone's queue, so it never lands on top of an action; fire-and-forget: the new phone
+        // is never held up by it (a slow or timed-out lock only shows in the log, and never marks anything down).
+        const sleepPrev = () => {
+          if (focused === prev) return;
+          if (attached.has(prev)) return void console.log(`[focus] ${prev.slice(-8)} stays awake: someone is watching it`);
+          backend.stopCapture?.(prev, 'another phone is in focus');
+          if (agent.busy(prev) || control.pending(prev) > 0) return;
+          void control.handle(prev, { type: 'key', key: 'lock' }).then(
+            () => console.log(`[focus] ${prev.slice(-8)} is asleep`),
+            (err: Error) => console.log(`[focus] ${prev.slice(-8)} stays awake: lock failed: ${err.message}`),
+          );
+        };
+        const wait = extras.focusLockMs ?? FOCUS_LOCK_MS;
+        if (wait > 0) setTimeout(sleepPrev, wait).unref();
+        else sleepPrev();
         previous = { udid: prev, slept: false, reason: 'locking' };
       }
-      console.log(`[focus] ${prev.slice(-8)} -> ${udid.slice(-8)}${previous.slept ? ' (the previous one is asleep)' : ` (the previous one stays awake: ${previous.reason})`}`);
+      console.log(`[focus] ${prev.slice(-8)} -> ${udid.slice(-8)}${previous.reason === 'locking' ? ' (the previous one sleeps once nobody watches it)' : ` (the previous one stays awake: ${previous.reason})`}`);
     }
     const state = warmUp(udid);
     return { focused: udid, previous, ...state, input: backend.inputMethods?.(udid) ?? null };
@@ -394,9 +419,12 @@ export function createServer(backend: Backend, token: string, updater?: Updater,
 
   // ---- the watch: phones on show are health-checked every WATCH_MS, in their queue ----
   let watching = false;
+  let watchN = 0;
   const watchTick = async () => {
     if (watching) return;
     watching = true;
+    // WDA's own word on the lock every tick; the screen itself (a screenshot) every DARK_EVERY ticks
+    const quick = watchN++ % DARK_EVERY !== 0;
     try {
       const ids = new Set([...attached.keys(), ...(focused ? [focused] : [])]);
       const list = ids.size ? await backend.list() : [];
@@ -408,7 +436,7 @@ export function createServer(backend: Backend, token: string, updater?: Updater,
           await control
             .check(udid, async () => {
               if (backend.heal && !(await backend.heal(udid, 'watch'))) return;
-              if (backend.isLocked) idle.note(udid, await backend.isLocked(udid).catch(() => null));
+              if (backend.isLocked) idle.note(udid, await backend.isLocked(udid, quick).catch(() => null));
             })
             .catch(() => {});
           // the focused phone's capture stays warm while a viewer is attached (its view can reopen at once)
@@ -428,7 +456,9 @@ export function createServer(backend: Backend, token: string, updater?: Updater,
     try {
       const url = new URL(req.url ?? '/', 'http://x');
       const path = url.pathname.replace(/\/+$/, '') || '/';
-      if (req.method === 'GET' && path === '/health') return send(res, 200, { ok: true, mock: backend.mock });
+      // public (no token): alive, and which build this is (the commit and when it started), so a client can tell
+      // whether the Mac has pulled a change
+      if (req.method === 'GET' && path === '/health') return send(res, 200, { ok: true, mock: backend.mock, ...(extras.version ?? {}) });
       if (!authorized(bearer(req))) {
         res.setHeader('www-authenticate', 'Bearer');
         return send(res, 401, { error: 'missing or invalid bearer token' });
@@ -455,11 +485,12 @@ export function createServer(backend: Backend, token: string, updater?: Updater,
         });
       }
       if (path === '/api/settings' || path === '/settings') {
-        if (req.method === 'GET') return send(res, 200, settings.get());
+        // `naturalTouch: true` is not a setting any more (2026-11-16: always on): it only says this server has it
+        if (req.method === 'GET') return send(res, 200, { ...settings.get(), naturalTouch: true });
         if (req.method !== 'PUT' && req.method !== 'POST') throw new HttpError(405, 'use GET or PUT');
         const next = settings.put(await readJson(req));
         void idle.tick().catch(() => {}); // a shorter idle time applies now
-        return send(res, 200, next);
+        return send(res, 200, { ...next, naturalTouch: true });
       }
       if (path === '/api/wda' || path === '/wda') {
         if (req.method !== 'GET') throw new HttpError(405, 'use GET');
@@ -841,6 +872,10 @@ export function createServer(backend: Backend, token: string, updater?: Updater,
     const rtc = rtcSignaling(backend, control, udid, reply, remote, {
       dispatch: (msg, who) => agent.dispatch(udid, msg, who),
       view: () => view(udid),
+      // an offer is someone about to look: a phone that went dark since (iOS's Auto-Lock) is woken, one that's on is left
+      offer: () => {
+        if (idle.supported) void idle.wake(udid, true).catch(() => {});
+      },
     });
     // an open live view: keep the phone's live touch channel (HID session) open so the first tap doesn't pay for it
     const releaseInput = backend.warmInput?.(udid);

@@ -789,6 +789,23 @@ export class WdaManager {
     }
   }
 
+  /**
+   * A Home press that never heals (2026-11-16, the wake of a dark phone): the session's pressButton, else the
+   * session-less /wda/homescreen. Rejects like callSoft.
+   */
+  async homeSoft(udid: string, timeout = 4000): Promise<void> {
+    const sid = this.entries.get(udid)?.sessionId;
+    if (sid) {
+      try {
+        await this.callSoft(udid, 'POST', `/session/${sid}/wda/pressButton`, { name: 'home' }, timeout);
+        return;
+      } catch {
+        /* the session-less route */
+      }
+    }
+    await this.callSoft(udid, 'POST', '/wda/homescreen', {}, timeout);
+  }
+
   callNoSession(udid: string, method: string, p: string, body?: unknown, timeout = 30000): Promise<any> {
     return this.withRecovery(udid, (e) => this.raw(e, method, p, body, timeout));
   }

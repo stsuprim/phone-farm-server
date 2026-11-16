@@ -1,5 +1,5 @@
 // Natural touch (src/human.ts): curves and easing, tap offsets and holds, drags, the owner's paths replayed as they
-// were, the setting (GET/PUT /api/settings naturalTouch) and exact input with it off. Seeded: the same every run.
+// were, always on at the server (2026-11-16: no setting) and exact input with `natural: false`. Seeded: the same every run.
 process.env.INPUT_LOG = '0';
 import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
@@ -218,13 +218,12 @@ const quick = { minGapMs: 0, idleProbeMs: Infinity };
   ok('the owner\'s path: every point and its timing replayed; a whole swipe kept; a tap\'s real hold');
 }
 
-// ---- the setting: GET/PUT /api/settings, kept, and the server follows it ----
+// ---- always on (2026-11-16): no setting; the server's input is natural whatever a client puts ----
 {
   const s = new SettingsStore();
-  assert.equal(s.get().naturalTouch, true, 'on by default');
-  assert.throws(() => s.put({ naturalTouch: 'yes' }), /true or false/);
-  assert.equal(s.put({ naturalTouch: false }).naturalTouch, false);
-  assert.equal(SettingsStore.validate({ naturalTouch: 1 }, true).naturalTouch, undefined, 'a bad file value is skipped');
+  assert.equal('naturalTouch' in s.get(), false, 'not a setting any more');
+  assert.deepEqual(s.put({ naturalTouch: false }), { idleLockMinutes: 10 }, 'an older client\'s PUT of it is left out, not refused');
+  assert.deepEqual(SettingsStore.validate({ naturalTouch: false, idleLockMinutes: 5 }, true), { idleLockMinutes: 5 }, 'one kept in the file is skipped');
 
   const token = crypto.randomBytes(16).toString('hex');
   const backend = new MockBackend(1);
@@ -238,18 +237,22 @@ const quick = { minGapMs: 0, idleProbeMs: Infinity };
     const udid = ((await (await fetch(`${base}/phones`, { headers })).json()) as any[])[0].udid as string;
     const p = (backend as any).live(udid);
     await fetch(`${base}/phones/${udid}/tap`, { method: 'POST', headers, body: JSON.stringify({ x: 100, y: 100, unit: 'pt', fast: true }) });
-    assert.match(p.log[p.log.length - 1], /^tap \d+,\d+ hold \d+$/, 'on: held a natural moment');
+    assert.match(p.log[p.log.length - 1], /^tap \d+,\d+ hold \d+$/, 'held a natural moment');
+    // an older Lotus's switch: taken without a word, and nothing changes
     const put = (await (await fetch(`${base}/api/settings`, { method: 'PUT', headers, body: JSON.stringify({ naturalTouch: false }) })).json()) as Record<string, unknown>;
-    assert.equal(put.naturalTouch, false);
+    assert.equal(put.naturalTouch, true, 'it only says the server has it');
     await fetch(`${base}/phones/${udid}/tap`, { method: 'POST', headers, body: JSON.stringify({ x: 100, y: 100, unit: 'pt', fast: true }) });
-    assert.equal(p.log[p.log.length - 1], 'tap 100,100', 'off: exact');
-    const bad = await fetch(`${base}/api/settings`, { method: 'PUT', headers, body: JSON.stringify({ naturalTouch: 'on' }) });
+    assert.match(p.log[p.log.length - 1], /^tap \d+,\d+ hold \d+$/, 'still natural');
+    // the owner's own whole tap says natural: false: exact
+    await fetch(`${base}/phones/${udid}/tap`, { method: 'POST', headers, body: JSON.stringify({ x: 100, y: 100, unit: 'pt', fast: true, natural: false }) });
+    assert.equal(p.log[p.log.length - 1], 'tap 100,100', 'natural: false on a message stays exact');
+    const bad = await fetch(`${base}/api/settings`, { method: 'PUT', headers, body: JSON.stringify({ nope: 1 }) });
     assert.equal(bad.status, 400);
   } finally {
     server.close();
     await backend.close();
   }
-  ok('the setting: on by default, PUT turns it off, the server\'s input follows it');
+  ok('always on: no setting to turn it off, an older client\'s PUT changes nothing, natural: false stays exact');
 }
 
 console.log(`\nall ${passed} natural touch checks passed`);

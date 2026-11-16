@@ -15,9 +15,6 @@ import { IdleLock } from '../src/idle.js';
 import { MockBackend } from '../src/mock.js';
 import { createServer } from '../src/server.js';
 import type { Backend, PathPoint } from '../src/types.js';
-import { SettingsStore } from '../src/settings.js';
-/** Natural touch off: these checks need exact places and timing. */
-const exactTouch = () => { const s = new SettingsStore(); s.put({ naturalTouch: false }); return s; };
 
 let passed = 0;
 const ok = (name: string) => {
@@ -342,7 +339,7 @@ type Fake = ChildProcess & EventEmitter & { lines: Record<string, unknown>[]; ou
 {
   const token = crypto.randomBytes(16).toString('hex');
   const backend = new MockBackend(1);
-  const server = createServer(backend, token, undefined, { settings: exactTouch() });
+  const server = createServer(backend, token, undefined, { exactTouch: true });
   await new Promise<void>((r) => server.listen(0, '127.0.0.1', r));
   const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
   const auth = { authorization: `Bearer ${token}`, 'content-type': 'application/json' };

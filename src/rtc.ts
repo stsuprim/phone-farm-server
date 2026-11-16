@@ -8,6 +8,9 @@ import { Backend, HttpError, Profile, QualityTier } from './types.js';
 /**
  * WebRTC live view (node-datachannel / libdatachannel). Signaling rides the control WebSocket:
  *   client -> {type:"rtc-offer", sdp, want:{fps, scale, quality?}}   server -> {type:"rtc-answer", sdp}
+ *   (every offer is a new session. An ICE restart of a running one isn't possible here: libdatachannel's libjuice
+ *   refuses a second ICE generation, "Invalid ICE settings from remote SDP"; tried 2026-11-16. A client whose link
+ *   drops waits a few seconds for ICE to come back by itself, then sends a new offer.)
  *   both ways {type:"rtc-ice", candidate, mid}; server -> {type:"rtc-hello", ...} once frames flow,
  *   client -> {type:"rtc-key"} (a keyframe now: its picture stalled), {type:"rtc-close"},
  *   or {type:"rtc-error", reason} (the client falls back to the H.264 WebSocket / MJPEG).
@@ -260,6 +263,8 @@ export interface RtcHooks {
   dispatch?: (msg: Record<string, unknown>, owner: object) => Promise<Record<string, unknown> | null>;
   /** The phone as it's turned now: `{orientation, point_width, point_height, screen_width, screen_height}`. */
   view?: () => Record<string, unknown>;
+  /** A viewer asks for the picture (an offer came): the server sees that the phone's screen is on. */
+  offer?: () => void;
 }
 
 /** One WebRTC session for one control WebSocket: a sendonly H.264 track plus the "input"/"input-r" channels. */
@@ -648,11 +653,13 @@ export function rtcSignaling(backend: Backend, control: Control, udid: string, s
     handle(msg: Record<string, unknown>): boolean {
       switch (msg.type) {
         case 'rtc-offer': {
-          session?.close('replaced by a new offer');
           if (typeof msg.sdp !== 'string' || !msg.sdp) {
+            session?.close('replaced by a bad offer');
             send({ type: 'rtc-error', reason: '"sdp" must be a string' });
             return true;
           }
+          hooks.offer?.();
+          session?.close('replaced by a new offer');
           const s = new RtcSession(backend, control, udid, send, remote, hooks);
           session = s;
           s.start(msg.sdp, msg.want).catch((err) => {
