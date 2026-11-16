@@ -442,7 +442,9 @@ export function createServer(backend: Backend, token: string, updater?: Updater,
       }
       console.log(`[focus] ${prev.slice(-8)} -> ${udid.slice(-8)}${previous.reason === 'locking' ? ' (the previous one sleeps once nobody watches it)' : ` (the previous one stays awake: ${previous.reason})`}`);
     }
-    const state = warmUp(udid);
+    // 2026-11-17 (the owner: selecting a phone must not wake it): the focus wakes nothing; the client wakes the
+    // phone itself (POST /wake, Lotus's Unlock) and a picture's offer wakes it
+    const state = warmUp(udid, false);
     return { focused: udid, previous, ...state, input: backend.inputMethods?.(udid) ?? null };
   };
 
@@ -906,8 +908,9 @@ export function createServer(backend: Backend, token: string, updater?: Updater,
     });
     // an open live view: keep the phone's live touch channel (HID session) open so the first tap doesn't pay for it
     const releaseInput = backend.warmInput?.(udid);
-    // ...and it's activity: the phone wakes and isn't idle-locked while the view is open
-    const releaseIdle = idle.viewer(udid);
+    // ...and it's activity: the phone isn't idle-locked while the link is open. 2026-11-17: opening the link wakes
+    // nothing (the owner's Unlock wakes it by POST /wake, a picture's rtc-offer does too)
+    const releaseIdle = idle.viewer(udid, false);
     // (the capture starts with the viewer's own rtc-offer, not here: it runs only under a picture someone asked for)
     const link = linkOf(udid);
     const opened = Date.now();

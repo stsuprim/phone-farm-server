@@ -151,15 +151,19 @@ export class IdleLock {
     }
   }
 
-  /** A viewer opened (stream or WebRTC session): activity, and the phone wakes. Returns the release. */
-  viewer(udid: string): () => void {
+  /**
+   * A viewer opened (stream or WebRTC session): activity, and the phone wakes. Returns the release. 2026-11-17:
+   * `wake: false` (the control socket): activity only, the phone is left as it is (a Lotus that opens a phone's
+   * control link has had the owner press Unlock, which wakes it by POST /wake; a picture's own offer wakes it too).
+   */
+  viewer(udid: string, wake = true): () => void {
     const e = this.entry(udid);
     e.viewers++;
     e.lastActive = this.now();
     e.known = true;
     // a viewer isn't latency-critical: the phone is asked whether it's locked or dark unless it's known to be
     // (2026-11-16: also when it's thought awake: a phone that went dark by itself says nothing, and showed black)
-    if (this.supported) void this.wake(udid, e.locked !== true).catch(() => {});
+    if (wake && this.supported) void this.wake(udid, e.locked !== true).catch(() => {});
     let done = false;
     return () => {
       if (done) return;

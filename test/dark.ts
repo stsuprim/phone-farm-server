@@ -198,7 +198,9 @@ const until = async (cond: () => boolean | Promise<boolean>, ms = 3000) => {
     assert.ok(await until(() => backend.isLocked(b2!).then((l) => l === true)), 'the phone before sleeps once nobody watches it');
     assert.deepEqual(stopped, [], 'a capture ends with its last viewer, never by the focus');
 
-    // back to B before its lock is due: it's the focus again, and stays awake
+    // back to B before its lock is due: it's the focus again, and no lock lands on it. 2026-11-17: the focus no
+    // longer wakes a phone (Lotus's Unlock wakes it by POST /wake), so B is woken here as Unlock would
+    await backend.unlock(b2!);
     assert.equal(await post(`/phones/${b2}/focus`), 200);
     assert.equal(await post(`/phones/${c}/focus`), 200);
     assert.equal(await post(`/phones/${b2}/focus`), 200);
