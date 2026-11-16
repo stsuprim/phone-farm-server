@@ -3,8 +3,9 @@ import fs from 'node:fs';
 import http from 'node:http';
 import path from 'node:path';
 import { Config } from './config.js';
-import { FORK_ROUTES, ForkLaunch, launchPlan, TOKEN_ENV, TOKEN_HEADER, WdaFlavor } from './fork.js';
+import { FORK_ROUTES, ForkLaunch, launchPlan, LIVE_SEGMENTED, TOKEN_ENV, TOKEN_HEADER, WdaFlavor } from './fork.js';
 import { isLandscape, Orientation, orientationFromWda, portraitSize, uprightSize, uprightToPanel } from './orient.js';
+import { Segmenter } from './segments.js';
 import { ButtonName, ControlState, HttpError, PathPoint, ScreenInfo, StreamSettings } from './types.js';
 
 export type WdaStatus = 'starting' | 'ready' | 'failed' | 'stopped';
@@ -92,6 +93,8 @@ interface Entry {
   launchError: string | null;
   /** Our build's live touch stopped working since the runner started (what XCTest said): not used until it restarts. */
   liveFailed: string | null;
+  /** Live mode 4 (segmented, src/segments.ts): the drag going to our build in short whole gestures as it happens. */
+  seg?: Segmenter;
   /** Our build's runner ended this many times in a row without staying up FORK_STABLE_MS, and when it last came up. */
   forkFails: number;
   readyAt: number;
@@ -523,6 +526,7 @@ export class WdaManager {
     e.token = plan.flavor === 'fork' ? plan.env[`TEST_RUNNER_${TOKEN_ENV}`] : undefined;
     e.forkInfo = null;
     e.liveFailed = null;
+    e.seg = undefined;
     const forward = (slot: 0 | 1, local: number, remote: number): ChildProcess => {
       const p = spawnLogged('iproxy', ['-u', e.udid, `${local}:${remote}`]);
       p.on('exit', (code) => {
@@ -1388,6 +1392,16 @@ export class WdaManager {
     if (!e || why) throw new HttpError(503, why ?? 'WebDriverAgent is not running for this phone');
     const mode = this.liveModeOf(udid);
     const at = this.panel(e, x, y);
+    if (mode === LIVE_SEGMENTED) {
+      // 2026-11-17: no finger can stay down between XCTest's records on iOS 18: the drag goes in short whole
+      // gestures as it happens (src/segments.ts), each starting where the last ended
+      const seg = (e.seg ??= new Segmenter((points, hold) => this.raw(e, 'POST', FORK_ROUTES.gesture, gestureBody(points, hold), LIVE_TOUCH_TIMEOUT_MS)));
+      if (phase === 'down') {
+        if (seg.isDown) await seg.up(at[0], at[1]).catch(() => {});
+        return seg.down(at[0], at[1]);
+      }
+      return phase === 'move' ? seg.move(at[0], at[1]) : seg.up(at[0], at[1]);
+    }
     const v = (await this.raw(e, 'POST', FORK_ROUTES.touch, liveBody(phase, at, mode), LIVE_TOUCH_TIMEOUT_MS))?.value;
     if (typeof v?.failed === 'string' && v.failed) {
       // XCTest refused (or never answered) a live record: not used again until the runner restarts. Whatever of the
@@ -1434,7 +1448,7 @@ export class WdaManager {
   }
 
   /** The phone's own live-touch self-test (POST /lotus/selftest, our build): which way of holding a finger down works. */
-  async selftest(udid: string): Promise<{ tested: boolean; mode: number; why?: string | null; notes?: string[] }> {
+  async selftest(udid: string): Promise<{ tested: boolean; mode: number; why?: string | null; notes?: string[]; modes?: { mode: number; works: boolean; why: string | null }[] }> {
     const e = this.entries.get(udid);
     if (!e || !e.wanted || e.status !== 'ready' || !e.forkInfo) return { tested: false, mode: 0, why: "our WebDriverAgent build isn't up on the phone" };
     e.inflight++;
@@ -1443,6 +1457,8 @@ export class WdaManager {
       return {
         tested: v?.tested === true, mode: Number.isInteger(v?.mode) ? v.mode : 0, why: typeof v?.why === 'string' ? v.why : null,
         notes: Array.isArray(v?.notes) ? v.notes.filter((n: unknown) => typeof n === 'string') : undefined,
+        // 2026-11-17 (v2): each mode's result
+        ...(Array.isArray(v?.modes) ? { modes: v.modes } : {}),
       };
     } catch (err) {
       return { tested: false, mode: 0, why: (err as Error).message };

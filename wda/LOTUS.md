@@ -52,6 +52,20 @@ keeps the mode it found (`data/wda-fork.json`), and sends it with every live eve
 self-test hasn't run, the server doesn't use `/lotus/touch` at all: a drag is then played whole on release, as with
 a stock WebDriverAgent. A finger nobody has said anything about for 10 s is lifted by the phone.
 
+**v2 (2026-11-17): segmented drags.** On both phones (iOS 18.5 and 18.7.8) v1's self-test found no mode: XCTest
+plays each `XCSynthesizedEventRecord` as a complete event stream and ends every finger still down when the record
+ends (`beginsPersistentState` doesn't change that), so no finger can be held between requests through XCTest; and
+iPhone-1 saw no touch at all because it was locked while the test ran. v2's self-test still tries modes 1-3 (a
+future iOS may keep the contact), then **mode 4, segmented**: two short whole gestures, the second starting where
+the first ended, must each reach the window as a complete touch. The server then sends a drag as it happens as
+short whole gestures through `/lotus/gesture` (`src/segments.ts`: one once it has lasted 70 ms and moved 10 pt,
+still 30 ms before its lift so nothing flings, paced to what the phone can play), never `/lotus/touch`. A tap or a
+long press still goes whole; what segmented can't do is carry one contact through a whole drag (a long press that
+turns into a drag lifts after its first segment). The answer now has `modes: [{mode, works, why}]`, every mode's
+result. The server wakes and unlocks the phone first and checks it's awake (WDA's lock state and a look at the
+screen), tries once more when it found nothing, runs it after each install and on demand
+(`POST /api/wda/:udid/selftest`), and never when Lotus's page merely opens.
+
 ## What has to be seen on the Mac
 
 This was written on a PC with no Xcode. The additions were parsed with clang's Objective-C front end against
@@ -63,8 +77,11 @@ the real check:
    first error under `fork.perDevice.<udid>.reason`.
 2. **The token gate.** `curl -i http://127.0.0.1:<port>/status` on the Mac must show a bare `404` with
    `Content-Length: 0`; with `-H "X-Lotus-Token: …"` (the server has it) it answers.
-3. **The self-test.** `fork.perDevice.<udid>.live` in `GET /api/wda` says the mode it found and its notes.
-4. **A live drag** on the Phones page follows the pointer while the button is down.
+3. **The self-test.** `fork.perDevice.<udid>.live` in `GET /api/wda` says the mode it found (v2: 4, `kind:
+   "segmented"`, unless a hold mode works), each mode's result under `modes`, and its notes (for mode 4 the two
+   segments' touches, e.g. `'BMMEBMME'`, and how long both took to play: about 250-400 ms is fine).
+4. **A live drag** on the Phones page follows the pointer while the button is down (with mode 4, a few segments a
+   second, each about 100-150 ms behind the pointer); a list scrolls without flinging between segments.
 
 ## Turning it off from afar
 

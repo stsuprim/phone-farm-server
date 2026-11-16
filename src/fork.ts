@@ -49,6 +49,20 @@ export const TOKEN_HEADER = 'x-lotus-token';
 /** The environment variable our build is given its token in (xcodebuild passes TEST_RUNNER_<NAME> on as <NAME>). */
 export const TOKEN_ENV = 'LOTUS_WDA_TOKEN';
 /** Our build's routes. */
+/**
+ * The live-touch modes: 1-3 hold a finger down between requests (`/lotus/touch`, a mode each way of asking XCTest);
+ * 4 (2026-11-17, `LIVE_SEGMENTED`) plays the drag in short whole gestures as it happens (src/segments.ts), for a phone
+ * where none of 1-3 works (iOS 18: XCTest lifts every finger at the end of each record). 0: drags play on release.
+ */
+export const LIVE_SEGMENTED = 4;
+export const LIVE_MODES: Record<number, string> = { 0: 'none', 1: 'hold (plain)', 2: 'hold (persistent state)', 3: 'hold (persistent on every move)', 4: 'segmented' };
+/** One mode's result in the phone's self-test. */
+export interface LiveModeResult {
+  mode: number;
+  works: boolean;
+  why: string | null;
+}
+
 export const FORK_ROUTES = { info: '/lotus/info', gesture: '/lotus/gesture', touch: '/lotus/touch', shot: '/lotus/shot', selftest: '/lotus/selftest' } as const;
 
 /** What our build needs to be launched on one phone. */
@@ -185,10 +199,14 @@ export type ForkState = 'stock' | 'building' | 'installing' | 'fork' | 'waiting'
 export interface LiveTest {
   /** It ran (false: the WebDriverAgent app couldn't come to the front; tried again later). */
   tested: boolean;
-  /** The way of holding a finger down that works on this phone (1-3), 0 when none does. */
+  /** The live-touch mode that works on this phone (1-3 a held finger, 4 segmented), 0 when none does. */
   mode: number;
   why: string | null;
   notes?: string[];
+  /** Each mode's result (2026-11-17), what it is ('hold', 'segmented') and what started the test. */
+  modes?: LiveModeResult[];
+  kind?: 'hold' | 'segmented' | null;
+  trigger?: 'install' | 'retry' | 'demand';
   at: number;
   tries: number;
 }
@@ -223,6 +241,8 @@ export const RETRY_AFTER_MS = [2 * MIN, 5 * MIN, 15 * MIN, 30 * MIN, 60 * MIN, 1
 /** A self-test that couldn't run (the phone was dark or locked) is tried again this much later, this many times. */
 export const LIVE_RETRY_MS = 10 * MIN;
 export const LIVE_TRIES = 6;
+/** One self-test run tries this many times (woken again before each) before it says so. */
+export const SELFTEST_ATTEMPTS = 2;
 
 export function retryAfter(attempts: number): number {
   return RETRY_AFTER_MS[Math.min(Math.max(1, attempts), RETRY_AFTER_MS.length) - 1]!;
@@ -247,7 +267,12 @@ export interface ForkOptions {
   /** Restart the phone's runner as `flavor` and wait until it answers (or say why it didn't). */
   switchTo: (udid: string, flavor: WdaFlavor) => Promise<{ ok: boolean; why?: string }>;
   /** The phone's own live-touch self-test (our build's POST /lotus/selftest). */
-  selftest?: (udid: string) => Promise<{ tested: boolean; mode: number; why?: string | null; notes?: string[] }>;
+  selftest?: (udid: string) => Promise<SelfTestAnswer>;
+  /**
+   * Whether the phone is awake and unlocked now (2026-11-17: the self-test is only run on a phone that is; WDA's
+   * /wda/locked and a look at the screen). null: can't tell (the test goes ahead).
+   */
+  awake?: (udid: string) => Promise<boolean | null>;
   /** Phones plugged in now. */
   devices: () => Promise<string[]>;
   /** Before a build, an install or a self-test: wake the phone (a locked or dark one can refuse the install). */
@@ -262,6 +287,25 @@ export interface ForkOptions {
   /** How often the check runs (ms; default 60 s; 0 = never on its own: tests call tick()). */
   tickMs?: number;
   log?: (m: string) => void;
+}
+
+/** What the phone's /lotus/selftest answers. */
+export interface SelfTestAnswer {
+  tested: boolean;
+  mode: number;
+  why?: string | null;
+  notes?: string[];
+  modes?: LiveModeResult[];
+}
+
+/** A self-test's answer, made sure of: the mode one this server knows, each mode's result kept short. */
+export function readSelfTest(r: SelfTestAnswer): { tested: boolean; mode: number; modes: LiveModeResult[] } {
+  const mode = r.tested && Number.isInteger(r.mode) && r.mode >= 1 && r.mode <= LIVE_SEGMENTED ? r.mode : 0;
+  const modes = (Array.isArray(r.modes) ? r.modes : [])
+    .filter((m) => m && Number.isInteger(m.mode) && m.mode >= 1 && m.mode <= LIVE_SEGMENTED)
+    .slice(0, 8)
+    .map((m) => ({ mode: m.mode, works: m.works === true, why: typeof m.why === 'string' ? m.why.slice(0, 200) : null }));
+  return { tested: !!r.tested, mode, modes };
 }
 
 /** Keeps each phone's state and installs our build wherever it's missing or older than the repo's. */
@@ -450,20 +494,66 @@ export class ForkInstaller {
     return this.device(udid);
   }
 
-  /** The phone's own self-test of live touch; what it found is kept (and used from then on). */
-  private async liveTest(udid: string): Promise<void> {
-    if (!this.o.selftest) return;
-    const tries = (this.device(udid).live?.tries ?? 0) + 1;
-    let r: { tested: boolean; mode: number; why?: string | null; notes?: string[] };
-    try {
-      r = await this.o.selftest(udid);
-    } catch (err) {
-      r = { tested: false, mode: 0, why: (err as Error).message };
+  /**
+   * The phone's own self-test of live touch; what it found is kept (and used from then on). 2026-11-17: the phone is
+   * woken and unlocked first (the test puts a window of WDA's app over the screen: on a dark or locked phone it saw no
+   * touch at all), checked awake, and the test is run once more when it couldn't run or found no mode. Run only
+   * right after an install, when one couldn't run (retried later), or on demand (POST /api/wda/:udid/selftest).
+   */
+  private async liveTest(udid: string, trigger: 'install' | 'retry' | 'demand' = 'install'): Promise<LiveTest> {
+    if (!this.o.selftest) return { tested: false, mode: 0, why: 'the self-test is off (WDA_LIVE_TOUCH=off)', at: this.now(), tries: 0 };
+    const tries = (trigger === 'demand' ? 0 : this.device(udid).live?.tries ?? 0) + 1;
+    let r: SelfTestAnswer = { tested: false, mode: 0, why: 'not run' };
+    const notes: string[] = [];
+    for (let attempt = 1; attempt <= SELFTEST_ATTEMPTS; attempt++) {
+      const ready = await this.wakeForTest(udid);
+      if (ready) {
+        r = { tested: false, mode: 0, why: ready };
+        notes.push(`try ${attempt}: ${ready}`);
+        continue;
+      }
+      try {
+        r = await this.o.selftest(udid);
+      } catch (err) {
+        r = { tested: false, mode: 0, why: (err as Error).message };
+      }
+      if (r.notes?.length) notes.push(...r.notes.map((n) => `try ${attempt}: ${n}`));
+      if (r.tested && readSelfTest(r).mode) break;
     }
-    const mode = r.tested && Number.isInteger(r.mode) && r.mode >= 1 && r.mode <= 3 ? r.mode : 0;
-    this.set(udid, { live: { tested: !!r.tested, mode, why: r.tested ? (mode ? null : 'no way of holding a finger down worked on this phone: drags are played whole') : r.why ?? 'the self-test could not run', notes: r.notes?.slice(0, 6), at: this.now(), tries } });
+    const { tested, mode, modes } = readSelfTest(r);
+    const kind = mode >= 1 && mode <= 3 ? 'hold' : mode === LIVE_SEGMENTED ? 'segmented' : null;
+    const why = tested
+      ? mode
+        ? null
+        : 'no live-touch mode worked on this phone (not even segmented): drags are played whole'
+      : r.why ?? 'the self-test could not run';
+    this.set(udid, { live: { tested, mode, why, notes: notes.slice(-8), modes, kind, trigger, at: this.now(), tries } });
     const l = this.device(udid).live!;
-    this.log(`${udid.slice(-8)}: live touch self-test: ${l.tested ? (l.mode ? `mode ${l.mode} works (drags are live)` : 'no mode works (drags stay whole gestures)') : `not run (${l.why}); try ${tries} of ${LIVE_TRIES}`}${r.notes?.length ? ` [${r.notes.join('; ').slice(0, 400)}]` : ''}`);
+    this.log(`${udid.slice(-8)}: live touch self-test (${trigger}): ${l.tested ? (l.mode ? `mode ${l.mode} (${LIVE_MODES[l.mode]}) works` : 'no mode works (drags stay whole gestures)') : `not run (${l.why}); try ${tries} of ${LIVE_TRIES}`}${notes.length ? ` [${notes.join('; ').slice(0, 500)}]` : ''}`);
+    return l;
+  }
+
+  /** Wakes the phone for its self-test and checks it's awake: null when it is (or can't be told), else why not. */
+  private async wakeForTest(udid: string): Promise<string | null> {
+    let woke: string | null = null;
+    if (this.o.prepare) {
+      try {
+        await this.o.prepare(udid);
+      } catch (err) {
+        woke = (err as Error).message;
+      }
+    }
+    const awake = this.o.awake ? await this.o.awake(udid).catch(() => null) : null;
+    if (awake === false) return `the phone stayed locked or dark${woke ? ` (${woke})` : ''}`;
+    return null;
+  }
+
+  /** A self-test now, on demand (POST /api/wda/:udid/selftest): only on a phone running our build. */
+  async selftestNow(udid: string): Promise<LiveTest | { tested: false; why: string }> {
+    const d = this.devices[udid];
+    if (!d || d.state !== 'fork') return { tested: false, why: 'the phone is not running our WebDriverAgent build' };
+    if (!this.o.selftest) return { tested: false, why: 'the self-test is off (WDA_LIVE_TOUCH=off)' };
+    return this.liveTest(udid, 'demand');
   }
 
   private async liveRetry(udid: string): Promise<void> {
@@ -473,8 +563,7 @@ export class ForkInstaller {
     if (l && (l.tested || l.tries >= LIVE_TRIES || this.now() - l.at < LIVE_RETRY_MS)) return;
     // the self-test takes the screen for a few seconds and ends on the Home Screen: not under someone's hands
     if (this.o.busy?.(udid)) return;
-    await this.o.prepare?.(udid).catch(() => {});
-    await this.liveTest(udid);
+    await this.liveTest(udid, 'retry');
   }
 
   status(): ForkStatus {

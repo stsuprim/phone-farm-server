@@ -9,7 +9,9 @@
  *   POST /lotus/touch     one event of a live touch: {"phase": "down" | "move" | "up", "x": .., "y": .., "mode": 1-3}
  *                         The finger stays down on the phone between requests (see "Live touch" below).
  *   GET  /lotus/shot      one still as a JPEG: ?scale=1-100&quality=1-100 -> {"jpeg": "<base64>"}
- *   POST /lotus/selftest  finds out, on this phone, which way of holding a finger down works (see "Self-test")
+ *   POST /lotus/selftest  finds out, on this phone, which way of live touch works (see "Self-test"): a held
+ *                         finger (modes 1-3) or, v2 (2026-11-17), segmented drags (mode 4: short whole
+ *                         gestures the Mac's server sends through /lotus/gesture as the finger moves)
  *
  * Coordinates are points of the screen as the record's orientation says (the Mac's server sends portrait points
  * with "orientation": 1, turning a landscape touch onto the panel itself).
@@ -46,7 +48,7 @@
 #pragma clang diagnostic ignored "-Weverything"
 
 /** The version of our changes. The Mac's server installs this build on a phone whose build says another number. */
-static const NSInteger LotusForkVersion = 1;
+static const NSInteger LotusForkVersion = 2;
 static NSString *const LotusUpstreamTag = @"v16.15.3";
 
 /** How long one step of a live move takes on the phone (seconds): about a frame. */
@@ -487,14 +489,43 @@ static BOOL LotusLiveWatching = NO;
   return error.localizedDescription ?: @"XCTest refused the record";
 }
 
+/** Why a held-finger mode's run didn't give one clean touch, in words (for /api/wda and the control app status). */
++ (NSString *)lotus_whyDown:(NSString *)afterDown move:(NSString *)afterMove up:(NSString *)afterUp travelled:(double)travelled
+{
+  if (0 == afterUp.length) {
+    return @"no touch reached the test window (is the phone awake and unlocked?)";
+  }
+  if ([afterDown rangeOfString:@"E"].location != NSNotFound || [afterDown rangeOfString:@"C"].location != NSNotFound) {
+    return [NSString stringWithFormat:@"the press was lifted when its record ended ('%@'): XCTest ends every finger with its record", afterDown];
+  }
+  if (![afterDown isEqualToString:@"B"]) {
+    return [NSString stringWithFormat:@"the press gave '%@', not one begin", afterDown];
+  }
+  if (afterMove.length > 1 && [[afterMove substringFromIndex:1] rangeOfString:@"B"].location != NSNotFound) {
+    return [NSString stringWithFormat:@"the move began a new touch ('%@'): the contact did not survive between records", afterMove];
+  }
+  if (travelled < 30.0) {
+    return [NSString stringWithFormat:@"the touch moved only %.0f pt of 60 ('%@')", travelled, afterMove];
+  }
+  return [NSString stringWithFormat:@"the lift gave '%@'", afterUp];
+}
+
 /**
  POST /lotus/selftest: which mode of live touch works on this phone. The WebDriverAgent app comes to the front, puts
- a window of its own over the screen and touches it the way a live touch would (press, move, lift, as three
- records), watching what the window receives. A mode works when the window sees ONE touch: it begins once, moves
- without ending, and ends once at the lift. Nothing else on the phone is touched; afterwards the phone goes back
- to its Home Screen ({"home": false} leaves the app in front).
- -> {"tested": true, "mode": 0-3 (0: none works, the server keeps playing drags whole), "notes": [...]}
+ a window of its own over the screen and touches it, watching what the window receives.
+   modes 1-3 (a held finger): press, move, lift as three records. Works when the window sees ONE touch: it begins
+     once, moves without ending, and ends once at the lift.
+   mode 4 (segmented, v2, 2026-11-17): two short whole gestures one after the other, each press -> move -> a still
+     moment -> lift, the second starting where the first ended (what the Mac's server sends through /lotus/gesture as
+     a finger moves when no finger can be held). Works when the window sees two complete touches that moved.
+ The answer is the first of 1-3 that works, else 4 when it works, else 0. Every mode's result is said (`modes`).
+ The Mac's server wakes and unlocks the phone before it asks (v1 also ran on a locked phone, which saw nothing).
+ Nothing else on the phone is touched; afterwards the phone goes back to its Home Screen ({"home": false} leaves the
+ app in front).
+ -> {"tested": true, "mode": 0-4, "modes": [{"mode", "works", "why"}], "notes": [...]}
  -> {"tested": false, "why": "..."} when the app couldn't come to the front (a locked or dark phone): try later.
+ TO VERIFY ON THE MAC (v2): it compiles; GET /api/wda shows fork.perDevice.<udid>.live.mode 4 (or 1-3) and each
+ mode's "why"; a drag on the Phones page moves on the phone while the pointer moves.
  */
 + (id<FBResponsePayload>)handleLotusSelfTest:(FBRouteRequest *)request
 {
@@ -544,13 +575,16 @@ static BOOL LotusLiveWatching = NO;
   CGSize size = window.bounds.size;
   CGPoint a = CGPointMake(floor(size.width / 2.0), floor(size.height / 2.0));
   CGPoint b = CGPointMake(a.x, a.y + 60.0);
+  CGPoint c = CGPointMake(a.x, a.y + 120.0);
   long long orientation = (long long)scene.interfaceOrientation;
   if (orientation < (long long)UIInterfaceOrientationPortrait || orientation > (long long)UIInterfaceOrientationLandscapeLeft) {
     orientation = (long long)UIInterfaceOrientationPortrait;
   }
   NSMutableArray<NSString *> *notes = [NSMutableArray array];
+  NSMutableArray<NSDictionary *> *modes = [NSMutableArray array];
   NSInteger found = 0;
-  for (NSInteger mode = 1; mode <= 3 && 0 == found; mode++) {
+  // 1-3: a held finger. Each is tried even after one works, so every mode's result is said.
+  for (NSInteger mode = 1; mode <= 3; mode++) {
     [probe.seen setString:@""];
     NSString *e1 = [self lotus_play:[self lotus_recordFrom:a to:a seconds:0 lift:NO begins:(mode >= 2) ends:NO orientation:orientation]];
     [self lotus_spin:0.35];
@@ -568,18 +602,75 @@ static BOOL LotusLiveWatching = NO;
     BOOL lifted = afterUp.length > afterMove.length && [afterUp hasPrefix:afterMove] && [afterUp hasSuffix:@"E"]
       && [self lotus_text:[afterUp substringWithRange:NSMakeRange(afterMove.length, afterUp.length - afterMove.length - 1)] only:@"M"];
     BOOL good = nil == e1 && nil == e2 && nil == e3 && pressed && dragged && lifted;
-    [notes addObject:[NSString stringWithFormat:@"mode %ld: press '%@' move '%@' (%.0f pt) lift '%@'%@%@%@ -> %@", (long)mode,
-                      afterDown, afterMove, travelled, afterUp,
-                      nil != e1 ? [@" press: " stringByAppendingString:e1] : @"",
-                      nil != e2 ? [@" move: " stringByAppendingString:e2] : @"",
-                      nil != e3 ? [@" lift: " stringByAppendingString:e3] : @"",
-                      good ? @"works" : @"no"]];
-    if (good) {
+    NSString *why = nil;
+    if (!good) {
+      if (nil != e1) {
+        why = [@"XCTest refused the press: " stringByAppendingString:e1];
+      } else if (nil != e2) {
+        why = [@"XCTest refused the move: " stringByAppendingString:e2];
+      } else if (nil != e3) {
+        why = [@"XCTest refused the lift: " stringByAppendingString:e3];
+      } else {
+        why = [self lotus_whyDown:afterDown move:afterMove up:afterUp travelled:travelled];
+      }
+    }
+    [modes addObject:@{@"mode": @(mode), @"works": @(good), @"why": (nil != why ? why : (id)[NSNull null])}];
+    [notes addObject:[NSString stringWithFormat:@"mode %ld: press '%@' move '%@' (%.0f pt) lift '%@' -> %@", (long)mode,
+                      afterDown, afterMove, travelled, afterUp, good ? @"works" : why]];
+    if (good && 0 == found) {
       found = mode;
-    } else {
+    }
+    if (!good) {
       // whatever this mode left behind, no finger of ours stays down for the next one
       [self lotus_play:[self lotus_recordFrom:b to:b seconds:0 lift:YES begins:NO ends:YES orientation:orientation]];
       [self lotus_spin:0.3];
+    }
+  }
+  // 4: segmented. Two whole gestures, a -> b then b -> c, each still for a moment before its lift, as the server
+  // sends them (src/segments.ts); played one after the other like the phone's queue does.
+  {
+    [probe.seen setString:@""];
+    XCPointerEventPath *p1 = [[XCPointerEventPath alloc] initForTouchAtPoint:a offset:0];
+    [p1 moveToPoint:b atOffset:0.08];
+    [p1 liftUpAtOffset:0.11];
+    XCSynthesizedEventRecord *r1 = [[XCSynthesizedEventRecord alloc] initWithName:@"Lotus self-test segment" interfaceOrientation:orientation];
+    [r1 addPointerEventPath:p1];
+    XCPointerEventPath *p2 = [[XCPointerEventPath alloc] initForTouchAtPoint:b offset:0];
+    [p2 moveToPoint:c atOffset:0.08];
+    [p2 liftUpAtOffset:0.11];
+    XCSynthesizedEventRecord *r2 = [[XCSynthesizedEventRecord alloc] initWithName:@"Lotus self-test segment" interfaceOrientation:orientation];
+    [r2 addPointerEventPath:p2];
+    CFAbsoluteTime t0 = CFAbsoluteTimeGetCurrent();
+    NSString *e1 = [self lotus_play:r1];
+    NSString *e2 = [self lotus_play:r2];
+    double ms = (CFAbsoluteTimeGetCurrent() - t0) * 1000.0;
+    [self lotus_spin:0.35];
+    NSString *seen = [probe.seen copy];
+    double travelled = hypot(probe.lastAt.x - probe.beganAt.x, probe.lastAt.y - probe.beganAt.y);
+    // two touches, each "B", moves, "E" (e.g. "BMMEBMME"); the second began at b, so it travelled about 60 pt
+    NSUInteger complete = 0;
+    for (NSString *t in [seen componentsSeparatedByString:@"E"]) {
+      if (t.length > 1 && [t hasPrefix:@"B"] && [self lotus_text:[t substringFromIndex:1] only:@"M"]) {
+        complete++;
+      }
+    }
+    BOOL good = nil == e1 && nil == e2 && 2 == complete && [seen hasSuffix:@"E"] && travelled >= 30.0;
+    NSString *why = nil;
+    if (!good) {
+      if (nil != e1) {
+        why = [@"XCTest refused the first segment: " stringByAppendingString:e1];
+      } else if (nil != e2) {
+        why = [@"XCTest refused the second segment: " stringByAppendingString:e2];
+      } else if (0 == seen.length) {
+        why = @"no touch reached the test window (is the phone awake and unlocked?)";
+      } else {
+        why = [NSString stringWithFormat:@"the two segments gave '%@' (%.0f pt)", seen, travelled];
+      }
+    }
+    [modes addObject:@{@"mode": @4, @"works": @(good), @"why": (nil != why ? why : (id)[NSNull null])}];
+    [notes addObject:[NSString stringWithFormat:@"mode 4 (segmented): '%@' (%.0f pt, both played in %.0f ms) -> %@", seen, travelled, ms, good ? @"works" : why]];
+    if (good && 0 == found) {
+      found = 4;
     }
   }
   window.hidden = YES;
@@ -590,7 +681,7 @@ static BOOL LotusLiveWatching = NO;
     [[XCUIDevice sharedDevice] fb_goToHomescreenWithError:NULL];
   }
   [FBLogger logFmt:@"Lotus: live touch self-test: mode %ld (%@)", (long)found, [notes componentsJoinedByString:@"; "]];
-  return FBResponseWithObject(@{@"lotus": @(LotusForkVersion), @"tested": @YES, @"mode": @(found), @"notes": notes});
+  return FBResponseWithObject(@{@"lotus": @(LotusForkVersion), @"tested": @YES, @"mode": @(found), @"modes": modes, @"notes": notes});
 }
 
 #pragma mark - Info and stills

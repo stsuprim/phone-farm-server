@@ -23,7 +23,7 @@ export interface ServerExtras {
   idle?: IdleLock;
   resigner?: WdaResigner;
   /** Our own WebDriverAgent build (src/fork.ts): its state per phone, said in GET /api/wda as `fork`. */
-  fork?: { status(): unknown };
+  fork?: { status(): unknown; selftestNow?(udid: string): Promise<unknown> };
   /** How often a watched phone's WDA and lock state are checked (ms; default WATCH_MS; 0 = never on its own). */
   watchMs?: number;
   /** Seed of natural touch's randomness (tests); default a random one. */
@@ -524,6 +524,15 @@ export function createServer(backend: Backend, token: string, updater?: Updater,
       if (path === '/api/wda' || path === '/wda') {
         if (req.method !== 'GET') throw new HttpError(405, 'use GET');
         return send(res, 200, wdaStatus());
+      }
+      // 2026-11-17: the live-touch self-test of one phone on our build, now (it wakes and unlocks the phone first)
+      const st = /^\/(?:api\/)?wda\/([^/]+)\/selftest$/.exec(path);
+      if (st) {
+        if (req.method !== 'POST') throw new HttpError(405, 'use POST');
+        if (!extras.fork?.selftestNow) return send(res, 503, { error: 'our WebDriverAgent build is not in use on this server' });
+        const udid = decodeURIComponent(st[1]!);
+        await phoneFor(udid);
+        return send(res, 200, { ok: true, udid, live: await extras.fork.selftestNow(udid) });
       }
       if (path === '/api/wda/resign' || path === '/wda/resign') {
         if (req.method !== 'POST') throw new HttpError(405, 'use POST');

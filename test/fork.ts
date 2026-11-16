@@ -280,6 +280,24 @@ const fakeSpawn = ((cmd: string, args: string[], opts: { env?: NodeJS.ProcessEnv
     assert.deepEqual(ours.hits.slice(n).map((h) => [h.path, h.body.phase, h.body.x, h.body.y, h.body.mode, h.body.orientation]), [
       ['/lotus/touch', 'down', 100, 300, 2, 1], ['/lotus/touch', 'move', 100, 320.3, 2, 1], ['/lotus/touch', 'move', 100, 350, 2, 1], ['/lotus/touch', 'up', 100, 350, 2, 1],
     ], 'down, the moves in order, up: one contact, each event its own request');
+    // 2026-11-17, mode 4 (segmented, src/segments.ts): no /lotus/touch at all; the drag goes in short whole gestures
+    // while it happens (the first one before the finger lifts), each starting where the last ended
+    liveMode = 4;
+    const n4 = ours.hits.length;
+    await m.liveTouch('U1', 'down', 100, 300);
+    assert.equal(ours.hits.length, n4, 'a press alone sends nothing yet (a tap or a long press goes whole)');
+    await sleep(90);
+    await m.liveTouch('U1', 'move', 100, 330);
+    assert.equal(ours.hits.length, n4 + 1, 'a segment goes while the finger is still down');
+    await sleep(250);
+    await m.liveTouch('U1', 'up', 100, 360);
+    const segs = ours.hits.slice(n4);
+    assert.deepEqual(segs.map((h) => h.path), ['/lotus/gesture', '/lotus/gesture']);
+    const [s1, s2] = segs.map((h) => h.body as { points: number[][]; hold: number; orientation: number });
+    assert.deepEqual([s1!.points[0], s1!.points.at(-1)!.slice(0, 2), s1!.hold, s1!.orientation], [[100, 300, 0], [100, 330], 30, 1], 'the first: from the press, still a moment before its lift');
+    assert.ok(s1!.points.at(-1)![2]! >= 80, 'at the pace it was made');
+    assert.deepEqual([s2!.points[0], s2!.points.at(-1)!.slice(0, 2), s2!.hold], [[100, 330, 0], [100, 360], 0], 'the last: from where the first ended, lifting as the finger did');
+    liveMode = 2;
     // XCTest refused a live record on the phone: said once, and live touch is left alone until the runner restarts
     ours.failedOnce = 'XCTest refused the record';
     await assert.rejects(m.liveTouch('U1', 'down', 5, 5), /could not play the live touch/);
@@ -373,8 +391,8 @@ const fakeSpawn = ((cmd: string, args: string[], opts: { env?: NodeJS.ProcessEnv
   assert.deepEqual([f.flavorAtStart('A'), f.due('A'), f.liveMode('A')], ['stock', true, 0]);
   await f.tick();
   assert.deepEqual([...calls], [
-    'wake A', 'build A', 'wake A', 'switch A fork', 'selftest A',
-    'wake B', 'build B', 'wake B', 'switch B fork', 'selftest B',
+    'wake A', 'build A', 'wake A', 'switch A fork', 'wake A', 'selftest A',
+    'wake B', 'build B', 'wake B', 'switch B fork', 'wake B', 'selftest B',
   ]);
   assert.equal(signed, 2, 'the re-sign schedule hears of each fresh sign');
   let st = f.status();
@@ -474,7 +492,7 @@ const fakeSpawn = ((cmd: string, args: string[], opts: { env?: NodeJS.ProcessEnv
   f = make(4);
   await f.tick();
   assert.equal(f.liveMode('A'), 0);
-  assert.match(f.status().perDevice.A!.live?.why ?? '', /no way of holding a finger down worked/);
+  assert.match(f.status().perDevice.A!.live?.why ?? '', /no live-touch mode worked/);
   calls.length = 0;
   now += 60 * 60_000;
   await f.tick();

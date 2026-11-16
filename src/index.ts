@@ -86,6 +86,11 @@ const fork = real
       selftest: cfg.wdaLiveTouch === 'off' ? undefined : (udid) => real.wdaSelftest(udid),
       devices: onlinePhones,
       prepare: (udid) => idle.wake(udid),
+      // 2026-11-17: the self-test runs only on a phone that's awake and unlocked (WDA's word and a look at the screen)
+      awake: async (udid) => {
+        const l = await real.isLocked(udid).catch(() => null);
+        return l === null ? null : !l;
+      },
       signed: () => resignerRef?.refresh(),
       busy: (udid) => {
         const s = idle.state(udid);

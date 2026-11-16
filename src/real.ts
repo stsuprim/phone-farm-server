@@ -625,7 +625,7 @@ export class RealBackend implements Backend {
   }
 
   /** The phone's own live-touch self-test (our build). */
-  wdaSelftest(udid: string): Promise<{ tested: boolean; mode: number; why?: string | null; notes?: string[] }> {
+  wdaSelftest(udid: string): ReturnType<WdaManager['selftest']> {
     return this.wda.selftest(udid);
   }
 
