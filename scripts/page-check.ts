@@ -5,7 +5,11 @@
 // in the middle and Lotus's chat on the right, the open phone goes live over WebRTC (its card shows fps and latency),
 // a click on another card switches, and a server that stops answering gets "Reconnecting" and the picture back.
 //
-//   npx tsx scripts/page-check.ts [--ui <Lotus's source/modules/phones/ui folder>] [--browser <exe>] [--seconds 6]
+//   npx tsx scripts/page-check.ts [--ui <Lotus's source/modules/phones/ui folder>] [--browser <exe>] [--seconds 6] [--live]
+//
+// --live: the mock phones take live touch (as a phone with CoreDevice HID does), and the owner's drag is checked end
+// to end: a press, a curved drag, a hold of 2.5 s, more dragging and the release reach the phone as ONE contact, in
+// order, while they happen.
 //
 // Not part of npm test (it needs a browser). Exit code 1 when a check fails.
 import { spawn } from 'node:child_process';
@@ -51,7 +55,8 @@ if (!browser) {
 }
 
 const token = crypto.randomBytes(16).toString('hex');
-const backend = new MockBackend(2, { h264KeySeconds: 2, h264IdleMs: 60_000 });
+const liveTouch = args.includes('--live');
+const backend = new MockBackend(2, { h264KeySeconds: 2, h264IdleMs: 60_000, live: liveTouch });
 const server = createServer(backend, token, undefined, { focusLockMs: 300 });
 await new Promise<void>((r) => server.listen(0, '127.0.0.1', r));
 const serverPort = (server.address() as AddressInfo).port;
@@ -280,7 +285,44 @@ try {
   await evalJs(`(() => { const el = document.querySelector('.ph-screen'), r = el.getBoundingClientRect(); const ev = (t) => el.dispatchEvent(new PointerEvent(t, { bubbles: true, pointerId: 7, button: 0, clientX: r.left + r.width / 2, clientY: r.top + r.height / 2 })); ev('pointerdown'); setTimeout(() => ev('pointerup'), 80); })()`);
   await sleep(1200);
   const log = ((backend as any).live(now.udid).log as string[]).slice(-3).join(' | ');
-  check(/tap /.test(log), `a press on the picture reaches the phone (${log})`);
+  check(liveTouch ? /down .*\| up /.test(log) : /tap /.test(log), `a press on the picture reaches the phone (${log})`);
+
+  // ---- the owner's drag (--live): one contact from the press to the release, while it happens ----
+  if (liveTouch) {
+    const phoneLog = (backend as any).live(now.udid).log as string[];
+    const from = phoneLog.length;
+    const stamps: number[] = [];
+    const push = phoneLog.push.bind(phoneLog);
+    phoneLog.push = (...a: string[]) => (stamps.push(performance.now()), push(...a)); // when each event reached the phone
+    const t0 = performance.now();
+    // down at the lower middle; up the screen in an arc over 0.6 s; held still 2.5 s (longer than the old 1.5 s
+    // auto-release); then to the left over 0.4 s; released there
+    await evalJs(`(() => {
+      const el = document.querySelector('.ph-screen'), r = el.getBoundingClientRect();
+      const ev = (t, fx, fy) => el.dispatchEvent(new PointerEvent(t, { bubbles: true, pointerId: 9, button: 0, clientX: r.left + r.width * fx, clientY: r.top + r.height * fy }));
+      const at = (ms, f) => setTimeout(f, ms);
+      ev('pointerdown', 0.5, 0.8);
+      for (let i = 1; i <= 12; i++) at(i * 50, () => ev('pointermove', 0.5 + 0.1 * Math.sin(i / 4), 0.8 - i * 0.04));
+      for (let i = 1; i <= 8; i++) at(3100 + i * 50, () => ev('pointermove', 0.5 + 0.1 * Math.sin(3) - i * 0.04, 0.32));
+      at(3600, () => ev('pointerup', 0.5 + 0.1 * Math.sin(3) - 0.32, 0.32));
+    })()`);
+    await sleep(4600);
+    const got = phoneLog.slice(from);
+    const when = stamps.map((t) => Math.round(t - t0));
+    const downs = got.filter((l) => l.startsWith('down')).length;
+    const ups = got.filter((l) => l.startsWith('up')).length;
+    const moves = got.slice(1, -1);
+    const ys = moves.map((l) => Number(l.split(',')[1]));
+    check(downs === 1 && ups === 1 && got[0]?.startsWith('down') && got[got.length - 1]?.startsWith('up'), `a drag is one contact: one down, one up (${downs} down, ${ups} up, ${got.length} events)`);
+    check(moves.length >= 12 && moves.every((l) => l.startsWith('move')), `its moves reach the phone between them (${moves.length} moves)`);
+    check(ys.every((y, i) => i === 0 || y <= ys[i - 1]! + 0.5), 'in order (never back down the screen)');
+    check(when[1]! < 400 && when.some((t) => t > 700 && t < 3000) && when[when.length - 1]! > 3400, `while they happen: the first move after ${when[1]} ms, the contact said again during the hold, the up after ${when[when.length - 1]} ms`);
+    const end = got[got.length - 1]!.split(' ')[1]!.split(',').map(Number);
+    const want = [(0.5 + 0.1 * Math.sin(3) - 0.32) * 390, 0.32 * 844];
+    check(Math.abs(end[0]! - want[0]!) <= 4 && Math.abs(end[1]! - want[1]!) <= 4, `released where the pointer was (${end.join(',')} for ${want.map(Math.round).join(',')})`);
+    const stats = String(await evalJs(`window.__tools.find((t) => t.name === "stats").run()`));
+    check(/"controlLink":\{/.test(stats), 'phones_stats has the control link');
+  }
 
   // ---- the server's WebRTC session dies under the page: it heals itself, the last frame staying up ----
   await evalJs(`(() => { window.__seen = []; window.__t = setInterval(() => { const s = __see(); __seen.push([s.rows.find((r) => r.on)?.state, s.chip, !s.video.hidden || !s.canvas.hidden, s.cover].join("/")); }, 250); })()`);
