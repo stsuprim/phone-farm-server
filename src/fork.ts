@@ -363,6 +363,13 @@ export interface SelfTestAnswer {
   modes?: LiveModeResult[];
 }
 
+/** Whether one self-test's pick is better than another's: any mode beats none, a lower mode wins, then a smaller gap. */
+export function betterLive(a: { mode: number; gapMs: number }, b: { mode: number; gapMs: number }): boolean {
+  if (!a.mode) return false;
+  if (!b.mode) return true;
+  return a.mode < b.mode || (a.mode === b.mode && a.gapMs < b.gapMs);
+}
+
 /**
  * A self-test's answer, made sure of: modes this server knows, each mode's result kept short, and the mode (and gap)
  * picked by this server from every result (pickLiveMode). An answer without results (an older build) keeps its mode.
@@ -584,6 +591,7 @@ export class ForkInstaller {
     if (!this.o.selftest) return { tested: false, mode: 0, why: 'the self-test is off (WDA_LIVE_TOUCH=off)', at: this.now(), tries: 0 };
     const tries = (trigger === 'demand' ? 0 : this.device(udid).live?.tries ?? 0) + 1;
     let r: SelfTestAnswer = { tested: false, mode: 0, why: 'not run' };
+    let best: SelfTestAnswer | null = null;
     const notes: string[] = [];
     for (let attempt = 1; attempt <= SELFTEST_ATTEMPTS; attempt++) {
       const ready = await this.wakeForTest(udid);
@@ -598,8 +606,14 @@ export class ForkInstaller {
         r = { tested: false, mode: 0, why: (err as Error).message };
       }
       if (r.notes?.length) notes.push(...r.notes.map((n) => `try ${attempt}: ${n}`));
-      if (r.tested && readSelfTest(r).mode) break;
+      if (!r.tested) continue;
+      const got = readSelfTest(r);
+      if (!best || betterLive(got, readSelfTest(best))) best = r;
+      // a hold mode or mode 4 found: done. Mode 5 while mode 4 also ran (and failed, perhaps by chance): one more
+      // try, keeping the better (mode 4 wins if either shows it working), so a phone like iPhone-2 isn't left gapped.
+      if (got.mode && !(got.mode === LIVE_GAPPED && got.modes.some((m) => m.mode === LIVE_SEGMENTED))) break;
     }
+    if (best) r = best;
     const { tested, mode, gapMs, modes } = readSelfTest(r);
     const kind = mode >= 1 && mode <= 3 ? 'hold' : mode === LIVE_SEGMENTED || mode === LIVE_GAPPED ? 'segmented' : null;
     const why = tested

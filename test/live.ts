@@ -269,6 +269,39 @@ const tick = () => new Promise((r) => setImmediate(r));
   assert.deepEqual(calls, ['wake A', 'awake? A', 'selftest A']);
   assert.deepEqual([live.mode, live.kind, live.trigger, live.tries], [2, 'hold', 'demand', 1]);
   assert.deepEqual(await f.selftestNow('B'), { tested: false, why: 'the phone is not running our WebDriverAgent build' });
+  // v3: mode 5 picked while mode 4 also ran (and failed, perhaps by chance, as iPhone-2 might): one more try, the
+  // better kept: mode 4 wins when either try shows it working
+  const m4fail = { mode: 4, works: false, why: 'x', seen: 'BMMMMMMMME', gapMs: 0 };
+  const m4ok = { mode: 4, works: true, why: null, seen: 'BMMEBMME', gapMs: 0 };
+  const m5ok = { mode: 5, works: true, why: null, seen: 'BMMEBMME', gapMs: 40 };
+  const m5ok100 = { mode: 5, works: true, why: null, seen: 'BMMEBMME', gapMs: 100 };
+  calls.length = 0;
+  answers = [{ tested: true, mode: 5, modes: [m4fail, m5ok] }, { tested: true, mode: 4, modes: [m4ok, m5ok] }];
+  live = (await f.selftestNow('A')) as typeof live;
+  assert.deepEqual(calls, ['wake A', 'awake? A', 'selftest A', 'wake A', 'awake? A', 'selftest A'], 'a second try after a gapped pick');
+  assert.deepEqual([live.mode, live.gapMs, f.liveMode('A'), f.liveGap('A')], [4, undefined, 4, 0], 'mode 4 from the second try wins');
+  // ...and the first try's mode 4 is kept when the second does worse
+  answers = [{ tested: true, mode: 4, modes: [m4ok, m5ok] }];
+  live = (await f.selftestNow('A')) as typeof live;
+  assert.equal(live.mode, 4, 'mode 4 found at once: no second try needed');
+  answers = [{ tested: true, mode: 5, modes: [m4fail, m5ok] }, { tested: true, mode: 0, modes: [m4fail] }];
+  live = (await f.selftestNow('A')) as typeof live;
+  assert.deepEqual([live.mode, live.gapMs], [5, 40], 'the better of the two kept when the second finds less');
+  answers = [{ tested: true, mode: 5, modes: [m4fail, m5ok100] }, { tested: true, mode: 5, modes: [m4fail, m5ok] }];
+  live = (await f.selftestNow('A')) as typeof live;
+  assert.deepEqual([live.mode, live.gapMs, f.liveGap('A')], [5, 40, 40], 'both gapped: the smaller gap');
+  // iPhone-1's case, mode 4 failing twice: mode 5 is kept after the second try
+  calls.length = 0;
+  answers = [{ tested: true, mode: 5, modes: [m4fail, m5ok100] }, { tested: true, mode: 5, modes: [m4fail, m5ok100] }];
+  live = (await f.selftestNow('A')) as typeof live;
+  assert.equal(calls.filter((c) => c.startsWith('selftest')).length, 2);
+  assert.deepEqual([live.mode, live.gapMs, live.kind], [5, 100, 'segmented']);
+  // a gapped pick with no mode 4 run at all: no second try
+  calls.length = 0;
+  answers = [{ tested: true, mode: 5, modes: [m5ok] }];
+  live = (await f.selftestNow('A')) as typeof live;
+  assert.deepEqual([calls.filter((c) => c.startsWith('selftest')).length, live.mode], [1, 5]);
+  ok('self-test (v3): a gapped pick while mode 4 ran gets a second try; mode 4 wins if either try shows it working');
   // a page that only opens never runs it: nothing but an install, a due retry or a request does
   calls.length = 0;
   now += 60 * 60_000;
