@@ -99,6 +99,15 @@ interface Entry {
   /** Our build's runner ended this many times in a row without staying up FORK_STABLE_MS, and when it last came up. */
   forkFails: number;
   readyAt: number;
+  /** 2026-11-18, restarts: the attempt of the restart now under way or last made (0: none since WDA was last fine). */
+  attempt: number;
+  /** The restart in progress (one per phone: every caller joins it) and when it began. */
+  restartP?: Promise<void>;
+  restartSince: number;
+  /** Why control is down after the restarts gave up; null otherwise (a recover or WDA answering again clears it). */
+  downWhy: string | null;
+  /** Bumped by start() and stop(): a restart begun before stops at its next step. */
+  epoch: number;
 }
 
 /** One self-heal: when (ms since the epoch) and why. */
@@ -125,6 +134,20 @@ export interface WdaTimeouts {
   missSpan?: number;
   /** A control state other than "ready" is said only once it lasted this long (ms; default CONTROL_DEBOUNCE_MS). */
   debounce?: number;
+  /** Before a restart: /status asked this many times, and every one unanswered (default DEAD_PROBES)... */
+  probes?: number;
+  /** ...one this long after the start of the last (ms; default PROBE_EVERY_MS). */
+  probeEvery?: number;
+  /** Waits between restart attempts (ms; default RESTART_BACKOFF_MS)... */
+  backoff?: number[];
+  /** ...and at most this many attempts before control is down (default RESTART_ATTEMPTS). */
+  attempts?: number;
+  /** A restarted WDA that answers gets this long to make its session (ms; default SESSION_WAIT_MS). */
+  sessionWait?: number;
+  /** A recover asked for waits this long for a restart before it answers with the state as it is (ms; default RECOVER_WAIT_MS). */
+  recoverWait?: number;
+  /** A call waits this long for a WDA that's starting before it answers 503 (ms; default START_WAIT_MS). */
+  startWait?: number;
 }
 export const DEFAULT_TIMEOUTS: WdaTimeouts = { input: 8000, launch: 20000, probe: 3000, restart: 90000 };
 /**
@@ -140,6 +163,40 @@ export const MISSES = 3;
 export const MISS_SPAN_MS = 15_000;
 export const STATUS_MS = 2500;
 export const CONTROL_DEBOUNCE_MS = 4000;
+/**
+ * 2026-11-18, "it restarts too much" (and one restart left iPhone-2 "recovering" for 10+ minutes with every call
+ * timing out): WDA is restarted only once it's really dead: /status asked DEAD_PROBES times, PROBE_EVERY_MS apart
+ * (about 12-15 s), none answered and nothing else from WDA answered meanwhile. A slow or failed action never
+ * restarts anything by itself. One restart at a time per phone (everyone joins it), every step bounded; calls
+ * meanwhile get a 503 at once. Attempts wait RESTART_BACKOFF_MS between them, at most RESTART_ATTEMPTS, then the
+ * phone's control is "down" with the last error until a recover, or WDA answering again.
+ */
+export const DEAD_PROBES = 4;
+export const PROBE_EVERY_MS = 4000;
+export const RESTART_BACKOFF_MS = [5000, 15000, 60000];
+export const RESTART_ATTEMPTS = 4;
+export const SESSION_WAIT_MS = 20_000;
+export const RECOVER_WAIT_MS = 20_000;
+export const START_WAIT_MS = 1000;
+/** A launched runner's WDA gets this long (by the clock) to answer /status before the runner is given up on. */
+const START_MS = 180_000;
+
+/** `p`, or `onTimeout()`'s error after `ms` (`p` still runs; its end is ignored). */
+function within<T>(p: Promise<T>, ms: number, onTimeout: () => Error): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const t = setTimeout(() => reject(onTimeout()), ms);
+    p.then(
+      (v) => {
+        clearTimeout(t);
+        resolve(v);
+      },
+      (err) => {
+        clearTimeout(t);
+        reject(err);
+      },
+    );
+  });
+}
 
 const newAgent = () => new http.Agent({ keepAlive: true, maxSockets: 6 });
 type HttpErr = Error & { code?: string };
@@ -336,14 +393,49 @@ export class WdaManager {
    * How WDA's own link is doing, for the phone's stats (`stats.controlLink.wda`): the state as told (debounced) and
    * as it is, liveness checks missed in a row, recoveries and runner restarts so far, ms since WDA last answered.
    */
-  linkHealth(udid: string): { state: ControlState; raw: ControlState; misses: number; recoveries: number; runnerRestarts: number; answeredMsAgo: number | null; busy: number } | null {
+  linkHealth(udid: string): { state: ControlState; raw: ControlState; misses: number; recoveries: number; runnerRestarts: number; answeredMsAgo: number | null; busy: number; restarting: { attempt: number; of: number; since: number } | null; controlDown: string | null } | null {
     const e = this.entries.get(udid);
     if (!e) return null;
     return {
-      state: this.state(udid), raw: !e.wanted ? 'down' : e.status === 'starting' ? 'recovering' : e.status !== 'ready' ? 'down' : e.control,
+      state: this.state(udid), raw: !e.wanted || e.downWhy ? 'down' : e.status === 'starting' ? 'recovering' : e.status !== 'ready' ? 'down' : e.control,
       misses: e.misses, recoveries: e.recoveries, runnerRestarts: e.runnerRestarts,
       answeredMsAgo: e.lastAnswer ? Date.now() - e.lastAnswer : null, busy: e.busy + e.inflight,
+      restarting: this.restarting(udid), controlDown: e.downWhy,
     };
+  }
+
+  /** The restart under way now: which attempt of how many, and since when; null when none is. */
+  restarting(udid: string): { attempt: number; of: number; since: number } | null {
+    const e = this.entries.get(udid);
+    return e?.restartP ? { attempt: Math.max(1, e.attempt), of: this.maxAttempts, since: e.restartSince } : null;
+  }
+
+  /** Why the phone's control is down after its restarts gave up; null otherwise. */
+  controlDown(udid: string): string | null {
+    return this.entries.get(udid)?.downWhy ?? null;
+  }
+
+  private get maxAttempts(): number {
+    return this.timeouts.attempts ?? RESTART_ATTEMPTS;
+  }
+
+  /**
+   * Throws a 503 at once while the phone's WDA is being restarted, or its control is down after the restarts gave up:
+   * `{error: "The phone's control link is restarting (attempt N)", state: "restarting"}` or "control down: ...".
+   */
+  gate(udid: string): void {
+    const e = this.entries.get(udid);
+    if (!e || !e.wanted) return;
+    if (e.restartP) throw this.restartingError(e);
+    if (e.downWhy) throw this.controlDownError(e);
+  }
+
+  private restartingError(e: Entry): HttpError {
+    return new HttpError(503, `The phone's control link is restarting (attempt ${Math.max(1, e.attempt)})`, { state: 'restarting' });
+  }
+
+  private controlDownError(e: Entry): HttpError {
+    return new HttpError(503, `control down: ${e.downWhy}`, { state: 'down' });
   }
 
   /** `control` changes here, so when it left "ready" is known (state() says a state only once it lasted). */
@@ -377,8 +469,8 @@ export class WdaManager {
    */
   state(udid: string): ControlState {
     const e = this.entries.get(udid);
-    if (!e || !e.wanted) return 'down';
-    if (e.status === 'starting') return 'recovering';
+    if (!e || !e.wanted || e.downWhy) return 'down';
+    if (e.restartP || e.status === 'starting') return 'recovering';
     if (e.status !== 'ready') return 'down';
     if (e.control !== 'ready' && Date.now() - e.unreadyAt < (this.timeouts.debounce ?? CONTROL_DEBOUNCE_MS)) return 'ready';
     return e.control;
@@ -415,7 +507,12 @@ export class WdaManager {
       mjpeg: { ...DEFAULT_MJPEG }, agent: newAgent(), heals: 0, lastHeal: null, inflight: 0,
       busy: 0, lastAnswer: 0, misses: 0, missAt: 0, unreadyAt: 0, recoveries: 0, runnerRestarts: 0,
       flavor: 'stock', forkInfo: null, switching: false, launchError: null, liveFailed: null, forkFails: 0, readyAt: 0,
+      attempt: 0, restartSince: 0, downWhy: null, epoch: 0,
     };
+    e.epoch++;
+    e.attempt = 0;
+    e.downWhy = null;
+    e.restartP = undefined;
     // ours when it was installed on this phone and ran (src/fork.ts), else the stock one
     e.flavor = this.fork?.flavorAtStart(udid) ?? 'stock';
     e.wanted = true;
@@ -429,6 +526,10 @@ export class WdaManager {
     e.wanted = false;
     e.status = 'stopped';
     e.control = 'down';
+    e.epoch++;
+    e.restartP = undefined;
+    e.attempt = 0;
+    e.downWhy = null;
     this.killProcs(e);
   }
 
@@ -449,8 +550,12 @@ export class WdaManager {
   restartRunner(udid: string): void {
     const e = this.entries.get(udid);
     if (!e?.wanted) return;
+    // a restart under way launches the fresh build anyway
+    if (e.restartP) return void this.log(e, 'a fresh WDA build is in place; the restart under way runs it');
     this.log(e, 'restarting the runner (fresh WDA build)');
     e.restarts = 0;
+    e.attempt = 0;
+    e.downWhy = null;
     this.restart(e);
   }
 
@@ -483,16 +588,16 @@ export class WdaManager {
         e.flavor = 'stock';
         e.restarts = 0;
         e.forkFails = 0;
+        e.attempt = 0; // a new start: the stock one gets its own attempts
         this.fork?.failed(e.udid, why);
         this.healed(e, `our WebDriverAgent build did not stay up ${FORK_GIVE_UP} times in a row (${why}); back to the stock one`);
       }
     }
-    const delay = Math.min(30000, 1000 * 2 ** Math.min(e.restarts, 5));
-    this.log(e, `${why}; restart in ${delay / 1000}s`);
-    e.timer = setTimeout(() => {
-      e.timer = undefined;
-      if (e.wanted) this.launch(e);
-    }, delay);
+    // the runner ended: WDA is dead for sure (no probing). The restart under way sees it; a phone whose restarts gave up
+    // stays down until a recover; otherwise a restart begins (one at a time, backed off, capped).
+    if (e.restartP) return void this.log(e, why);
+    if (e.downWhy) return void this.log(e, `${why}; control stays down until a recover`);
+    void this.beginRestart(e, why);
   }
 
   private launch(e: Entry): void {
@@ -568,7 +673,9 @@ export class WdaManager {
 
     // poll WDA /status until it answers, then warm a session
     const waitReady = async () => {
-      for (let i = 0; i < 360 && e.wanted && e.runner === xcode; i++) {
+      // by the clock (2026-11-18): it counted 360 tries, and a /status that timed out each time made that 15 minutes
+      const until = Date.now() + START_MS;
+      while (Date.now() < until && e.wanted && e.runner === xcode) {
         if ((await this.ping(e, 2000)).ok) {
           if (e.runner !== xcode) return;
           // which WebDriverAgent answered: ours says so (and its version); a stock one doesn't know the route
@@ -579,6 +686,12 @@ export class WdaManager {
           e.status = 'ready';
           e.restarts = 0;
           e.lastOk = Date.now();
+          if (!e.restartP) {
+            // WDA answering again by itself (after the restarts gave up): control is back, the count starts afresh
+            if (e.downWhy) this.restartLog(e, `WDA answers again; control is back (it was down: ${e.downWhy})`);
+            e.downWhy = null;
+            e.attempt = 0;
+          }
           this.log(e, 'ready');
           try {
             await this.session(e);
@@ -590,7 +703,7 @@ export class WdaManager {
         }
         await sleep(500);
       }
-      if (e.wanted && e.runner === xcode) this.relaunchLater(e, 'WDA did not answer within 3 minutes');
+      if (e.wanted && e.runner === xcode) this.relaunchLater(e, `WDA did not answer within ${Math.round(START_MS / 60000)} minutes`);
     };
     void waitReady();
   }
@@ -684,7 +797,7 @@ export class WdaManager {
     throw new WdaError(kind, msg);
   }
 
-  private async ping(e: Entry, timeout: number): Promise<{ ok: boolean; sessionId?: string }> {
+  private async ping(e: Entry, timeout: number): Promise<{ ok: boolean; sessionId?: string; why?: string }> {
     try {
       const r = await this.request(e, 'GET', '/status', undefined, timeout);
       let j: any = {};
@@ -695,9 +808,11 @@ export class WdaManager {
       }
       const sid = j?.sessionId ?? j?.value?.sessionId;
       if (typeof sid === 'string' && sid) e.statusNamesSession = true;
-      return { ok: r.status >= 200 && r.status < 300, sessionId: typeof sid === 'string' && sid ? sid : undefined };
-    } catch {
-      return { ok: false };
+      const ok = r.status >= 200 && r.status < 300;
+      return { ok, sessionId: typeof sid === 'string' && sid ? sid : undefined, ...(ok ? {} : { why: `HTTP ${r.status}` }) };
+    } catch (err) {
+      const x = err as HttpErr;
+      return { ok: false, why: x.code === 'TIMEOUT' ? `no answer in ${(timeout / 1000).toFixed(1)} s` : `unreachable (${x.code ?? x.message})` };
     }
   }
 
@@ -887,7 +1002,10 @@ export class WdaManager {
     return this.downError(e, (err as Error)?.message ?? String(err));
   }
 
-  /** The phone's entry once WDA can take a request; waits out a start or a recovery in progress. */
+  /**
+   * The phone's entry once WDA can take a request. Never waits on a restart (2026-11-18): while one is under way, or
+   * control is down after the restarts gave up, a 503 at once; a WDA that's starting gets START_WAIT_MS, then a 503.
+   */
   private async usable(udid: string): Promise<Entry> {
     const e = this.entries.get(udid);
     if (!e || !e.wanted) {
@@ -895,54 +1013,82 @@ export class WdaManager {
       err.named = true;
       throw err;
     }
+    this.gate(udid);
     if (e.status === 'failed' && e.timer) {
-      // an action while waiting out the restart backoff: try again now
+      // a runner a switch of flavor left failed, waiting to be started again: start it now
       clearTimeout(e.timer);
       e.timer = undefined;
       this.launch(e);
     }
-    if (e.status === 'starting') await this.waitReady(e, 45000);
-    if (e.recovering) await e.recovering.catch(() => {});
-    if (e.status !== 'ready') throw this.downError(e, `WebDriverAgent is ${e.status === 'starting' ? 'still starting' : e.status}`);
+    if (e.status === 'starting') await this.waitReady(e, this.timeouts.startWait ?? START_WAIT_MS);
+    this.gate(udid);
+    if (e.status !== 'ready') {
+      const starting = e.status === 'starting';
+      throw new HttpError(503, starting ? "The phone's control link is starting" : `The phone's control link is not running (WebDriverAgent ${e.status})`, { state: starting ? 'starting' : 'down' });
+    }
     return e;
   }
 
+  /** A restart's line in server.log: `[wda-restart] <udid end> ...` (never a token). */
+  private restartLog(e: Entry, m: string): void {
+    console.log(`[wda-restart] ${e.udid.slice(-8)} ${this.clean(e, m)}`);
+  }
+
   /**
-   * Find out what's wrong and fix only that. WDA is asked /status up to three times (one slow answer isn't a dead
-   * WDA; a port forward that just exited is back within a second): only a WDA that never answers has its runner
-   * restarted. A WDA that answers keeps its session when that still answers too; one that's gone (`sessionGone`: WDA
-   * said so itself) is made anew. Shared by concurrent callers.
+   * Is WDA really dead? /status is asked `probes` times, `probeEvery` apart, each given `status` ms. Any answer at
+   * all (that one, or any other request's meanwhile) means it's there. Null when it is; else how each ask failed.
+   * 'moot' when the phone changed meanwhile (a restart began, the runner ended, it was unplugged).
+   */
+  private async confirmDead(e: Entry): Promise<string | null | 'moot'> {
+    const n = Math.max(1, this.timeouts.probes ?? DEAD_PROBES);
+    const every = this.timeouts.probeEvery ?? PROBE_EVERY_MS;
+    const ms = this.timeouts.status ?? STATUS_MS;
+    const fails: string[] = [];
+    const t0 = Date.now();
+    for (let i = 0; i < n; i++) {
+      if (!e.wanted || e.status !== 'ready' || e.restartP) return 'moot';
+      const at = Date.now();
+      const r = await this.ping(e, ms);
+      if (r.ok || e.lastAnswer >= at) return null;
+      fails.push(r.why ?? 'no answer');
+      if (i < n - 1) {
+        const wait = every - (Date.now() - at);
+        if (wait > 0) await sleep(wait);
+        if (e.lastAnswer >= at) return null; // something else got an answer meanwhile: WDA is there
+      }
+    }
+    const counts = new Map<string, number>();
+    for (const f of fails) counts.set(f, (counts.get(f) ?? 0) + 1);
+    const how = [...counts].map(([f, c]) => (c > 1 ? `${f} x${c}` : f)).join(', ');
+    return `/status asked ${n} times over ${((Date.now() - t0) / 1000).toFixed(1)} s, never answered (${how})`;
+  }
+
+  /**
+   * Find out what's wrong and fix only that (shared by concurrent callers; every step bounded). WDA counts as dead
+   * only when /status went unanswered `probes` times over ~12-15 s (confirmDead): then a restart begins (beginRestart)
+   * and this rejects with its 503. A WDA that answers keeps its session when that still answers too; one that's gone
+   * (`sessionGone`: WDA said so itself) is made anew; a WDA that answers but makes no session twice is restarted.
    */
   private recover(e: Entry, why: string, sessionGone = false): Promise<void> {
+    if (e.restartP) return Promise.reject(this.restartingError(e));
+    if (e.downWhy) return Promise.reject(this.controlDownError(e));
     if (e.recovering) return e.recovering;
     const run = (async () => {
-      this.setControl(e, 'recovering');
+      if (e.status !== 'ready') throw this.downError(e, `WebDriverAgent is ${e.status === 'starting' ? 'still starting' : e.status}`);
       e.recoveries++;
       e.misses = 0;
       this.healed(e, `recovering: ${why}`);
-      let restarted = false;
-      const first = this.timeouts.status ?? STATUS_MS;
-      let alive = false;
-      for (const ms of [first, first * 1.5, first * 1.5]) {
-        if (!e.wanted || e.status !== 'ready') break;
-        const t0 = Date.now();
-        if ((await this.ping(e, ms)).ok) {
-          alive = true;
-          break;
-        }
-        // refused at once (nothing listens, or its forward is being started again): a moment before the next ask
-        if (Date.now() - t0 < 700) await sleep(Math.min(700, first / 3));
+      const dead = await this.confirmDead(e);
+      if (dead !== null && dead !== 'moot') {
+        void this.beginRestart(e, `${why}; then ${dead}`);
+        throw this.restartingError(e);
       }
-      if (!alive && e.wanted && e.status === 'ready') {
-        this.log(e, 'WDA is not answering (/status asked three times); restarting it');
-        this.restart(e);
-        restarted = true;
-      }
-      if (e.status !== 'ready') await this.waitReady(e, restarted ? this.timeouts.restart : 45000);
-      if (e.status !== 'ready') throw new WdaError('unreachable', `WebDriverAgent did not come back (${e.status})`);
+      if (e.restartP) throw this.restartingError(e);
+      if (e.downWhy) throw this.controlDownError(e);
+      if (e.status !== 'ready') throw this.downError(e, `WebDriverAgent is ${e.status === 'starting' ? 'still starting' : e.status}`);
       // WDA answers. Its session is kept when it still answers too; dropped when it's gone, or when it says nothing
       const sid = e.sessionId;
-      if (sid && !restarted) {
+      if (sid) {
         let gone = sessionGone;
         if (!gone) {
           try {
@@ -956,30 +1102,129 @@ export class WdaManager {
           e.mjpegApplied = undefined;
         }
       }
+      const wait = this.timeouts.sessionWait ?? SESSION_WAIT_MS;
+      const made = () => within(this.session(e), wait, () => new WdaError('unreachable', `no session within ${Math.round(wait / 1000)} s`));
       try {
-        await this.session(e);
+        await made();
       } catch (err) {
-        // /status answers but no session can be made (XCTest hung under it): only a fresh runner fixes that
-        if (restarted || !(err instanceof WdaError) || !err.down) throw err;
-        this.log(e, `no session could be made (${err.message}); restarting WDA`);
-        this.restart(e);
-        await this.waitReady(e, this.timeouts.restart);
-        if (e.status !== 'ready') throw new WdaError('unreachable', `WebDriverAgent did not come back (${e.status})`);
-        await this.session(e);
+        // /status answers but no session: asked once more a moment later; still none (XCTest hung under it): only a
+        // fresh runner fixes that
+        await sleep(Math.min(1000, this.timeouts.probeEvery ?? PROBE_EVERY_MS));
+        try {
+          await made();
+        } catch (err2) {
+          if (!(err2 instanceof WdaError) || !err2.down || !e.wanted || e.status !== 'ready') throw err2;
+          void this.beginRestart(e, `${why}; then /status answered but no session could be made, twice (${(err as Error).message}; ${err2.message})`);
+          throw this.restartingError(e);
+        }
       }
+      e.lastOk = Date.now();
       this.setControl(e, 'ready');
       this.log(e, 'recovered');
     })();
-    e.recovering = run
+    const p: Promise<void> = run.finally(() => {
+      if (e.recovering === p) e.recovering = undefined;
+    });
+    e.recovering = p;
+    return p;
+  }
+
+  /**
+   * Restart the phone's WDA: one restart at a time per phone (every caller gets the same promise), attempts backed off
+   * (`backoff`: 5 s, 15 s, 60 s) and capped (`attempts`), each step bounded (the runner's /status within `restart`, its
+   * session within `sessionWait`). After the last attempt failed, control is "down" with the last error until a
+   * recover, or WDA answering again. Every attempt goes to server.log with why, how it ended and how long it took.
+   */
+  private beginRestart(e: Entry, reason: string): Promise<void> {
+    if (e.restartP) return e.restartP;
+    if (!e.wanted || e.switching) return Promise.resolve();
+    const epoch = e.epoch;
+    const live = () => e.wanted && !e.switching && e.epoch === epoch;
+    const max = this.maxAttempts;
+    const backoff = this.timeouts.backoff ?? RESTART_BACKOFF_MS;
+    const secs = (t: number) => `${((Date.now() - t) / 1000).toFixed(1)} s`;
+    e.downWhy = null;
+    e.restartSince = Date.now();
+    reason = this.clean(e, reason).slice(0, 400);
+    const run = async (): Promise<void> => {
+      let last = reason;
+      while (live()) {
+        if (e.attempt >= max) {
+          e.downWhy = `WebDriverAgent did not come back after ${max} restarts (last: ${last})`.slice(0, 400);
+          this.setControl(e, 'down');
+          this.restartLog(e, `control down after ${max} attempts in ${secs(e.restartSince)}: ${last}; it stays down until a recover, or WDA answering again`);
+          return;
+        }
+        if (e.attempt > 0) {
+          const wait = backoff[Math.min(e.attempt - 1, backoff.length - 1)] ?? 0;
+          this.restartLog(e, `waiting ${(wait / 1000).toFixed(1)} s before attempt ${e.attempt + 1}/${max}`);
+          // the last attempt's runner may still come up meanwhile: then WDA is back and nothing more is restarted
+          if (await this.readyWithin(e, wait, live)) {
+            e.attempt = 0;
+            this.setControl(e, 'ready');
+            this.restartLog(e, `WDA came back while waiting; restart done in ${secs(e.restartSince)}`);
+            return;
+          }
+          if (!live()) return;
+        }
+        e.attempt++;
+        const n = e.attempt;
+        const t = Date.now();
+        const why = n === 1 ? reason : `attempt ${n - 1} failed: ${last}`;
+        this.restartLog(e, `attempt ${n}/${max}: restarting WDA (${why})`);
+        this.healed(e, `restarting WDA (attempt ${n}/${max}): ${why}`);
+        this.restart(e);
+        const r = await this.awaitUp(e, this.timeouts.restart, live);
+        if (!live()) return;
+        if (r.ok) {
+          e.attempt = 0;
+          this.setControl(e, 'ready');
+          this.restartLog(e, `attempt ${n}/${max} ok: WDA is back in ${secs(t)} (${secs(e.restartSince)} since the restart began)`);
+          return;
+        }
+        last = r.why;
+        this.restartLog(e, `attempt ${n}/${max} failed after ${secs(t)}: ${last}`);
+      }
+    };
+    const p: Promise<void> = Promise.resolve()
+      .then(run)
       .catch((err) => {
-        this.setControl(e, 'down');
-        this.log(e, `recovery failed: ${(err as Error).message}`);
-        throw err;
+        // never expected (every step is bounded and caught); the phone is said to be down rather than left restarting
+        this.restartLog(e, `the restart stopped: ${(err as Error)?.message ?? err}`);
+        if (live()) {
+          e.downWhy = `the restart stopped: ${(err as Error)?.message ?? err}`.slice(0, 400);
+          this.setControl(e, 'down');
+        }
       })
       .finally(() => {
-        e.recovering = undefined;
+        if (e.restartP === p) e.restartP = undefined;
       });
-    return e.recovering;
+    e.restartP = p;
+    return p;
+  }
+
+  /** The runner just launched answers /status within `ms` and makes its session within `sessionWait`. */
+  private async awaitUp(e: Entry, ms: number, live: () => boolean): Promise<{ ok: boolean; why: string }> {
+    const until = Date.now() + ms;
+    while (live() && e.status === 'starting' && Date.now() < until) await sleep(100);
+    if (!live()) return { ok: false, why: 'the phone was stopped' };
+    if (e.status === 'failed') return { ok: false, why: e.launchError ?? 'the runner ended before WDA answered' };
+    if (e.status !== 'ready') return { ok: false, why: `WDA did not answer /status within ${Math.round(ms / 1000)} s` };
+    const wait = this.timeouts.sessionWait ?? SESSION_WAIT_MS;
+    try {
+      await within(this.session(e), wait, () => new Error(`none within ${Math.round(wait / 1000)} s`));
+      return { ok: true, why: '' };
+    } catch (err) {
+      return { ok: false, why: `WDA answers but made no session (${(err as Error).message})` };
+    }
+  }
+
+  /** The last runner came up (and made its session) within `ms`. */
+  private async readyWithin(e: Entry, ms: number, live: () => boolean): Promise<boolean> {
+    const until = Date.now() + ms;
+    while (live() && e.status !== 'ready' && Date.now() < until) await sleep(Math.max(1, Math.min(100, until - Date.now())));
+    if (!live() || e.status !== 'ready') return false;
+    return (await this.awaitUp(e, 0, live)).ok;
   }
 
   private async withRecovery<T>(udid: string, fn: (e: Entry) => Promise<T>): Promise<T> {
@@ -999,9 +1244,16 @@ export class WdaManager {
       return r;
     } catch (err) {
       if (!(err instanceof WdaError) || !err.down) throw this.named(e, err);
+      // 2026-11-18: no answer in time may only be a slow WDA (or a long action still playing): never asked again (it
+      // may yet happen on the phone) and never a restart by itself; WDA is checked in the background
+      if (err.timeout) {
+        void this.recover(e, err.message).catch(() => {});
+        throw this.named(e, err);
+      }
       try {
         await this.recover(e, err.message, err.kind === 'session');
       } catch (err2) {
+        if (err2 instanceof HttpError && !(err2 instanceof WdaError)) throw err2; // restarting, or control down: a 503
         throw this.named(e, err2 instanceof WdaError ? err2 : err);
       }
       try {
@@ -1015,7 +1267,11 @@ export class WdaManager {
     }
   }
 
-  /** Asked for (POST /recover): drop the session, restart the runner if /status fails, make a new warm session. */
+  /**
+   * Asked for (POST /recover): WDA checked, and fixed as needed (a new session; a restart only when it's dead). A
+   * recover during a restart joins it (never a second one); one while control is down starts the attempts afresh.
+   * Waits for a restart at most `recoverWait`, then answers with the state as it is.
+   */
   async recoverNow(udid: string): Promise<ControlState> {
     const e = this.entries.get(udid);
     if (!e || !e.wanted) {
@@ -1023,15 +1279,30 @@ export class WdaManager {
       err.named = true;
       throw err;
     }
-    if (e.status === 'failed') {
-      if (e.timer) clearTimeout(e.timer);
-      e.timer = undefined;
-      this.launch(e);
+    const wait = this.timeouts.recoverWait ?? RECOVER_WAIT_MS;
+    const join = async (p: Promise<void>): Promise<ControlState> => {
+      await within(p, wait, () => new Error('wait')).catch(() => {});
+      return this.state(udid);
+    };
+    if (e.restartP) {
+      this.restartLog(e, `a recover was asked during attempt ${Math.max(1, e.attempt)}: it joins the restart under way`);
+      return join(e.restartP);
     }
-    if (e.recovering) await e.recovering.catch(() => {});
+    if (e.downWhy || e.attempt) {
+      this.restartLog(e, `a recover was asked${e.downWhy ? ` (control was down: ${e.downWhy})` : ''}: the attempts start afresh`);
+      const was = e.downWhy;
+      e.downWhy = null;
+      e.attempt = 0;
+      if (was && e.status !== 'ready' && !e.switching) return join(this.beginRestart(e, `a recover was asked while control was down (${was})`));
+    }
+    if (e.switching) return this.state(udid); // a switch of flavor owns the runner now
+    if (e.status === 'failed') return join(this.beginRestart(e, 'a recover was asked while the runner was not running'));
+    if (e.status === 'starting') return this.state(udid); // on its way up already
     try {
       await this.recover(e, 'requested by the client');
     } catch (err) {
+      if (e.restartP) return join(e.restartP);
+      if (err instanceof HttpError && !(err instanceof WdaError)) throw err;
       throw this.named(e, err);
     }
     return this.state(udid);
@@ -1144,15 +1415,17 @@ export class WdaManager {
   }
 
   private async probeNow(e: Entry, reason: string): Promise<boolean> {
+    // a restart under way, or control down after the restarts: nothing to probe, and nobody is kept waiting
+    if (e.restartP || e.downWhy) return false;
     if (e.status === 'failed' && e.timer) {
       clearTimeout(e.timer);
       e.timer = undefined;
-      this.healed(e, `${reason}: WDA was waiting to restart; starting it now`);
+      this.healed(e, `${reason}: WDA was waiting to start again; starting it now`);
       this.launch(e);
     }
-    if (e.status === 'starting') await this.waitReady(e, 45000);
+    if (e.status === 'starting') await this.waitReady(e, this.timeouts.startWait ?? START_WAIT_MS);
     if (e.recovering) await e.recovering.catch(() => {});
-    if (e.status !== 'ready') return false;
+    if (e.status !== 'ready' || e.restartP || e.downWhy) return false;
     // something is on its way to WDA (a long gesture, a big /source, a screenshot, a lock, a card's read): WDA
     // works one thing at a time, so a probe now would only wait behind it and look like a hang; that request finds
     // out for itself.
@@ -1429,7 +1702,7 @@ export class WdaManager {
   /** Every ~10 s per phone: /status; recover before the owner notices. Skipped right after a successful action. */
   private healthCheck(): void {
     for (const e of this.entries.values()) {
-      if (!e.wanted || e.status !== 'ready' || e.recovering || e.checking) continue;
+      if (!e.wanted || e.status !== 'ready' || e.recovering || e.restartP || e.downWhy || e.checking) continue;
       if (e.sessionId && Date.now() - Math.max(e.lastOk, e.lastAnswer) < HEALTH_MS - 1000) continue; // it answered lately
       if (e.inflight > 0 || e.busy > 0) continue; // busy with something: that request finds out for itself
       e.checking = true;

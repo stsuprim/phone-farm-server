@@ -100,7 +100,8 @@ const fakeSpawn = ((cmd: string, args: string[]) => {
   console.log = (...a: unknown[]) => void logs.push(a.join(' '));
   const w = await fakeWda();
   const cfg = { wdaBasePort: w.port, mjpegBasePort: w.port + 1, wdaProject: '/x', wdaDerivedData: '/y' } as unknown as import('../src/config.js').Config;
-  const m = new WdaManager(cfg, (u) => u, fakeSpawn, { input: 300, launch: 1000, probe: 300, restart: 5000 });
+  // quick clocks: WDA is dead after /status went unanswered 3 times, 60 ms apart; restarts back off 50/100/200 ms
+  const m = new WdaManager(cfg, (u) => u, fakeSpawn, { input: 300, launch: 1000, probe: 300, restart: 5000, status: 200, probes: 3, probeEvery: 60, backoff: [50, 100, 200] });
   try {
     m.start('U1');
     assert.ok(await until(() => m.state('U1') === 'ready'), 'ready');
@@ -116,8 +117,9 @@ const fakeSpawn = ((cmd: string, args: string[]) => {
     assert.equal(w.current, `S${w.made}`, 'a new session was made');
     await m.tap('U1', 10, 10);
 
-    // 2. XCTest hangs under a tap: no answer within the input timeout -> recovered (new session), retried, and the
-    //    caller hears so quickly instead of waiting 30 s; once WDA answers again the next tap goes through
+    // 2. XCTest hangs under a tap: no answer within the input timeout -> the caller hears so quickly instead of
+    //    waiting 30 s; never asked again (it may still happen), WDA only checked (it answers: nothing restarted);
+    //    once WDA answers again the next tap goes through
     w.hang = true;
     const t0 = Date.now();
     await assert.rejects(m.tap('U1', 10, 10), (err: HttpError) => err.status === 502 && /no answer within/.test(err.message));
@@ -128,16 +130,17 @@ const fakeSpawn = ((cmd: string, args: string[]) => {
     await until(() => m.state('U1') === 'ready');
     await m.tap('U1', 10, 10);
 
-    // 3. WDA dies (its port goes away): the probe recovers, /status fails too, so the runner is restarted through
-    //    the usual path; the fake comes back with the new xcodebuild
+    // 3. WDA dies (its port goes away): the probe checks /status (3 asks, none answered), so the runner is restarted;
+    //    the probe says "not yet" at once rather than waiting the restart out; the fake comes back with the new xcodebuild
     const xcodes = spawned.filter((s) => s.cmd === 'xcodebuild').length;
     w.close();
     onXcode = () => void setTimeout(() => void w.open(), 50);
-    assert.equal(await m.probe('U1', 'first action after 31 s idle'), true, 'healed: WDA can take input again');
+    assert.equal(await m.probe('U1', 'first action after 31 s idle'), false, 'a restart began: not usable yet');
+    assert.ok(await until(() => m.state('U1') === 'ready' && !m.restarting('U1')), 'healed: WDA can take input again');
     onXcode = null;
-    assert.equal(spawned.filter((s) => s.cmd === 'xcodebuild').length, xcodes + 1, 'the runner was restarted');
-    assert.equal(m.state('U1'), 'ready');
-    assert.match(m.healStats('U1').lastHeal!.reason, /^recovering: first action after 31 s idle/);
+    assert.equal(spawned.filter((s) => s.cmd === 'xcodebuild').length, xcodes + 1, 'the runner was restarted once');
+    // (the check the hung tap began may be the one that finds it dead: either way one restart, attempt 1)
+    assert.match(m.healStats('U1').lastHeal!.reason, /^restarting WDA \(attempt 1\/4\): /);
     await m.tap('U1', 10, 10);
 
     // 4. the WDA port forward (iproxy) exits by itself: it's started again, WDA itself is left alone

@@ -14,6 +14,13 @@ export interface PhoneInfo {
   online: boolean;
   ready: boolean; // true when the phone can be controlled (WDA up)
   control: ControlState;
+  /**
+   * 2026-11-18: why the phone's control link is down after its WDA restarts gave up (src/wda.ts: a few attempts with a
+   * back-off, then "control down" until a recover or WDA answering again); null otherwise.
+   */
+  controlDown?: string | null;
+  /** A WDA restart under way now: which attempt of how many, and since when (ms since the epoch); null otherwise. */
+  restarting?: { attempt: number; of: number; since: number } | null;
   /** Screen scale (points -> pixels), from WDA; null until a WDA session has been made. */
   scale: number | null;
   /** Screen size in points (WDA's coordinate space), upright: as the phone is turned now; null until known. */
@@ -226,7 +233,8 @@ export interface Image {
 }
 
 export class HttpError extends Error {
-  constructor(public status: number, message: string) {
+  /** `extra`: more fields for the error's JSON answer (e.g. `{state: "restarting"}`). */
+  constructor(public status: number, message: string, public extra?: Record<string, unknown>) {
     super(message);
   }
 }
@@ -305,6 +313,11 @@ export interface Backend {
   playFailure?(udid: string, since: number): string | null;
   /** Drop the WDA session, restart the runner if WDA doesn't answer, make a new warm session. */
   recover(udid: string): Promise<ControlState>;
+  /**
+   * Throws a 503 at once while the phone's WDA is being restarted, or its control link is down after the restarts gave
+   * up (2026-11-18): a call that needs WDA never waits on a restart.
+   */
+  controlGate?(udid: string): void;
   /**
    * Make sure the phone can take input: probe its WDA session and heal what's wrong (a new session, WDA restarted).
    * False when it can't take input even so. `reason` is logged with any heal.

@@ -205,6 +205,8 @@ export const IDLE_PROBE_MS = 30_000;
 const HEAL_WAIT_MS = 20_000;
 /** How long an action waits for the phone to wake before it goes anyway. */
 const WAKE_WAIT_MS = 30_000;
+/** An action waits at most this long for a health check on the phone's WDA to end. */
+const CHECK_WAIT_MS = 5_000;
 /** After an action timed out, the next one waits this much longer for it to settle (never two at once on WDA). */
 const HUNG_GRACE_MS = 5_000;
 
@@ -476,12 +478,13 @@ export class Control {
     }
   }
 
-  /** Recover the phone's WDA, in the phone's queue so it never overlaps an action. */
+  /**
+   * Recover the phone's WDA. Not in the phone's queue (2026-11-18): queued behind actions that each waited on a stuck
+   * WDA it never got its turn; it only asks /status and the session (a restart only when WDA is dead), and joins a
+   * restart under way.
+   */
   recover(udid: string): Promise<ControlState> {
-    let state: ControlState = 'down';
-    return this.run(udid, 'recover', null, async () => {
-      state = await this.backend.recover(udid);
-    }, { silent: true, timeoutMs: Infinity }).then(() => state);
+    return this.backend.recover(udid);
   }
 
   /**
@@ -610,7 +613,9 @@ export class Control {
     const p = queue.tail.then(async () => {
       if (opts.quiet) return fn();
       // a health check is on WDA right now: what goes through WDA waits for it (the owner's live touch doesn't)
-      if (!opts.live) await this.checks.get(udid)?.catch(() => {});
+      // (at most CHECK_WAIT_MS: a check on a WDA that's dying never holds the phone's actions)
+      const check = this.checks.get(udid);
+      if (!opts.live && check) await within(check, CHECK_WAIT_MS, () => new Error('check')).catch(() => {});
       // the first action after a quiet spell: the phone's WDA is probed (and healed) first, in this same request
       if (opts.discrete && this.onHeal) {
         const last = this.acted.get(udid);

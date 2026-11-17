@@ -100,7 +100,7 @@ const xcodes = () => spawned.filter((c) => c === 'xcodebuild').length;
   const w = await fakeWda();
   const cfg = { wdaBasePort: w.port, mjpegBasePort: w.port + 1, wdaProject: '/x', wdaDerivedData: '/y' } as unknown as import('../src/config.js').Config;
   // quick clocks: a probe waits 80 ms, WDA is down after 3 misses over 200 ms, a state is said once it lasted 250 ms
-  const m = new WdaManager(cfg, (u) => u, fakeSpawn, { input: 400, launch: 1000, probe: 80, restart: 4000, status: 80, misses: 3, missSpan: 200, debounce: 250 });
+  const m = new WdaManager(cfg, (u) => u, fakeSpawn, { input: 400, launch: 1000, probe: 80, restart: 4000, status: 80, misses: 3, missSpan: 200, debounce: 250, probes: 3, probeEvery: 100, backoff: [50, 100, 200] });
   try {
     m.start('U1');
     assert.ok(await until(() => m.state('U1') === 'ready'));
@@ -168,11 +168,11 @@ const xcodes = () => spawned.filter((c) => c === 'xcodebuild').length;
     assert.ok(await until(() => seen.has('recovering')), 'a real outage is said');
     w.slow.probe = 0;
     w.slow.status = 0; // the new runner's WDA answers
-    assert.equal(await healing, true);
-    assert.ok(await until(() => m.state('U1') === 'ready'));
+    assert.equal(await healing, false, 'a restart is under way: not usable yet (and the probe never waits it out)');
+    assert.ok(await until(() => m.state('U1') === 'ready' && !m.restarting('U1')));
     h = m.linkHealth('U1')!;
     assert.deepEqual([h.recoveries, h.runnerRestarts, h.misses], [1, 1, 0]);
-    assert.match(m.healStats('U1').lastHeal!.reason, /^recovering: health check: no answer within/);
+    assert.match(m.healStats('U1').lastHeal!.reason, /^restarting WDA \(attempt 1\/4\): health check: no answer within.*\/status asked 3 times/);
     clearInterval(watch);
 
     // 6. a slow answer under an action: the session that still answers is kept (it was only slow)

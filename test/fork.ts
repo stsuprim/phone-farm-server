@@ -193,7 +193,7 @@ const fakeSpawn = ((cmd: string, args: string[], opts: { env?: NodeJS.ProcessEnv
   const stock = await fakeWda(null);
   const ours = await fakeWda(TOKEN);
   const cfg = { wdaBasePort: stock.port, mjpegBasePort: stock.port + 1, wdaProject: '/stock/wda', wdaDerivedData: '/stock/build', wdaLiveTouch: 'auto' } as unknown as Config;
-  const m = new WdaManager(cfg, (u) => u, fakeSpawn, { input: 400, launch: 1000, probe: 400, restart: 5000 });
+  const m = new WdaManager(cfg, (u) => u, fakeSpawn, { input: 400, launch: 1000, probe: 400, restart: 5000, backoff: [100, 200, 400] });
   let liveMode = 0;
   let liveGap = 0;
   const failures: string[] = [];
@@ -460,7 +460,7 @@ const fakeSpawn = ((cmd: string, args: string[], opts: { env?: NodeJS.ProcessEnv
     atStart = 'fork';
     xcodeExits = (s) => (s.args.includes('/fork/build') ? { code: 70, says: 'error: Failed to launch the test runner' } : null);
     m.start('U1');
-    // (the restarts back off 2 s, then 4 s: an action in between starts the next try at once, as in real use)
+    // (the restarts back off 100, then 200 ms here: 5 s, then 15 s on a real phone; a probe meanwhile never starts one)
     const kick = setInterval(() => void m.probe('U1', 'test').catch(() => {}), 150);
     const gaveUp = await until(() => failures.length === 1, 20_000);
     if (!gaveUp) origLog(logs.slice(-25).join(' ## '));

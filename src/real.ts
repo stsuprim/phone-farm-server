@@ -188,6 +188,8 @@ export class RealBackend implements Backend {
         ...p,
         ready: p.online && this.wda.status(p.udid) === 'ready',
         control: p.online ? this.wda.state(p.udid) : 'down',
+        controlDown: p.online ? this.wda.controlDown(p.udid) : null,
+        restarting: p.online ? this.wda.restarting(p.udid) : null,
         scale: s?.scale ?? null,
         point_width: s?.width ?? null,
         point_height: s?.height ?? null,
@@ -937,6 +939,10 @@ export class RealBackend implements Backend {
   async recover(udid: string): Promise<ControlState> {
     this.known(udid);
     return this.wda.recoverNow(udid);
+  }
+
+  controlGate(udid: string): void {
+    this.wda.gate(udid);
   }
 
   /** The MJPEG server is one per phone: it runs at the most any current subscriber asked for. */

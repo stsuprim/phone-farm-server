@@ -20,7 +20,11 @@ as red rings/yellow lines on the next frame. Coordinates are iPhone points (390x
 All endpoints except `/health` need `Authorization: Bearer <API_TOKEN>` (WebSockets also accept `?token=`).
 Errors are JSON `{"ok": false, "error": "..."}` with 400/401/404/405/501/503/502 (routes that aren't about one phone answer `{"error": "..."}`). When WebDriverAgent is at fault the status is 502 and the
 message names it: `WDA session for <name> is down: ...` (WDA unreachable, session gone, 5xx; already retried once after
-recovering) or `WDA refused the request on <name>: ...` (WDA answered but said no).
+recovering) or `WDA refused the request on <name>: ...` (WDA answered but said no). While a phone's WDA is being
+restarted every call that needs it answers at once with 503 `{"ok": false, "error": "The phone's control link is
+restarting (attempt N)", "state": "restarting"}`; after the restarts gave up, 503 `{"error": "control down: ...",
+"state": "down"}`; while it's starting, 503 `{"error": "The phone's control link is starting", "state": "starting"}`
+(see [Restarts](#restarts-only-when-wda-is-really-dead-2026-11-18)).
 
 | Method | Path | Body / query | Result |
 |---|---|---|---|
@@ -47,7 +51,7 @@ recovering) or `WDA refused the request on <name>: ...` (WDA answered but said n
 | GET | `/phones/:udid/orientation` | - | `{ok, udid, orientation, point_width, point_height, screen_width, screen_height, width, height}`, asked from WDA now |
 | POST | `/phones/:udid/tap-element` | `{id \| label \| name \| text, index?, timeoutMs?, settle?, verify?}` | finds the element and taps its middle: the report + `element`, `matches`, `moved?`; 404 says what the screen does say; 409 when the screen changed under an `id` or the element is off the screen |
 | POST | `/phones/:udid/act` | `{steps: [...], verify?, continueOnError?}` | a batch in order: the report + `steps`, `done`, `failedAt?` |
-| POST | `/phones/:udid/recover` | `{}` | drops the WDA session, restarts the runner if `/status` fails, makes a new warm session (in the phone's queue, after any waiting actions): `{ok:true, control}`, or 502 `{error}` naming WDA |
+| POST | `/phones/:udid/recover` | `{}` | checks WDA (`/status` asked up to 4 times over ~12 s), remakes a dead session, restarts the runner only when WDA is really dead; joins a restart under way (never a second one); while control is down, starts the attempts afresh. Not in the phone's queue. Waits at most 20 s for a restart: `{ok:true, control}` (`"recovering"` when it's still under way), or 502 `{error}` naming WDA |
 | POST | `/phones/:udid/swipe` | `{points: [[x, y, t], ...], duration, unit?}` (a whole drag in one command; `t` ms, `duration` ms optional) | the report: replayed on the server as ONE smooth gesture (resampled every 8 ms; `duration` stretches the client's timing). The `remote` profile sends drags this way, never per point |
 | POST | `/phones/:udid/wake` (also `/api/devices/:udid/wake`) | `{}` | wakes and unlocks (WDA `/wda/unlock`: past the lock screen when there's no passcode): `{ok, udid, locked, screenOn, lastActive, warning?}`; 404 `{"error":"unknown phone"}` |
 | POST | `/phones/:udid/lock` (also `/api/devices/:udid/lock`) | `{}` | locks, screen off (WDA `/wda/lock`): same answer |
@@ -135,9 +139,9 @@ What used to leave a phone not answering after a while, and what the server does
 | Cause | Fix |
 |---|---|
 | The WDA session expired or was replaced while nobody was looking (`/status` still answers, so the old 10 s check saw nothing) | Every phone that's watched (a control socket or stream open, or in focus) has its **session itself** probed every 12 s (`GET /session/:id`, 3 s at most), in its queue; a dead one is remade |
-| XCTest hung under WDA: a request that never answers held the phone's queue for 30 s, then 45 s of recovery | Per-request timeouts (taps, keys, home: 8 s; launch 20 s; a gesture 8 s plus its length; typing by its length); a hung session is recovered, and when no new session can be made either, **WDA is restarted** through the usual restart path. The queue never waits more than 20 s (plus the action's own length) for one action: the caller gets 504 `... got no answer within N s: the phone is being checked and healed; it may still happen, so look at the screen before trying again`, the phone is healed, and the next action waits at most 5 s more for the hung one to settle |
+| XCTest hung under WDA: a request that never answers held the phone's queue for 30 s, then 45 s of recovery | Per-request timeouts (taps, keys, home: 8 s; launch 20 s; a gesture 8 s plus its length; typing by its length). A call with no answer in time fails at once and is **never sent again** (it may still happen); WDA is only checked in the background and restarted only when it's really dead (see [Restarts](#restarts-only-when-wda-is-really-dead-2026-11-18)). The queue never waits more than 20 s (plus the action's own length) for one action: the caller gets 504 `... got no answer within N s: the phone is being checked and healed; it may still happen, so look at the screen before trying again`, and the next action waits at most 5 s more for the hung one to settle (and at most 5 s for a health check on the phone) |
 | The WDA port forward (`iproxy`) died (usbmuxd hiccup, the phone re-enumerating after a long sleep) | It's started again by itself; WDA isn't restarted for it |
-| WDA itself died, or is waiting out a restart back-off | The probe restarts it now |
+| WDA itself died (its runner ended, or `/status` stopped answering) | Restarted, backed off and capped (see [Restarts](#restarts-only-when-wda-is-really-dead-2026-11-18)) |
 | The phone went dark by itself (iOS Auto-Lock) and the "is it locked?" ask timed out (1.5 s) after a long idle: the tap went to a dark phone, and **every tap for the next 25 s** too | The first action after **30 s** without one probes WDA first (and heals it), then asks whether the phone is locked (4 s), wakes it if so, then acts: **one request**. An ask that gets no answer is asked again by the next input. The 12 s watch also asks, so a phone found locked is woken by the next touch without asking |
 | The HID helper died or its session broke | (already) the input falls back to WDA at once and the session reopens by itself while someone watches |
 
@@ -156,9 +160,10 @@ passcode, a card's read, the orientation poll: none of them counted as "busy"), 
 - **Busy isn't down.** Every request to WDA counts as busy; a liveness check is skipped while one is on its way, and
   any answer at all (whatever it says) means WDA is there and clears the count.
 - **Several missed beats, not one.** WDA counts as down only after `MISSES` (3) liveness checks in a row got no
-  answer in time, over at least 15 s. A refused connection (nothing listens) still recovers at once.
-- **A recovery fixes only what's wrong.** It asks `/status` three times (2.5 s, then 3.75 s twice) before it restarts
-  the runner, and keeps a session that still answers (it was only slow); a session WDA itself says is gone is remade.
+  answer in time, over at least 15 s. A refused connection (nothing listens) is checked at once.
+- **A recovery fixes only what's wrong.** It asks `/status` four times over ~12 s before it restarts the runner
+  (2026-11-18, see [Restarts](#restarts-only-when-wda-is-really-dead-2026-11-18)), and keeps a session that still
+  answers (it was only slow); a session WDA itself says is gone is remade.
 - **No "down" for a hiccup.** `control` says `recovering` or `down` only once that lasted 4 s
   (`CONTROL_DEBOUNCE_MS`); a session remade in a moment is never shown. A restarting runner says so at once.
 - **The control socket.** The server answers `{type:"ping"}` in the message handler, beside whatever the phone's
@@ -167,8 +172,43 @@ passcode, a card's read, the orientation poll: none of them counted as "busy"), 
   open for one phone; none closes another.
 - **Measured.** `stats.controlLink` on each phone of `GET /phones`: `{open, opens, closes, drops, lastOpen,
   lastClose: {at, code, reason, why: "client"|"dropped"|"dead", livedMs}, wda: {state, raw, misses, recoveries,
-  runnerRestarts, answeredMsAgo, busy}}` (`drops`: closes that weren't the client's own; `wda.state` is what
-  `control` says, `wda.raw` what it is underneath).
+  runnerRestarts, answeredMsAgo, busy, restarting, controlDown}}` (`drops`: closes that weren't the client's own;
+  `wda.state` is what `control` says, `wda.raw` what it is underneath).
+
+### Restarts only when WDA is really dead (2026-11-18)
+
+The owner: "it RESTART TOO MUCH even if 1 single is not responding or whatever small lag happens it restart
+automatically ... and maybe this time while restart it broke." iPhone-2 sat in "recovering" for 10+ minutes with every
+call to it timing out, so Lotus said the server couldn't be reached. **Why it stuck:** a restarted runner's start
+waited for `/status` by counting 360 tries, not by the clock; with each try's 2 s timeout that was up to 15 minutes in
+"starting" (= "recovering"). Meanwhile every call waited up to 45 s for it, `POST /recover` queued behind those calls
+in the phone's queue, and any call during a restart back-off killed and relaunched the runner at once. Now:
+
+- **Dead means dead.** WDA is restarted only when `/status` went unanswered `DEAD_PROBES` (4) times in a row,
+  `PROBE_EVERY_MS` (4 s) apart, 2.5 s each (about 12-15 s), with no other request of WDA's answered meanwhile (any
+  answer at all means it's there). Or when its runner (xcodebuild) ended, or `/status` answers but no session can be
+  made twice. A single failed or slow call, or a timeout on a long action, never restarts anything by itself: the call
+  fails, isn't sent again, and WDA is checked in the background.
+- **Fast answers during a restart.** While a phone's restart is under way, every call that needs its WDA answers at
+  once with 503 `{"error": "The phone's control link is restarting (attempt N)", "state": "restarting"}` (the HTTP
+  routes `ui`, `apps`, `tap-element` and `act` check before anything is queued; everything else when it reaches WDA).
+  A WDA that's starting gets 1 s, then 503 `"starting"`. Live view, HID touch and the other phones are untouched.
+- **One at a time, backed off, capped.** One restart per phone: a `POST /recover` during it joins the same one (never
+  a second); a probe or the health check never starts one on top. Attempts wait 5 s, 15 s, then 60 s between them
+  (`RESTART_BACKOFF_MS`), at most `RESTART_ATTEMPTS` (4). Each step is bounded: the runner's `/status` within 90 s
+  (by the clock), its session within 20 s. After the last one the phone is **control down** with the last error:
+  `control: "down"`, `controlDown: "WebDriverAgent did not come back after 4 restarts (last: ...)"` in `GET /phones`
+  and `/info`, and calls get 503 `control down: ...` at once. It never loops in "recovering". A `POST /recover`
+  starts the attempts afresh, and WDA answering again by itself (the last runner came up late) brings control back.
+- **Said.** `GET /phones` and `/info` carry `control`, `controlDown` (null unless down) and `restarting` (`{attempt,
+  of, since}` while one is under way, else null); so does `stats.controlLink.wda`.
+- **Logged.** Every restart goes to `server.log` as `[wda-restart] <udid end> ...`: why (which check failed and how,
+  e.g. `/status asked 4 times over 12.4 s, never answered (no answer in 2.5 s x4)`), each attempt `n/4`, how it
+  ended and how long it took, the waits, "control down", a recover joining, control coming back. Never a token.
+
+`test/restart.ts` checks it: a slow call restarts nothing, two unanswered asks then an answer is alive, three in a row
+restart once, calls meanwhile get a 503 at once, a recover joins, the attempts back off and end in "control down", and a
+recover or WDA answering again brings it back.
 
 ### Device info (the detail card)
 
@@ -740,8 +780,9 @@ built, build error, capture failing, `H264=false`).
 
 The server keeps one WDA session per phone warm (made as soon as WDA answers, with the quiescence/idle waits off so actions
 don't wait for animations, and the MJPEG settings applied). On a WDA failure (connection refused, invalid session, 5xx) it
-makes a new session, restarts the phone's WDA runner if `/status` doesn't answer, and retries the action once. Every ~10 s
-each idle phone gets a `/status` check that recovers the same way before anyone notices (a phone on show has its session
+makes a new session, restarts the phone's WDA runner only if `/status` stays unanswered (see
+[Restarts](#restarts-only-when-wda-is-really-dead-2026-11-18)), and retries the action once (never one that timed out).
+Every ~10 s each idle phone gets a `/status` check that recovers the same way before anyone notices (a phone on show has its session
 itself probed instead, see [Staying responsive](#staying-responsive-wda-self-heal)). `GET /phones` shows it in `control`.
 
 **A session that expired** is remade and the call asked once more, however WDA says it: the standard 404 `invalid session
@@ -853,7 +894,7 @@ on the phone, no token, MJPEG stills, whole gestures by `/wda/lotus/touch`.
    (no root needed; the server finds that Python by itself, `HID_PYTHON` overrides it).
 7. **Run**: `npm start`. Within ~10-30 s of plugging a phone in, `GET /phones` shows `online:true, ready:true`.
    Per phone the server runs `xcodebuild test-without-building` (WDA) plus two `iproxy` forwards (WDA port 8100+n, MJPEG 9100+n;
-   the slot `n` per UDID is remembered in `data/ports.json`), restarts WDA with backoff if it dies, and stops it when the phone is unplugged.
+   the slot `n` per UDID is remembered in `data/ports.json`), restarts WDA with backoff if it dies (at most 4 attempts, then "control down"), and stops it when the phone is unplugged.
    A few minutes later it builds and installs [our own WebDriverAgent build](#our-own-webdriveragent-build-2026-11-16) on the phone
    by itself (one forward, port 28100+n, no MJPEG); the stock one of this step is the fallback.
 8. **Network**: the server listens on `HOST=0.0.0.0:8787`, so it is reachable on the LAN and via Tailscale
@@ -887,7 +928,7 @@ After `git pull`/code changes run `npm run build` and `launchctl kickstart -k gu
 
 `npm run check` type-checks. `npm test` runs `test/h264.ts` (helper framing, config-before-key, latest-only drop to keyframe,
 helper restarts, offer/RTCP parsing, WebRTC's keyframe unit, RTP clock and pacer queue), `test/input.ts` (live touch straight to the phone and its fallbacks, the HID sidecar's
-protocol, the WDA patch, latency metering, acks' `via`/`ms`), `test/orient.ts` (upright -> device mapping in all four orientations, units, the capture check, orientation in the list, hellos and on change), `test/touch.ts` (order, coalescing, acks, auto-release, wake first, fallbacks with a reason), `test/ui.ts` (UI tree flattening, the element finder, apps by name, `/ui`, `/tap-element`, `/type`, `/key`, `/launch`, `/act`, reports and verify), `test/info.ts` (the detail card: the battery / IORegistry / WDA parsers, the ~15 s cache, `GET /info`, `info` in the list, WDA's quiet read), `test/connect.ts` (a capture warmed ahead and kept warm, a keyframe at once on join, `connectMs` and `first-frame`, `POST /warm`), `test/reliability.ts` (an expired WDA session remade on a 4xx, never a stale UI tree, the settle wait and ids from a changed screen, a playing gesture holding the next action, HID inputs that time out or break off, HID reconnect), `test/heal.ts` (a fake WDA that expires its session, hangs or dies and an iproxy that exits, all healed and counted; a hung action's 504, bursts spaced, the probe before the first action after idle, wake-on-touch; units; `POST /focus`, `focused`, `percent` and `info` pushed), `test/rtc.ts` (WebRTC in mock mode with a node-datachannel client: signaling, ICE,
+protocol, the WDA patch, latency metering, acks' `via`/`ms`), `test/orient.ts` (upright -> device mapping in all four orientations, units, the capture check, orientation in the list, hellos and on change), `test/touch.ts` (order, coalescing, acks, auto-release, wake first, fallbacks with a reason), `test/ui.ts` (UI tree flattening, the element finder, apps by name, `/ui`, `/tap-element`, `/type`, `/key`, `/launch`, `/act`, reports and verify), `test/info.ts` (the detail card: the battery / IORegistry / WDA parsers, the ~15 s cache, `GET /info`, `info` in the list, WDA's quiet read), `test/connect.ts` (a capture warmed ahead and kept warm, a keyframe at once on join, `connectMs` and `first-frame`, `POST /warm`), `test/reliability.ts` (an expired WDA session remade on a 4xx, never a stale UI tree, the settle wait and ids from a changed screen, a playing gesture holding the next action, HID inputs that time out or break off, HID reconnect), `test/heal.ts` (a fake WDA that expires its session, hangs or dies and an iproxy that exits, all healed and counted; a hung action's 504, bursts spaced, the probe before the first action after idle, wake-on-touch; units; `POST /focus`, `focused`, `percent` and `info` pushed), `test/restart.ts` (WDA restarted only when it's really dead: a slow call restarts nothing, three unanswered asks of `/status` do; a 503 at once during a restart; a recover joins it; 4 attempts backed off, then "control down"; a recover or WDA answering brings it back), `test/rtc.ts` (WebRTC in mock mode with a node-datachannel client: signaling, ICE,
 RTP, PLI -> IDR, SPS/PPS with every keyframe, `rtc-key`, the RTP clock, data channels and acks, stats, rtc-error), `test/audio.ts` (the sound: the helper's audio records, `audio on/off`, the held capture, the Opus track beside the picture, a session without sound, the volume raised and put back, a crash's raise put right) and `test/smoke.ts` (a mock server: auth, every endpoint, MJPEG,
 H.264 WebSocket, the MJPEG fallback, ping/pong). Mock mode's H.264 is a real, decodable stream (a tiny built-in encoder:
 Constrained Baseline 208x448, I_PCM keyframes and skip-coded deltas), so clients can test decoding against it.

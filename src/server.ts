@@ -576,7 +576,11 @@ export function createServer(backend: Backend, token: string, updater?: Updater,
         if (req.method !== 'GET') throw new HttpError(405, 'use GET');
         const p = (await backend.list()).find((x) => x.udid === udid);
         if (!p) throw new HttpError(404, 'unknown phone');
-        return send(res, 200, { ok: true, udid, ...(await info.get(p, flag(url.searchParams.get('fresh')))) });
+        return send(res, 200, {
+          ok: true, udid, ...(await info.get(p, flag(url.searchParams.get('fresh')))),
+          // the control link as it is (2026-11-18): a restart under way, or down after the restarts gave up, and why
+          control: p.control, controlDown: p.controlDown ?? null, restarting: p.restarting ?? null,
+        });
       }
       if (action === 'warm') {
         if (req.method !== 'POST') throw new HttpError(405, 'use POST');
@@ -617,6 +621,8 @@ export function createServer(backend: Backend, token: string, updater?: Updater,
       }
 
       // ---- the AI control API: read the screen, act on what it says, hear what changed ----
+      // a WDA restart under way (or control down after it): a 503 at once, never a wait behind it (2026-11-18)
+      if (action === 'ui' || action === 'apps' || action === 'tap-element' || action === 'act') backend.controlGate?.(udid);
       if (action === 'ui') {
         if (req.method !== 'GET') throw new HttpError(405, 'use GET');
         const q = url.searchParams;
@@ -666,7 +672,7 @@ export function createServer(backend: Backend, token: string, updater?: Updater,
       }
       send(res, 200, await agent.inOrder(udid, () => agent.action(udid, msg)));
     } catch (err) {
-      if (err instanceof HttpError) return send(res, err.status, { ok: false, error: err.message });
+      if (err instanceof HttpError) return send(res, err.status, { ok: false, error: err.message, ...(err.extra ?? {}) });
       console.error(err);
       send(res, 500, { ok: false, error: 'internal error' });
     }

@@ -206,7 +206,9 @@ const KEYS = ['battery', 'temperatureC', 'app', 'uptimeSec', 'model', 'ios', 'bo
 
     const { status, body } = await get(`/phones/${u1}/info`);
     assert.equal(status, 200);
-    assert.deepEqual(Object.keys(body), ['ok', 'udid', ...KEYS]);
+    // 2026-11-18: the control link as it is, after the card
+    assert.deepEqual(Object.keys(body), ['ok', 'udid', ...KEYS, 'control', 'controlDown', 'restarting']);
+    assert.deepEqual([body.control, body.controlDown, body.restarting], ['ready', null, null]);
     assert.deepEqual([body.ok, body.udid], [true, u1]);
     assert.deepEqual(body.battery, { level: 0.9, percent: 90, charging: true });
     assert.equal(body.temperatureC, 29.5);
