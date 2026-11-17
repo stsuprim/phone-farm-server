@@ -100,6 +100,55 @@ export function curvePath(a: [number, number], b: [number, number], ms: number, 
   return out;
 }
 
+/** A quick swipe's time when none is given (ms): a flick is short, so iOS sees its speed. */
+export const FLICK_MIN_MS = 150;
+export const FLICK_MAX_MS = 300;
+
+/** How long a flick of `dist` points takes: swipeMs kept within FLICK_MIN_MS..FLICK_MAX_MS. */
+export function flickMs(dist: number, rng?: Rng): number {
+  return Math.min(FLICK_MAX_MS, Math.max(FLICK_MIN_MS, swipeMs(dist, rng)));
+}
+
+/** A flick's progress (0..1 over 0..1): off the mark at a third of its speed, fastest at the lift (never at rest). */
+export function flickEase(t: number): number {
+  const u = Math.min(1, Math.max(0, t));
+  return 0.35 * u + 0.65 * u * u;
+}
+
+/**
+ * 2026-11-17: a quick swipe (Lotus's `phones_swipe` without a hold, the page's wheel) as one whole path, the same body
+ * phones_path sends: pressed at `a`, then a move every `stepMs` (8) over `ms`, reaching `b` at full speed, lifted
+ * with that last move. curvePath's minimum-jerk ease came to rest before the lift, so iOS saw no velocity (no
+ * fling, and a Home Screen page snapped back), and an exact swipe was one jump with a single move. Natural (an
+ * `rng`): a slight bow like curvePath's; exact: a straight line.
+ */
+export function flickPath(a: [number, number], b: [number, number], ms: number, rng: Rng | null, opts: CurveOptions = {}): PathPoint[] {
+  const step = Math.max(1, opts.stepMs ?? CURVE_STEP_MS);
+  const dur = Math.max(1, Math.round(ms));
+  const [ax, ay] = a;
+  const [bx, by] = b;
+  const dx = bx - ax;
+  const dy = by - ay;
+  const len = Math.hypot(dx, dy);
+  const bow = rng && len > 0 ? Math.min(24, len * between(rng, 0.03, 0.08)) * (rng() < 0.5 ? -1 : 1) : 0;
+  const nx = len > 0 ? -dy / len : 0;
+  const ny = len > 0 ? dx / len : 0;
+  const cx = ax + dx * 0.5 + nx * bow * 2;
+  const cy = ay + dy * 0.5 + ny * bow * 2;
+  const n = Math.max(2, Math.ceil(dur / step));
+  const out: PathPoint[] = [[ax, ay, 0]];
+  for (let i = 1; i < n; i++) {
+    const s = flickEase(i / n);
+    const m = 1 - s;
+    let x = m * m * ax + 2 * m * s * cx + s * s * bx;
+    let y = m * m * ay + 2 * m * s * cy + s * s * by;
+    if (opts.clamp) [x, y] = opts.clamp(x, y);
+    out.push([Math.round(x * 10) / 10, Math.round(y * 10) / 10, Math.round((i * dur) / n)]);
+  }
+  out.push([bx, by, dur]);
+  return out;
+}
+
 /** A drag's rest before the lift (ms), so the release isn't a fling. */
 export const DRAG_REST_MS = 150;
 

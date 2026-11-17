@@ -5,7 +5,7 @@ import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
 import { AddressInfo } from 'node:net';
 import { Control, swipePlan } from '../src/control.js';
-import { curvePath, dragPath, ease, seeded, swipeMs, tapPlan, TAP_HOLD_MAX, TAP_HOLD_MIN, TAP_OFFSET_MAX } from '../src/human.js';
+import { curvePath, dragPath, ease, flickEase, flickMs, flickPath, FLICK_MAX_MS, FLICK_MIN_MS, seeded, swipeMs, tapPlan, TAP_HOLD_MAX, TAP_HOLD_MIN, TAP_OFFSET_MAX } from '../src/human.js';
 import { MockBackend } from '../src/mock.js';
 import { createServer } from '../src/server.js';
 import { SettingsStore } from '../src/settings.js';
@@ -104,6 +104,32 @@ const quick = { minGapMs: 0, idleProbeMs: Infinity };
   ok('curvePath: exact ends, monotone progress, a slight bow, eased; swipeMs fits the length');
 }
 
+// ---- 2026-11-17: the quick swipe (a flick) as one whole path, at speed when it's lifted ----
+{
+  for (const rng of [seeded(5), null]) {
+    const a: [number, number] = [200, 700];
+    const b: [number, number] = [200, 200];
+    const ms = flickMs(500, rng ?? undefined);
+    assert.ok(ms >= FLICK_MIN_MS && ms <= FLICK_MAX_MS, `a flick is quick (${ms} ms)`);
+    const pts = flickPath(a, b, ms, rng);
+    assert.deepEqual(pts[0], [200, 700, 0], 'pressed exactly where asked');
+    assert.deepEqual(pts[pts.length - 1], [200, 200, ms], 'ends exactly where asked, at its time');
+    assert.ok(pts.length >= ms / 10, `a move every 8 ms or so (${pts.length} points over ${ms} ms)`);
+    for (let i = 1; i < pts.length; i++) assert.ok(pts[i]![2] > pts[i - 1]![2] && pts[i]![1] < pts[i - 1]![1], 'time and progress go on');
+    // at speed when it's lifted: the last step is the fastest, never a stop before the lift
+    const speed = (i: number) => Math.hypot(pts[i]![0] - pts[i - 1]![0], pts[i]![1] - pts[i - 1]![1]) / (pts[i]![2] - pts[i - 1]![2]);
+    const last = speed(pts.length - 1);
+    assert.ok(last > speed(1) * 3, 'slow off the mark, fastest at the lift');
+    assert.ok(last * 1000 > 2000, `a fling's speed at the lift (${Math.round(last * 1000)} pt/s)`);
+    if (!rng) assert.ok(pts.every(([x]) => x === 200), 'exact: a straight line');
+    else assert.ok(pts.some(([x]) => Math.abs(x - 200) > 1), 'natural: a slight bow');
+  }
+  assert.equal(flickEase(0), 0);
+  assert.equal(flickEase(1), 1);
+  assert.ok(flickMs(0) === FLICK_MIN_MS && flickMs(5000) === FLICK_MAX_MS);
+  ok('flickPath: pressed, a move every 8 ms, at speed when lifted (never eased to a stop); 150-300 ms');
+}
+
 // ---- the tap's offset and hold ----
 {
   const rng = seeded(99);
@@ -177,7 +203,11 @@ const quick = { minGapMs: 0, idleProbeMs: Infinity };
   await c.handle('p', { type: 'tap', x: 200, y: 400, unit: 'pt' });
   assert.deepEqual(taps[4], { x: 200, y: 400, hold: undefined }, 'off: exactly there, the route\'s own hold');
   await c.handle('p', { type: 'swipe', x1: 200, y1: 700, x2: 200, y2: 200, unit: 'pt' });
-  assert.deepEqual(gestures[3], [[200, 700, 0], [200, 200, 300]], 'off: one straight line, as before');
+  // 2026-11-17: a straight flick, a move every 8 ms (was one jump: [[200, 700, 0], [200, 200, 300]], which iOS took
+  // for no swipe at all)
+  const off = gestures[3]!;
+  assert.deepEqual([off[0], off[off.length - 1]], [[200, 700, 0], [200, 200, 300]], 'off: from there to there, at its time');
+  assert.ok(off.length > 30 && off.every(([x]) => x === 200), 'off: one straight line, a whole path');
   await c.handle('p', { type: 'hold', x: 200, y: 400, ms: 800, unit: 'pt' });
   assert.deepEqual(gestures[4], [[200, 400, 0], [200, 400, 800]]);
   await c.handle('p', { type: 'swipe', x1: 50, y1: 400, x2: 350, y2: 400, ms: 600, hold: 500, unit: 'pt' });

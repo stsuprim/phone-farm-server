@@ -332,6 +332,39 @@ const tick = () => new Promise((r) => setImmediate(r));
   await f.tick();
   assert.deepEqual(calls, [], 'a tested phone is not tested again by the check');
   ok('self-test: on demand, only on our build and only on an awake phone; never again by itself once it ran');
+
+  // 2026-11-17: on demand it's started and answered at once (Lotus said "can't be reached" while it waited); a second
+  // request while it runs says so; GET /api/wda's status shows it running, then what it found
+  let release!: () => void;
+  const gate = new Promise<void>((r) => (release = r));
+  let gated = false; // the install's own self-test runs straight through
+  const slow = new ForkInstaller({
+    meta: { version: 3, upstream: 'v16.15.3' }, enabled: true, tokens: new ForkTokens(), project: '/repo/wda', derivedData: '/b',
+    port: () => 28100,
+    build: async () => ({ ok: true, log: '' }),
+    switchTo: async () => ({ ok: true }),
+    selftest: async () => (gated && (await gate), { tested: true, mode: 2, modes: [{ mode: 2, works: true, why: null }] }),
+    awake: async () => true,
+    devices: async () => ['A'],
+    prepare: async () => {},
+    now: () => now, tickMs: 0, log: () => {},
+  });
+  await slow.tick();
+  gated = true;
+  const prevLive = slow.status().perDevice.A?.live ?? null;
+  const first = slow.selftestStart('A');
+  assert.deepEqual([first.started, first.running, typeof first.since], [true, true, 'string'], 'started at once, not waited for');
+  assert.deepEqual(first.live, prevLive, 'the last result kept comes with it');
+  assert.equal(slow.status().perDevice.A!.selftestRunning, first.since);
+  const again = slow.selftestStart('A');
+  assert.deepEqual([again.started, again.running, again.since], [false, true, first.since], 'one at a time');
+  assert.equal(slow.selftestStart('B').why, 'the phone is not running our WebDriverAgent build');
+  release();
+  for (let i = 0; i < 20 && slow.selftestRunning('A'); i++) await tick();
+  assert.equal(slow.selftestRunning('A'), false);
+  const done = slow.status().perDevice.A!;
+  assert.deepEqual([done.selftestRunning, done.live?.mode, done.live?.trigger], [null, 2, 'demand'], 'what it found, in the status');
+  ok('self-test on demand: started at once ({started: true}), one at a time, its result in the status when it ends');
 }
 
 // ---- POST /api/wda/:udid/selftest ----
@@ -339,7 +372,11 @@ const tick = () => new Promise((r) => setImmediate(r));
   const token = crypto.randomBytes(16).toString('hex');
   const backend = new MockBackend(1);
   const asked: string[] = [];
-  const fork = { status: () => ({}), selftestNow: async (u: string) => (asked.push(u), { tested: true, mode: 4, kind: 'segmented' }) };
+  const fork = {
+    status: () => ({}),
+    selftestNow: async (_u: string) => assert.fail('the HTTP route never waits for the self-test'),
+    selftestStart: (u: string) => (asked.push(u), { started: true, running: true, since: '2026-11-17T10:00:00.000Z', live: { tested: true, mode: 4, kind: 'segmented' } }),
+  };
   const server = createServer(backend, token, undefined, { watchMs: 0, fork });
   await new Promise<void>((r) => server.listen(0, '127.0.0.1', r));
   const host = `127.0.0.1:${(server.address() as AddressInfo).port}`;
@@ -347,12 +384,12 @@ const tick = () => new Promise((r) => setImmediate(r));
   try {
     const [udid] = ((await (await fetch(`http://${host}/phones`, { headers: auth })).json()) as any[]).map((p) => p.udid as string);
     const r = await fetch(`http://${host}/api/wda/${udid}/selftest`, { method: 'POST', headers: auth, body: '{}' });
-    assert.equal(r.status, 200);
-    assert.deepEqual(await r.json(), { ok: true, udid, live: { tested: true, mode: 4, kind: 'segmented' } });
+    assert.equal(r.status, 202);
+    assert.deepEqual(await r.json(), { ok: true, udid, started: true, running: true, since: '2026-11-17T10:00:00.000Z', live: { tested: true, mode: 4, kind: 'segmented' } });
     assert.deepEqual(asked, [udid]);
     assert.equal((await fetch(`http://${host}/api/wda/nope/selftest`, { method: 'POST', headers: auth, body: '{}' })).status, 404);
     assert.equal((await fetch(`http://${host}/api/wda/${udid}/selftest`, { headers: auth })).status, 405);
-    ok('POST /api/wda/:udid/selftest runs it now and answers what it found');
+    ok('POST /api/wda/:udid/selftest starts it and answers at once (202, the last result kept)');
   } finally {
     server.closeAllConnections();
     await new Promise<void>((r) => server.close(() => r()));

@@ -315,8 +315,11 @@ export interface ForkStatus {
   upstream: string | null;
   /** Why nothing can be installed at all (no team id, not macOS...), or null. */
   problem: string | null;
-  /** `liveUsed` (2026-11-17): the mode the owner's touch really uses (usableLiveMode); 0 = whole on "up". */
-  perDevice: Record<string, Omit<ForkDevice, 'nextTryAt' | 'at'> & { nextTryAt: string | null; at: string; port: number | null; liveUsed: number }>;
+  /**
+   * `liveUsed` (2026-11-17): the mode the owner's touch really uses (usableLiveMode); 0 = whole on "up".
+   * `selftestRunning`: when an on-demand self-test started (ISO), while it runs; null otherwise.
+   */
+  perDevice: Record<string, Omit<ForkDevice, 'nextTryAt' | 'at'> & { nextTryAt: string | null; at: string; port: number | null; liveUsed: number; selftestRunning: string | null }>;
 }
 
 const MIN = 60_000;
@@ -413,6 +416,8 @@ export function readSelfTest(r: SelfTestAnswer): { tested: boolean; mode: number
 /** Keeps each phone's state and installs our build wherever it's missing or older than the repo's. */
 export class ForkInstaller {
   private devices: Record<string, ForkDevice> = {};
+  /** On-demand self-tests running now: udid -> when it started (ms since the epoch). */
+  private testing = new Map<string, number>();
   private running?: Promise<void>;
   private timer?: NodeJS.Timeout;
   private first?: NodeJS.Timeout;
@@ -671,6 +676,35 @@ export class ForkInstaller {
     return this.liveTest(udid, 'demand');
   }
 
+  /**
+   * 2026-11-17: an on-demand self-test started without waiting for it (POST /api/wda/:udid/selftest): it wakes the
+   * phone and tries every mode, which takes longer than a client waits (Lotus said "the phone server can't be
+   * reached"). `started: true` when it began now, false when one is already running (`since`) or can't run (`why`);
+   * `live` is the last result kept. What it finds shows in GET /api/wda (`perDevice.<udid>.live`, and
+   * `selftestRunning` while it runs).
+   */
+  selftestStart(udid: string): { started: boolean; running: boolean; since: string | null; live: LiveTest | null; why?: string } {
+    const d = this.devices[udid];
+    const last = d?.live ?? null;
+    if (!d || d.state !== 'fork') return { started: false, running: false, since: null, live: last, why: 'the phone is not running our WebDriverAgent build' };
+    if (!this.o.selftest) return { started: false, running: false, since: null, live: last, why: 'the self-test is off (WDA_LIVE_TOUCH=off)' };
+    const was = this.testing.get(udid);
+    if (was !== undefined) return { started: false, running: true, since: new Date(was).toISOString(), live: last };
+    const at = this.now();
+    this.testing.set(udid, at);
+    void this.liveTest(udid, 'demand')
+      .catch((err) => this.log(`${udid.slice(-8)}: the self-test failed: ${(err as Error).message}`))
+      .finally(() => {
+        if (this.testing.get(udid) === at) this.testing.delete(udid);
+      });
+    return { started: true, running: true, since: new Date(at).toISOString(), live: last };
+  }
+
+  /** Whether an on-demand self-test is running on that phone now. */
+  selftestRunning(udid: string): boolean {
+    return this.testing.has(udid);
+  }
+
   private async liveRetry(udid: string): Promise<void> {
     const d = this.devices[udid];
     if (!d || d.state !== 'fork' || !this.o.selftest) return;
@@ -691,7 +725,8 @@ export class ForkInstaller {
         port = null;
       }
       const liveUsed = d.live?.tested ? usableLiveMode(d.live.mode, this.o.liveSetting ?? 'auto') : 0;
-      perDevice[udid] = { ...d, nextTryAt: d.nextTryAt ? new Date(d.nextTryAt).toISOString() : null, at: new Date(d.at).toISOString(), port, liveUsed };
+      const since = this.testing.get(udid);
+      perDevice[udid] = { ...d, nextTryAt: d.nextTryAt ? new Date(d.nextTryAt).toISOString() : null, at: new Date(d.at).toISOString(), port, liveUsed, selftestRunning: since !== undefined ? new Date(since).toISOString() : null };
     }
     return { enabled: this.o.enabled, version: this.o.meta?.version ?? null, upstream: this.o.meta?.upstream ?? null, problem: this.problem(), perDevice };
   }

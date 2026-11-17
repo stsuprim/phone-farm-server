@@ -157,7 +157,10 @@ const near = (a: number[], b: number[], eps = 1e-9) => a.length === b.length && 
   await c.handle('P', { type: 'swipe', x1: 0.1, y1: 0.5, x2: 0.9, y2: 0.5, ms: 100 });
   await c.handle('P', { type: 'path', points: [[0, 0, 0], [1, 1, 50]], unit: 'norm' });
   await c.handle('P', { type: 'tap', x: 100, y: 200 }); // no unit, outside 0..1: points, as before units
-  assert.deepEqual(calls, ['tap 843,0', 'gesture 84,195 760,195', 'gesture 0,0 843,389', 'tap 100,200']);
+  // 2026-11-17: a swipe is a whole path now (a move every 8 ms): its ends are what's mapped
+  const ends = (c: string) => (c.startsWith('gesture ') ? ((w) => `gesture ${w[1]} ${w[w.length - 1]}`)(c.split(' ')) : c);
+  assert.ok(calls[1]!.split(' ').length > 4, 'the swipe is a path, not one jump');
+  assert.deepEqual(calls.map(ends), ['tap 843,0', 'gesture 84,195 760,195', 'gesture 0,0 843,389', 'tap 100,200']);
   ok('Control: normalized, pixel and point coordinates map to upright points in all four orientations, clamped');
 }
 {

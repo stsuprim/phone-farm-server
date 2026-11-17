@@ -193,23 +193,24 @@ assert.deepEqual([TOUCH_RELEASE_MS, TOUCH_QUIET_MS, HOLD_REPEAT_MS, OWNER_GRACE_
   assert.ok(whole.every(([x]) => x === 100), 'a straight line stays straight');
   assert.deepEqual([whole[0]![1], whole[whole.length - 1]![1], whole[whole.length - 1]![2]], [700, 100, 300]);
 
-  // Lotus's own two-point swipe: bowed and eased; its tap: a few points off and held a natural moment
+  // Lotus's own two-point swipe: a bowed flick (2026-11-17: at speed when lifted, 150-300 ms); its tap: a few points
+  // off and held a natural moment
   gestures.length = 0;
   calls.length = 0;
   await c.handle('P', { type: 'swipe', x1: 200, y1: 700, x2: 200, y2: 200, unit: 'pt' });
   const tool = gestures[0]!;
   assert.ok(tool.length > 10, 'a made path, not two points');
   assert.ok(tool.some(([x]) => Math.abs(x - 200) > 1), 'bowed to one side');
-  const mid = tool[Math.floor(tool.length / 2)]!;
   const firstStep = Math.abs(tool[1]![1] - tool[0]![1]);
-  const midStep = Math.abs(mid[1] - tool[Math.floor(tool.length / 2) - 1]![1]);
-  assert.ok(midStep > firstStep * 3, 'eased: slow off the mark, fastest mid-way');
+  const lastStep = Math.abs(tool[tool.length - 1]![1] - tool[tool.length - 2]![1]);
+  assert.ok(lastStep > firstStep * 3, 'a flick: slow off the mark, fastest at the lift');
+  assert.ok(tool[tool.length - 1]![2] >= 150 && tool[tool.length - 1]![2] <= 300, 'quick');
   assert.deepEqual([tool[0]![0], tool[0]![1], tool[tool.length - 1]![0], tool[tool.length - 1]![1]], [200, 700, 200, 200], 'the ends are exact');
   await c.handle('P', { type: 'tap', x: 200, y: 400, unit: 'pt' });
   const m = /^tap ([\d.]+),([\d.]+) hold (\d+)$/.exec(calls[calls.length - 1]!)!;
   assert.ok(m, `a natural tap says its hold: ${calls[calls.length - 1]}`);
   assert.ok(Math.hypot(Number(m[1]) - 200, Number(m[2]) - 400) <= 4.3 && Number(m[3]) >= 50 && Number(m[3]) <= 120);
-  ok("natural touch: the owner's live and buffered drags and whole swipes go as made; Lotus's swipe is bowed and eased, its tap offset and held");
+  ok("natural touch: the owner's live and buffered drags and whole swipes go as made; Lotus's swipe is a bowed flick, its tap offset and held");
 }
 
 // ---- a live press never waits for what only WDA needs: a health check, the idle probe, the breath between actions ----

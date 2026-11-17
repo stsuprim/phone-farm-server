@@ -64,7 +64,8 @@ long press still goes whole; what segmented can't do is carry one contact throug
 turns into a drag lifts after its first segment). The answer now has `modes: [{mode, works, why}]`, every mode's
 result. The server wakes and unlocks the phone first and checks it's awake (WDA's lock state and a look at the
 screen), tries once more when it found nothing, runs it after each install and on demand
-(`POST /api/wda/:udid/selftest`), and never when Lotus's page merely opens.
+(`POST /api/wda/:udid/selftest`; since 2026-11-17 it's started and answered at once, `202 { started, running, since,
+live }`, and what it finds shows in `GET /api/wda`), and never when Lotus's page merely opens.
 
 **v3 (2026-11-17): gapped segments, mode 5.** On v2, iPhone-2 (iOS 18.7.8) passed mode 4, but iPhone-1 (iOS 18.5)
 gave `'BMMMMMMMME'`, 48 pt, 811 ms: one touch of one segment's length (60 pt less a frame; a merge of both would be
