@@ -181,7 +181,7 @@ const quick = { minGapMs: 0, idleProbeMs: Infinity };
   assert.ok(taps[1]!.x >= 180 && taps[1]!.x <= 220 && taps[1]!.y >= 192 && taps[1]!.y <= 208, 'inside the element it aimed at');
   await c.handle('p', { type: 'swipe', x1: 200, y1: 700, x2: 200, y2: 200, unit: 'pt' });
   const sw = gestures[0]!;
-  assert.ok(sw.length > 20, 'a sampled curve');
+  assert.ok(sw.length > 12, 'a sampled curve (a move every 16 ms for Lotus)');
   assert.deepEqual(sw[0], [200, 700, 0]);
   assert.deepEqual([sw[sw.length - 1]![0], sw[sw.length - 1]![1]], [200, 200]);
   const len = sw[sw.length - 1]![2];
@@ -203,11 +203,11 @@ const quick = { minGapMs: 0, idleProbeMs: Infinity };
   await c.handle('p', { type: 'tap', x: 200, y: 400, unit: 'pt' });
   assert.deepEqual(taps[4], { x: 200, y: 400, hold: undefined }, 'off: exactly there, the route\'s own hold');
   await c.handle('p', { type: 'swipe', x1: 200, y1: 700, x2: 200, y2: 200, unit: 'pt' });
-  // 2026-11-17: a straight flick, a move every 8 ms (was one jump: [[200, 700, 0], [200, 200, 300]], which iOS took
+  // 2026-11-17: a straight flick, a move every 16 ms for Lotus (was one jump: [[200, 700, 0], [200, 200, 300]], which iOS took
   // for no swipe at all)
   const off = gestures[3]!;
   assert.deepEqual([off[0], off[off.length - 1]], [[200, 700, 0], [200, 200, 300]], 'off: from there to there, at its time');
-  assert.ok(off.length > 30 && off.every(([x]) => x === 200), 'off: one straight line, a whole path');
+  assert.ok(off.length > 15 && off.every(([x]) => x === 200), 'off: one straight line, a whole path');
   await c.handle('p', { type: 'hold', x: 200, y: 400, ms: 800, unit: 'pt' });
   assert.deepEqual(gestures[4], [[200, 400, 0], [200, 400, 800]]);
   await c.handle('p', { type: 'swipe', x1: 50, y1: 400, x2: 350, y2: 400, ms: 600, hold: 500, unit: 'pt' });

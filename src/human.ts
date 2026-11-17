@@ -149,21 +149,27 @@ export function flickPath(a: [number, number], b: [number, number], ms: number, 
   return out;
 }
 
+/**
+ * 2026-11-17: Lotus's swipe and drag paths step every 16 ms: phones_path's and the page's spacing, proven on both
+ * phones (a flick sampled every 8 ms reached WDA as a whole gesture and moved nothing on either phone).
+ */
+export const LOTUS_SWIPE_STEP_MS = 16;
+
 /** A drag's rest before the lift (ms), so the release isn't a fling. */
 export const DRAG_REST_MS = 150;
 
 /**
  * A drag (`hold` > 0): pressed at `a` for `hold` ms, moved to `b` over `ms`, rested `DRAG_REST_MS`, lifted.
  * Natural (an `rng`): the move is a `curvePath`, the hold and the rest vary a little; exact: a straight line at even
- * speed (every CURVE_STEP_MS*2), the times as given.
+ * speed (every CURVE_STEP_MS*2), the times as given. `stepMs`: the natural move's step (CURVE_STEP_MS by default).
  */
-export function dragPath(a: [number, number], b: [number, number], hold: number, ms: number, rng: Rng | null, clamp?: CurveOptions['clamp']): PathPoint[] {
+export function dragPath(a: [number, number], b: [number, number], hold: number, ms: number, rng: Rng | null, clamp?: CurveOptions['clamp'], stepMs?: number): PathPoint[] {
   const h = Math.max(0, Math.round(rng ? hold * between(rng, 0.92, 1.08) : hold));
   const rest = rng ? Math.round(DRAG_REST_MS * between(rng, 0.85, 1.25)) : DRAG_REST_MS;
   const out: PathPoint[] = [[a[0], a[1], 0]];
   if (h > 0) out.push([a[0], a[1], h]);
   if (rng) {
-    out.push(...curvePath(a, b, ms, rng, { startMs: h, clamp }).slice(1));
+    out.push(...curvePath(a, b, ms, rng, { startMs: h, clamp, stepMs }).slice(1));
   } else {
     const steps = Math.min(400, Math.max(2, Math.round(ms / 16)));
     for (let i = 1; i <= steps; i++) {

@@ -1,5 +1,5 @@
 import crypto from 'node:crypto';
-import { Box, dragPath, flickMs, flickPath, Rng, seeded, swipeMs, tapPlan } from './human.js';
+import { Box, dragPath, flickMs, flickPath, Rng, seeded, LOTUS_SWIPE_STEP_MS, swipeMs, tapPlan } from './human.js';
 import { InputMeter, InputResult, InputVia } from './inputlog.js';
 import { guessUnit, parseUnit, toPoints, Unit } from './orient.js';
 import { Backend, ButtonName, ControlState, HttpError, PathPoint } from './types.js';
@@ -509,8 +509,10 @@ export class Control {
   /**
    * A two-point swipe's gesture. `hold` (ms) makes it a drag: pressed there first, then moved, then rested before the
    * lift (no fling; natural: bowed and eased, src/human.ts dragPath). 2026-11-17: without `hold` it's a flick, one
-   * whole path like phones_path's (flickPath: pressed, a move every 8 ms, at speed when it's lifted) over `ms`
+   * whole path like phones_path's (flickPath: pressed, a move every step, at speed when it's lifted) over `ms`
    * (natural: ±8 %) or, without one, 150-300 ms by its length; natural adds a slight bow, exact is straight.
+   * 2026-11-17, later: Lotus's swipes (anything not the owner's) step every LOTUS_SWIPE_STEP_MS (16 ms, phones_path's and
+   * the page's proven spacing; the 8 ms flick moved nothing on either phone); the owner's wheel keeps its 8 ms.
    */
   private swipePoints(udid: string, msg: Record<string, unknown>, a: [number, number], b: [number, number]): PathPoint[] {
     const natural = this.natural(msg);
@@ -518,17 +520,18 @@ export class Control {
     const hold = typeof msg.hold === 'number' && Number.isFinite(msg.hold) && msg.hold > 0 ? Math.min(msg.hold, 10000) : 0;
     const clamp = (x: number, y: number) => this.clamp(udid, x, y);
     const dist = Math.hypot(b[0] - a[0], b[1] - a[1]);
+    const stepMs = msg.owner === true ? undefined : LOTUS_SWIPE_STEP_MS;
     if (!natural) {
-      // 2026-11-17: a quick swipe is a whole path (a move every 8 ms, at speed at the lift), never one jump
-      if (hold) return dragPath(a, b, hold, duration(msg.ms, 300, 10000), null);
-      return flickPath(a, b, given ? duration(msg.ms, 300, 10000) : flickMs(dist), null, { clamp });
+      // 2026-11-17: a quick swipe is a whole path (a move every step, at speed at the lift), never one jump
+      if (hold) return dragPath(a, b, hold, duration(msg.ms, 300, 10000), null, undefined, stepMs);
+      return flickPath(a, b, given ? duration(msg.ms, 300, 10000) : flickMs(dist), null, { clamp, stepMs });
     }
     if (hold) {
       const ms = given ? Math.min(10000, Math.max(50, Math.round((msg.ms as number) * (0.92 + 0.16 * this.rng())))) : swipeMs(dist, this.rng);
-      return dragPath(a, b, hold, ms, this.rng, clamp);
+      return dragPath(a, b, hold, ms, this.rng, clamp, stepMs);
     }
     const ms = given ? Math.min(10000, Math.max(50, Math.round((msg.ms as number) * (0.92 + 0.16 * this.rng())))) : flickMs(dist, this.rng);
-    return flickPath(a, b, ms, this.rng, { clamp });
+    return flickPath(a, b, ms, this.rng, { clamp, stepMs });
   }
 
   /** The element a tap or hold aims at (`bounds: [x, y, w, h]` in the message's unit), in points; null without one. */
