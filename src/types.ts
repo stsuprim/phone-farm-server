@@ -242,7 +242,11 @@ export interface Backend {
   refreshOrientation?(udid: string, maxAgeMs?: number): Promise<Orientation | null>;
   /** Set by the server: called when a phone's orientation or upright size changed. */
   onOrientation?: (udid: string) => void;
-  screenshot(udid: string, format: ImageFormat): Promise<Image>;
+  /**
+   * One still. 2026-11-17: `size` (a JPEG): its long side at most `maxSide` px and its `quality` (1-100), for a smaller
+   * read (our build's /lotus/shot scales on the phone; other stills come as they are).
+   */
+  screenshot(udid: string, format: ImageFormat, size?: { maxSide?: number; quality?: number }): Promise<Image>;
   /**
    * Quick tap at a point, held `holdMs` (a natural tap's 50-120 ms; the route's own short hold when not given).
    * Resolves once it's injected (or queued on the phone), saying how it went.

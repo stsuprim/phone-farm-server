@@ -13,9 +13,35 @@ import { centerOf, describeQuery, ElementQuery, findElements, flattenUi, UiEleme
  * (a string or a label on screen, the foreground app) and says whether it came.
  */
 
-const UI_FRESH_MS = 300;
-const SETTLE_MS = 350;
-const SETTLE_LAUNCH_MS = 1000;
+/** 2026-11-17: a tree read this recently is given again (any action since makes it stale at once). Was 300 ms. */
+export const UI_FRESH_MS = 1000;
+/**
+ * The settle after an action (2026-11-17, the owner: "make it fast even for simple task"): at least SETTLE_MIN_MS,
+ * then as soon as the picture stops changing (two equal stills), at most SETTLE_MAX_MS; a launch at least
+ * SETTLE_LAUNCH_MIN_MS and at most SETTLE_LAUNCH_MAX_MS. Was a fixed 350 ms (a launch 1000 ms) plus a separate look.
+ * A backend without stills to compare waits SETTLE_MS.
+ */
+export const SETTLE_MS = 300;
+export const SETTLE_MIN_MS = 100;
+export const SETTLE_MAX_MS = 700;
+export const SETTLE_LAUNCH_MIN_MS = 400;
+export const SETTLE_LAUNCH_MAX_MS = 1600;
+/**
+ * Yielding to the owner (2026-11-17, the owner: "WHEN USER IS RANDOMLY TOUCHING WHILE UR WORKING PAUSE ALL UR
+ * SEQUENCE UNTIL USER LEAVES THE TOUCHES FOR LIKE 5 sec"): the owner's own input on a phone (a message with
+ * `owner: true`, or a live touch) pauses Lotus's actions on that phone until it has been quiet OWNER_QUIET_MS. A single
+ * action waits at most OWNER_WAIT_MS (under the client's 60 s), a batch OWNER_BATCH_WAIT_MS (under its 300 s).
+ */
+export const OWNER_QUIET_MS = 5000;
+export const OWNER_WAIT_MS = 45_000;
+export const OWNER_BATCH_WAIT_MS = 120_000;
+const OWNER_POLL_MS = 200;
+/** The words a single action answers with when the screen it aimed at went away while the owner touched it. */
+export const CHANGED_WHILE_TOUCHING = 'screen changed while you were touching';
+/** Timing lines in the log (2026-11-17, to measure reads and actions); off in tests (INPUT_LOG=0). */
+const timingLog = (line: string) => {
+  if (process.env.INPUT_LOG !== '0' && process.env.AGENT_TIMING !== '0') console.log(`[timing] ${line}`);
+};
 const VERIFY_MS = 3000;
 const VERIFY_MAX_MS = 20000;
 const MAX_STEPS = 50;
@@ -62,6 +88,10 @@ export interface ActionReport {
   /** With `verify`: the condition came (true) or the wait ran out (false). */
   verified?: boolean;
   error?: string;
+  /** 2026-11-17: how long it waited for the owner to stop touching the phone first. */
+  paused?: { ms: number };
+  /** 2026-11-17: where the time went (ms): the look before, the action, the settle (with the look after), the verify. */
+  timing?: { look: number; act: number; settle: number; verify?: number };
 }
 
 export interface Verify {
@@ -78,8 +108,10 @@ export interface Verify {
 
 export interface ActionOptions {
   verify?: unknown;
-  /** How long the screen gets to react before the look after (ms; default 350, a launch 1000). */
+  /** How long the screen gets to react before the look after (ms; default: until it stops changing, see SETTLE_*). */
   settleMs?: unknown;
+  /** The caller already waited for the owner (a batch between its steps, a tap-element before its look). */
+  noYield?: boolean;
 }
 
 interface Look {
@@ -122,6 +154,10 @@ function says(el: UiElement, q: ElementQuery): boolean {
 export class Agent {
   private uiCache = new Map<string, { at: number; t0: number; p: Promise<UiSnapshot> }>();
   private lane = new Map<string, Promise<void>>();
+  /** 2026-11-17: when the owner last gave a phone input (Date.now()), by udid. */
+  private ownerAt = new Map<string, number>();
+  /** 2026-11-17: phones on which an action of Lotus's is waiting for the owner now: since when (Date.now()). */
+  private pausedSince = new Map<string, number>();
   /** A read saw the app in front (the server keeps the phone's card up to date with it). */
   onApp?: (udid: string, bundleId: string) => void;
 
@@ -130,7 +166,15 @@ export class Agent {
     return this.lane.has(udid);
   }
 
-  constructor(private backend: Backend, private control: Control) {
+  /** OWNER_QUIET_MS and the waits' caps (tests make them short). */
+  private quietMs: number;
+  private waitOneMs: number;
+  private waitBatchMs: number;
+
+  constructor(private backend: Backend, private control: Control, opts: { ownerQuietMs?: number; ownerWaitMs?: number; ownerBatchWaitMs?: number } = {}) {
+    this.quietMs = opts.ownerQuietMs ?? OWNER_QUIET_MS;
+    this.waitOneMs = opts.ownerWaitMs ?? OWNER_WAIT_MS;
+    this.waitBatchMs = opts.ownerBatchWaitMs ?? OWNER_BATCH_WAIT_MS;
     control.resolveApp = (udid, name) => this.bundleId(udid, name);
   }
 
@@ -147,6 +191,57 @@ export class Agent {
       if (this.lane.get(udid) === done) this.lane.delete(udid);
     });
     return p;
+  }
+
+  // ---- the owner's input (2026-11-17) ----
+
+  /** The owner gave this phone input now (a touch, a swipe, a key from the page). */
+  ownerInput(udid: string): void {
+    this.ownerAt.set(udid, Date.now());
+  }
+
+  /** How long ago the owner last gave this phone input (ms); Infinity when never. */
+  ownerQuiet(udid: string): number {
+    const at = this.ownerAt.get(udid);
+    return at === undefined ? Infinity : Date.now() - at;
+  }
+
+  /** The owner touched this phone in the last OWNER_QUIET_MS. */
+  ownerActive(udid: string): boolean {
+    return this.ownerQuiet(udid) < this.quietMs;
+  }
+
+  /** For GET /phones/:udid/owner and the phone's list entry: `{ activeMs, paused, pausedMs }`. */
+  ownerState(udid: string): { active: boolean; quietMs: number | null; paused: boolean; pausedMs: number | null } {
+    const q = this.ownerQuiet(udid);
+    const since = this.pausedSince.get(udid);
+    return { active: q < this.quietMs, quietMs: Number.isFinite(q) ? q : null, paused: since !== undefined, pausedMs: since !== undefined ? Date.now() - since : null };
+  }
+
+  /**
+   * Wait while the owner is touching this phone: until OWNER_QUIET_MS without input, at most `maxMs`. Null when he
+   * wasn't touching it (nothing waited); else how long it waited and whether he stopped (`resumed`).
+   */
+  async yieldToOwner(udid: string, maxMs: number): Promise<{ ms: number; resumed: boolean } | null> {
+    if (!this.ownerActive(udid)) return null;
+    const t0 = Date.now();
+    this.pausedSince.set(udid, t0);
+    try {
+      while (this.ownerActive(udid)) {
+        if (Date.now() - t0 >= maxMs) return { ms: Date.now() - t0, resumed: false };
+        await sleep(Math.max(5, Math.min(OWNER_POLL_MS, this.quietMs - this.ownerQuiet(udid) + 5)));
+      }
+      return { ms: Date.now() - t0, resumed: true };
+    } finally {
+      if (this.pausedSince.get(udid) === t0) this.pausedSince.delete(udid);
+    }
+  }
+
+  /** A single action waits for the owner; still touching after OWNER_WAIT_MS: refused (409). */
+  private async yieldOne(udid: string): Promise<{ ms: number } | null> {
+    const p = await this.yieldToOwner(udid, this.waitOneMs);
+    if (p && !p.resumed) throw new HttpError(409, `the owner is still using the phone (touching it for ${Math.round(p.ms / 1000)} s): try again when he stops`);
+    return p ? { ms: p.ms } : null;
   }
 
   // ---- reading ----
@@ -196,6 +291,7 @@ export class Agent {
     if (this.control.lastAction(udid) > t0) [tree, app] = await read();
     const s = this.backend.screen(udid);
     const flat = flattenUi(tree, s, opts);
+    timingLog(`${udid.slice(-8)} ui: ${flat.elements.length} elements in ${round1(performance.now() - t0)} ms`);
     const px = (v: number | undefined) => (s?.scale && v ? Math.round(v * s.scale) : null);
     return {
       udid, orientation: this.backend.orientation?.(udid) ?? null, app,
@@ -260,17 +356,14 @@ export class Agent {
     return false;
   }
 
-  private settle(msg: Record<string, unknown>, asked: unknown): number {
-    if (typeof asked === 'number' && Number.isFinite(asked)) return Math.min(5000, Math.max(0, asked));
-    return msg.type === 'launch' ? SETTLE_LAUNCH_MS : SETTLE_MS;
-  }
-
   /**
    * One action (a control message: tap, swipe, path, hold, type, key, home, launch, wake) through the phone's queue,
    * with a look before and after. Throws what the action throws (bad input, WDA down...); a failed `verify` doesn't
    * throw: `verified: false` with why in `error`.
    */
   async action(udid: string, msg: Record<string, unknown>, opts: ActionOptions = {}, owner?: object): Promise<ActionReport> {
+    // 2026-11-17: Lotus's action waits while the owner is touching this phone (the owner's own never does)
+    const paused = msg.owner === true || opts.noYield ? null : await this.yieldOne(udid);
     const t0 = performance.now();
     const verify = parseVerify(opts.verify ?? msg.verify);
     const before = await this.look(udid);
@@ -280,19 +373,64 @@ export class Agent {
     const ms = round1(performance.now() - tAct);
     // a gesture answered when it was queued is still playing on the phone: the look after comes after it
     const play = r && typeof r.play_ms === 'number' && r.play_ms > 0 ? Math.min(r.play_ms, 60_000) : 0;
-    const wait = this.settle(msg, opts.settleMs ?? msg.settleMs) + play;
-    if (wait > 0) await sleep(wait);
+    if (play > 0) await sleep(play);
+    const tSettle = performance.now();
+    const after = await this.settleLook(udid, msg, opts.settleMs ?? msg.settleMs, !!before);
     const broke = this.backend.playFailure?.(udid, since);
     if (broke) throw new HttpError(502, `${broke}; look at the screen before trying again`);
-    const [after, v] = await Promise.all([before ? this.look(udid) : null, verify ? this.verify(udid, verify) : null]);
+    const tVerify = performance.now();
+    const v = verify ? await this.verify(udid, verify) : null;
+    const timing = { look: round1(tAct - t0), act: round1(ms + play), settle: round1(tVerify - tSettle), ...(v ? { verify: round1(performance.now() - tVerify) } : {}) };
+    const total = round1(performance.now() - t0);
+    timingLog(`${udid.slice(-8)} ${String(msg.type)}: look ${timing.look} · act ${timing.act} · settle ${timing.settle}${v ? ` · verify ${timing.verify}` : ''} · total ${total} ms${paused ? ` (waited ${paused.ms} ms for the owner)` : ''}`);
     return {
-      ok: true, ms, total_ms: round1(performance.now() - t0),
+      ok: true, ms, total_ms: total,
       ...(r ? { via: r.via, ...(r.reason ? { reason: r.reason } : {}) } : {}),
       changed: before && after && before.kind === after.kind ? before.hash !== after.hash : null,
       app: v?.app !== undefined ? v.app : await this.app(udid),
       orientation: this.backend.orientation?.(udid) ?? null,
       ...(v ? { verified: v.verified, ...(v.error ? { error: v.error } : {}) } : {}),
+      ...(paused ? { paused } : {}),
+      timing,
     };
+  }
+
+  /**
+   * 2026-11-17: the settle after an action and the look after it, together: a given `settleMs` is waited as it is;
+   * else at least SETTLE_MIN_MS (a launch SETTLE_LAUNCH_MIN_MS), then until two stills in a row are the same (at
+   * most SETTLE_MAX_MS, a launch SETTLE_LAUNCH_MAX_MS), and the last still is the look after. A backend without
+   * stills waits SETTLE_MS (a launch SETTLE_LAUNCH_MIN_MS) and looks.
+   */
+  private async settleLook(udid: string, msg: Record<string, unknown>, asked: unknown, look: boolean): Promise<Look | null> {
+    const launch = msg.type === 'launch';
+    if (typeof asked === 'number' && Number.isFinite(asked)) {
+      await sleep(Math.min(5000, Math.max(0, asked)));
+      return look ? this.look(udid) : null;
+    }
+    await sleep(launch ? SETTLE_LAUNCH_MIN_MS : SETTLE_MIN_MS);
+    if (this.backend.frameHash) {
+      const h = await this.stillHash(udid, (launch ? SETTLE_LAUNCH_MAX_MS : SETTLE_MAX_MS) - (launch ? SETTLE_LAUNCH_MIN_MS : SETTLE_MIN_MS));
+      return h ? { kind: 'frame', hash: h } : null;
+    }
+    await sleep(Math.max(0, SETTLE_MS - SETTLE_MIN_MS));
+    return look ? this.look(udid) : null;
+  }
+
+  /** Like `still`, but says the last still's hash (null: no still came). */
+  private async stillHash(udid: string, maxMs: number): Promise<string | null> {
+    const hash = this.backend.frameHash!.bind(this.backend);
+    const until = performance.now() + maxMs;
+    let t = performance.now();
+    let prev = await hash(udid).catch(() => null);
+    while (prev !== null && performance.now() < until) {
+      // two stills STILL_STEP_MS apart: a still that took that long already is the gap
+      await sleep(Math.max(0, STILL_STEP_MS - (performance.now() - t)));
+      t = performance.now();
+      const now = await hash(udid).catch(() => null);
+      if (now === null || now === prev) return now ?? prev;
+      prev = now;
+    }
+    return prev;
   }
 
   /** Wait for a condition: every given part must hold (`gone`: the text and label must be absent). */
@@ -348,6 +486,8 @@ export class Agent {
   async tapElement(udid: string, body: Record<string, unknown>, owner?: object): Promise<ActionReport & { element: UiElement; matches: number; moved?: boolean }> {
     const q = queryOf(body);
     if (!q.id && !q.label && !q.name && !q.text) throw new HttpError(400, 'say which element: "id" (from GET /ui), "label", "name" or "text"');
+    // 2026-11-17: waits while the owner is touching the phone, then looks at the screen as it is now
+    const paused = body.noYield === true ? null : await this.yieldOne(udid);
     // The phone just had input: the screen may still be arriving (a push, a sheet sliding in, an app opening). An
     // element read mid-way is tapped where it was, not where it ends up, so the picture is waited for to stop moving
     // first, and an element that isn't there yet gets a moment to appear even when no `timeoutMs` was given.
@@ -360,7 +500,7 @@ export class Agent {
     let snap: UiSnapshot;
     for (let first = true; ; first = false) {
       // an id can name any node, a container too; and after the first look only a new one can show something else
-      snap = await this.ui(udid, { all: !!q.id, fresh: !first });
+      snap = await this.ui(udid, { all: !!q.id, fresh: !first || !!paused }); // after the owner's touches: read anew
       found = findElements(snap.elements, q);
       if (found.length > (q.index ?? 0) || Date.now() >= until) break;
       await sleep(Math.min(300, Math.max(0, until - Date.now())));
@@ -368,6 +508,8 @@ export class Agent {
     const i = q.index ?? 0;
     if (!found.length) {
       const says = snap.text.replace(/\n/g, ' | ').slice(0, 240);
+      // the owner's touches moved the screen away from what Lotus read: said so, for a fresh read and a new plan
+      if (paused) throw new HttpError(409, `${CHANGED_WHILE_TOUCHING}: no element matches ${describeQuery(q)} now${says ? `; the screen says: ${says}` : ''}`);
       throw new HttpError(404, `no element matches ${describeQuery(q)}${says ? `; the screen says: ${says}` : ' (the screen has no readable text)'}`);
     }
     if (i >= found.length) throw new HttpError(404, `only ${found.length} element(s) match ${describeQuery({ ...q, index: undefined })}, so there is no index ${i}`);
@@ -394,8 +536,8 @@ export class Agent {
     // its box goes along: a natural tap lands a little off the middle, never outside the element
     const tap: Record<string, unknown> = { type: 'tap', x, y, unit: 'norm', bounds: [el.x, el.y, el.w, el.h] };
     if (body.natural === false) tap.natural = false;
-    const report = await this.action(udid, tap, { verify: body.verify, settleMs: body.settleMs }, owner);
-    return { ...report, element: el, matches: found.length, ...(moved ? { moved } : {}) };
+    const report = await this.action(udid, tap, { verify: body.verify, settleMs: body.settleMs, noYield: true }, owner);
+    return { ...report, element: el, matches: found.length, ...(moved ? { moved } : {}), ...(paused ? { paused } : {}) };
   }
 
   /**
@@ -404,7 +546,7 @@ export class Agent {
    * `{type: "wait", text | label | app, timeoutMs}`; a step may carry its own `verify`. It stops at the first step
    * that fails (or whose verify doesn't come) unless `continueOnError`. `ok` = every step went and every verify came.
    */
-  async batch(udid: string, body: Record<string, unknown>): Promise<ActionReport & { steps: Record<string, unknown>[]; done: number; failedAt?: number }> {
+  async batch(udid: string, body: Record<string, unknown>): Promise<ActionReport & { steps: Record<string, unknown>[]; done: number; failedAt?: number; paused?: { ms: number; resumed: boolean }; remaining?: Record<string, unknown>[] }> {
     const steps = body.steps;
     if (!Array.isArray(steps) || !steps.length || steps.length > MAX_STEPS) throw new HttpError(400, `"steps" must be an array of 1 to ${MAX_STEPS} actions`);
     for (const [i, s] of steps.entries()) {
@@ -417,6 +559,18 @@ export class Agent {
     let failedAt: number | undefined;
     let error: string | undefined;
     for (const [i, raw] of (steps as Record<string, unknown>[]).entries()) {
+      // 2026-11-17: the owner is touching this phone: the batch stops before this step, waits until he has left it
+      // OWNER_QUIET_MS, and hands back what's done and what's left (never replayed blindly on a screen he changed)
+      if (this.ownerActive(udid)) {
+        const p = (await this.yieldToOwner(udid, this.waitBatchMs)) ?? { ms: 0, resumed: true };
+        const remaining = (steps as Record<string, unknown>[]).slice(i);
+        timingLog(`${udid.slice(-8)} batch paused for the owner before step ${i} (${p.ms} ms, ${remaining.length} left)`);
+        return {
+          ok: true, ms: round1(performance.now() - t0), changed: out.some((s) => s.changed === true) ? true : null,
+          app: await this.app(udid), orientation: this.backend.orientation?.(udid) ?? null,
+          steps: out, done: out.filter((s) => s.ok).length, paused: p, remaining,
+        };
+      }
       const type = String(raw.type ?? raw.action ?? raw.do ?? '').replace(/[_ ]/g, '-').toLowerCase();
       const step: Record<string, unknown> = { ...raw, type };
       let rep: Record<string, unknown>;
@@ -434,12 +588,12 @@ export class Agent {
           }
           rep.ms = round1(performance.now() - ts);
         } else if (type === 'tap-element' || type === 'tapelement' || (type === 'tap' && typeof raw.x !== 'number')) {
-          const r = await this.tapElement(udid, raw);
+          const r = await this.tapElement(udid, { ...raw, noYield: true });
           rep = { ...r, element: r.element.id, label: r.element.label };
         } else if (type === 'lock') {
-          rep = { ...(await this.action(udid, { type: 'key', key: 'lock' }, { verify: raw.verify, settleMs: raw.settleMs })) };
+          rep = { ...(await this.action(udid, { type: 'key', key: 'lock' }, { verify: raw.verify, settleMs: raw.settleMs, noYield: true })) };
         } else {
-          rep = { ...(await this.action(udid, step, { verify: raw.verify, settleMs: raw.settleMs })) };
+          rep = { ...(await this.action(udid, step, { verify: raw.verify, settleMs: raw.settleMs, noYield: true })) };
         }
       } catch (err) {
         rep = { ok: false, ms: round1(performance.now() - ts), error: errorOf(err) };
@@ -460,6 +614,7 @@ export class Agent {
       error ??= v.error;
     }
     const after = before ? await this.look(udid) : null;
+    timingLog(`${udid.slice(-8)} batch of ${steps.length}: ${out.map((s) => `${String(s.type)} ${String(s.ms ?? '?')}`).join(' · ')} · total ${round1(performance.now() - t0)} ms`);
     return {
       ok, ms: round1(performance.now() - t0),
       changed: before && after && before.kind === after.kind ? before.hash !== after.hash : out.some((s) => s.changed === true) ? true : null,
@@ -481,6 +636,9 @@ export class Agent {
   async dispatch(udid: string, msg: Record<string, unknown>, owner?: object): Promise<Record<string, unknown> | null> {
     const t0 = performance.now();
     const id = msg.id ?? null;
+    // 2026-11-17: the owner's own input (a live touch, or what the page marks `owner: true`) pauses Lotus on this phone
+    // and never waits behind Lotus's reported actions or batch
+    if (msg.type === 'touch' || msg.owner === true) this.ownerInput(udid);
     try {
       if (msg.type === 'touch') {
         const r = await this.control.handle(udid, msg, owner);
@@ -499,7 +657,7 @@ export class Agent {
       }
       // a plain action behind a reported one keeps its place; otherwise it goes straight to the phone's queue
       const plain = () => this.control.handle(udid, msg, owner);
-      const r = await (this.lane.has(udid) ? this.inOrder(udid, plain) : plain());
+      const r = await (this.lane.has(udid) && msg.owner !== true ? this.inOrder(udid, plain) : plain());
       return id !== null ? { type: 'ack', id, ok: true, ...ackExtra(r, t0) } : null;
     } catch (err) {
       if (!(err instanceof HttpError)) console.error(err);

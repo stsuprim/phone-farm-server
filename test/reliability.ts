@@ -430,7 +430,7 @@ function scripted() {
   assert.equal((await agent.ui('P')).cached, true, 'and that one is kept again');
 
   // the phone had input while a (slow) tree was being read: read once more, so the answer is the screen after it
-  await sleep(320);
+  await sleep(1020); // past the kept tree (UI_FRESH_MS, 1 s since 2026-11-17)
   st.tree = A;
   st.sourceMs = 120;
   const calls = st.sourceCalls;
@@ -520,7 +520,7 @@ function scripted() {
   await assert.rejects(agent.tapElement('P', { id, label: 'Go', settleMs: 0 }), (e: HttpError) => e.status === 409 && /the screen changed since it was read: 0\.0\.0 is now Button "Delete", not label "Go"; read the screen again/.test(e.message));
   assert.equal(st.taps.length, 0, 'Delete was not pressed');
   // it's still there, somewhere else: that one is tapped
-  await sleep(320); // (the screen changed by itself here: past the 300 ms a read is kept)
+  await sleep(1020); // (the screen changed by itself here: past the 1 s a read is kept, UI_FRESH_MS)
   st.tree = movedTo;
   r = await agent.tapElement('P', { id, label: 'Go', settleMs: 0 });
   assert.deepEqual([st.taps.pop(), r.moved, r.element.label, r.element.id], ['300,520', true, 'Go', '0.0.1']);

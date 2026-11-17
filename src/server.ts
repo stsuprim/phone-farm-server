@@ -553,7 +553,7 @@ export function createServer(backend: Backend, token: string, updater?: Updater,
         return send(res, 200, await updater.now());
       }
 
-      const m = /^\/(?:phones|api\/devices)\/([^/]+)\/(screenshot|tap|swipe|path|hold|touch|type|key|home|launch|recover|input|wake|lock|ui|apps|orientation|tap-element|act|info|warm|focus)$/.exec(path);
+      const m = /^\/(?:phones|api\/devices)\/([^/]+)\/(screenshot|tap|swipe|path|hold|touch|type|key|home|launch|recover|input|wake|lock|ui|apps|orientation|tap-element|act|info|warm|focus|owner)$/.exec(path);
       if (!m) return send(res, 404, { error: 'not found' });
       const udid = decodeURIComponent(m[1]!);
       const action = m[2]!;
@@ -589,12 +589,23 @@ export function createServer(backend: Backend, token: string, updater?: Updater,
         return send(res, 200, { ok: true, udid, ...(await focus(udid)) });
       }
 
+      if (action === 'owner') {
+        // 2026-11-17: whether the owner is touching this phone now, and whether Lotus's action waits for him
+        if (req.method !== 'GET') throw new HttpError(405, 'use GET');
+        await phoneFor(udid);
+        return send(res, 200, { ok: true, udid, ...agent.ownerState(udid) });
+      }
+
       if (action === 'screenshot') {
         if (req.method !== 'GET') throw new HttpError(405, 'use GET');
         const f = url.searchParams.get('format') ?? 'png';
         if (f !== 'png' && f !== 'jpeg') throw new HttpError(400, 'format must be png or jpeg');
+        // 2026-11-17: ?max=<long side px>&quality=<1-100>: a smaller JPEG read (our build scales it on the phone)
+        const num = (k: string) => (url.searchParams.has(k) && Number.isFinite(Number(url.searchParams.get(k))) ? Number(url.searchParams.get(k)) : undefined);
+        const maxSide = num('max');
+        const quality = num('quality');
         await backend.refreshOrientation?.(udid, 2000).catch(() => null);
-        const img = await backend.screenshot(udid, f);
+        const img = maxSide && maxSide >= 100 ? await backend.screenshot(udid, f, { maxSide: Math.min(4000, maxSide), quality }) : await backend.screenshot(udid, f);
         const size = imageSize(img.data);
         res.writeHead(200, {
           'content-type': img.contentType, 'content-length': img.data.length, 'cache-control': 'no-store',
@@ -637,9 +648,16 @@ export function createServer(backend: Backend, token: string, updater?: Updater,
       if (action === 'act') return send(res, 200, await agent.inOrder(udid, () => agent.batch(udid, body)));
       const msg = { ...body, type: action };
       if (action === 'touch') {
+        agent.ownerInput(udid); // 2026-11-17: a live touch is the owner's: Lotus pauses on this phone
         // one live touch event (the fallback when the socket can't open): the same ack fields
         const r = await control.handle(udid, msg);
         return send(res, 200, { ok: true, ...ackExtra(r, t0), ...(touchAck(msg, t0, r) ?? {}) });
+      }
+      if (body.owner === true) {
+        // 2026-11-17: the owner's own input from the page: Lotus pauses on this phone, and this never waits for it
+        agent.ownerInput(udid);
+        const r = await control.handle(udid, msg);
+        return send(res, 200, { ok: true, ...ackExtra(r, t0) });
       }
       if (body.fast === true || flag(url.searchParams.get('fast'))) {
         // just the action: no look before and after (a client that draws the picture itself)

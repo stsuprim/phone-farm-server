@@ -13,6 +13,7 @@ import { PhonecapHost, profileFor } from './lanes.js';
 import { HidHost, HidPartial, hidPlayMs, HidTimeout, hidTypable, iosMajor, toHid } from './hid.js';
 import type { InputResult } from './inputlog.js';
 import { MjpegSource } from './mjpeg.js';
+import { imageSize } from './imgsize.js';
 import { frameAgrees, Orientation, Size } from './orient.js';
 import { still, stillHash, StillSource } from './stills.js';
 import { AppInfo, Backend, ButtonName, ControlState, H264Want, HttpError, Image, ImageFormat, InputMethods, PathPoint, PhoneFacts, PhoneInfo, ScreenInfo, StreamSettings } from './types.js';
@@ -503,8 +504,22 @@ export class RealBackend implements Backend {
   }
 
   /** One still: WDA's screenshot (JPEG from its MJPEG server when it has one, else its PNG). Never the live capture. */
-  async screenshot(udid: string, format: ImageFormat): Promise<Image> {
+  async screenshot(udid: string, format: ImageFormat, size?: { maxSide?: number; quality?: number }): Promise<Image> {
     this.known(udid);
+    // 2026-11-17: a smaller read on our build: the phone scales its JPEG itself (GET /lotus/shot), so a long side
+    // of 800 px at quality 60 comes in a fraction of the PNG's time and bytes
+    if (format === 'jpeg' && size?.maxSide && this.wda.forkInfo(udid)) {
+      const s = this.wda.screen(udid);
+      const long = s ? Math.max(s.width, s.height) * (s.scale || 1) : 0;
+      const scale = long > 0 ? Math.min(100, Math.max(10, Math.ceil((size.maxSide / long) * 100))) : FORK_STILL.scale;
+      const quality = Math.min(100, Math.max(10, Math.round(size.quality ?? 60)));
+      const t0 = performance.now();
+      const jpeg = await this.wda.shot(udid, scale, quality, 8000).catch(() => null);
+      if (jpeg && frameAgrees(imageSize(jpeg), this.wda.orientation(udid))) {
+        if (process.env.INPUT_LOG !== '0') console.log(`[timing] ${udid.slice(-8)} still: ${scale} % at q${quality}, ${jpeg.length} bytes in ${Math.round(performance.now() - t0)} ms`);
+        return { data: jpeg, contentType: 'image/jpeg' };
+      }
+    }
     return still(this.stills(udid), format);
   }
 
