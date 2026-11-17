@@ -144,7 +144,10 @@ export function usableLiveMode(found: number, setting: 'auto' | 'segmented' | 'o
   return found;
 }
 
-export const FORK_ROUTES = { info: '/lotus/info', gesture: '/lotus/gesture', touch: '/lotus/touch', shot: '/lotus/shot', selftest: '/lotus/selftest' } as const;
+export const FORK_ROUTES = { info: '/lotus/info', gesture: '/lotus/gesture', touch: '/lotus/touch', shot: '/lotus/shot', selftest: '/lotus/selftest', field: '/lotus/field' } as const;
+
+/** The first version of our build with POST /lotus/field (read and clear the focused field, 2026-11-18). */
+export const FIELD_FORK_VERSION = 4;
 
 /** What our build needs to be launched on one phone. */
 export interface ForkLaunch {

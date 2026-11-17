@@ -35,6 +35,7 @@ The port is not a source change: upstream reads `USE_PORT`. The server gives eac
 | `POST /lotus/touch` | `{phase: "down" \| "move" \| "up", x, y, mode, orientation: 1}`. One event of a live touch: the finger stays down on the phone between requests. See below. |
 | `GET /lotus/shot?scale=&quality=` | One still as a JPEG (`{jpeg: <base64>}`). What the server and the phone agent look at; this build has no MJPEG stream. |
 | `POST /lotus/selftest` | Finds out on the phone itself which way of holding a finger down works. See below. |
+| `POST /lotus/field` | v4 (2026-11-18). `{clear: bool}` -> `{found, secure, len, value?, method?, cleared?}`: the field with the keyboard (the app in front's element with keyboard focus). With `clear` it's emptied in one go first, each way only while the field still holds something: the keyboard's Clear key (one HID keypress), then Cmd+A (`typeKey`, Xcode 15+) and one Delete, then a triple tap and one Delete; never a Delete per letter. A secure field (`XCUIElementTypeSecureTextField`, or text that is only bullets) gives its length only, and always gets the Cmd+A step (a web view's password field can read empty when it isn't). Waits for a gesture still playing first. The server reads the field before and after `type` with it (README, "Typing"). Not compiled where it was written: the Mac's build is the check (a failed build keeps v3 running, and the server then answers a clear with 501). |
 
 ### Live touch and its self-test
 

@@ -553,7 +553,7 @@ export function createServer(backend: Backend, token: string, updater?: Updater,
         return send(res, 200, await updater.now());
       }
 
-      const m = /^\/(?:phones|api\/devices)\/([^/]+)\/(screenshot|tap|swipe|path|hold|touch|type|key|home|launch|recover|input|wake|lock|ui|apps|orientation|tap-element|act|info|warm|focus|owner)$/.exec(path);
+      const m = /^\/(?:phones|api\/devices)\/([^/]+)\/(screenshot|tap|swipe|path|hold|touch|type|clear|key|home|launch|recover|input|wake|lock|ui|apps|orientation|tap-element|act|info|warm|focus|owner)$/.exec(path);
       if (!m) return send(res, 404, { error: 'not found' });
       const udid = decodeURIComponent(m[1]!);
       const action = m[2]!;

@@ -10,6 +10,7 @@ import { jpegMaybeBlack, pngIsBlack, wakeScreen } from './dark.js';
 import { H264Info, H264Source, helperProducer, phoneStats, StartProducer } from './h264.js';
 import { basicFacts, mergeBattery, parseActiveApp, parseBatteryDomain, parseDeviceInfo, parseIoreg, parseWdaBattery } from './info.js';
 import { PhonecapHost, profileFor } from './lanes.js';
+import { FieldState, scrubTyped } from './field.js';
 import { HidHost, HidPartial, hidPlayMs, HidTimeout, hidTypable, iosMajor, toHid } from './hid.js';
 import type { InputResult } from './inputlog.js';
 import { MjpegSource } from './mjpeg.js';
@@ -29,6 +30,10 @@ const HID_SCRIPT = path.join(ROOT, 'native', 'hid', 'hid_input.py');
 // the venv RINOR_TAP_CHECK.md makes; HID_PYTHON wins
 const HID_VENV_PYTHON = path.join(os.homedir(), '.phonefarm-hid', 'bin', 'python');
 const HID_RETRY_MS = 60000;
+/** 2026-11-18: text through the HID keyboard only when asked (see type()). */
+const HID_TYPING = process.env.HID_TYPING === '1';
+/** How fast the phone's keyboard types (keys a second; about HID's old pace, readable on the phone's screen). */
+const TYPE_KEYS_PER_SECOND = Math.min(60, Math.max(4, Number(process.env.TYPE_KEYS_PER_SECOND) || 15));
 /**
  * 2026-11-16: a phone's USB screen capture runs only while a live view of it is open. It starts with the first viewer
  * and stops this long after the last one left (long enough for a page to redraw or a WebRTC session to be made anew,
@@ -712,17 +717,41 @@ export class RealBackend implements Backend {
     const play = via === 'wda-fast' ? { play_ms: length } : {};
     return hid.why ? { via, reason: hid.why, ...play } : { via, ...play };
   }
+  /**
+   * Text goes through the phone's own on-screen keyboard (XCTest, one event record the phone plays at
+   * TYPE_KEYS_PER_SECOND), so it can be watched as it's typed. 2026-11-18: no longer through the HID keyboard by
+   * default: its every key was a press and a lift sent as two messages down the cable, and a lift that came late (the
+   * first key, while the web view made room for the newly attached keyboard) held the key long enough for iOS to repeat
+   * it ("aaa" in a password); a HID keyboard also hides the on-screen one. HID_TYPING=1 brings it back.
+   */
   async type(udid: string, text: string): Promise<InputResult> {
     this.known(udid);
     let why: string | null = null;
-    if (hidTypable(text)) {
+    if (HID_TYPING && hidTypable(text)) {
       // answered when the last key is typed (not when it's queued): what follows finds the whole text there
       const hid = await this.viaHid(udid, 'type', ({ h }) => h.input('type', { text }, { done: true }));
       if ('done' in hid) return hid.done;
       why = hid.why;
     }
-    await this.wda.call(udid, 'POST', '/wda/keys', { value: Array.from(text) }, 10000 + text.length * 150);
+    try {
+      await this.wda.typeText(udid, text, TYPE_KEYS_PER_SECOND);
+    } catch (err) {
+      // never the text itself in an answer or a log (XCTest names its record after the first letters)
+      const m = scrubTyped((err as Error)?.message ?? String(err), text);
+      throw new HttpError(err instanceof HttpError ? err.status : 502, `${m}; it was not typed again: look at the field before trying again`);
+    }
     return why ? { via: 'wda', reason: why } : { via: 'wda' };
+  }
+
+  /** The focused field: read it, or with `clear` empty it in one go first (WdaManager.field). */
+  async field(udid: string, opts: { clear?: boolean } = {}): Promise<FieldState | null> {
+    this.known(udid);
+    if (opts.clear) return this.wda.field(udid, true);
+    try {
+      return await this.wda.field(udid, false);
+    } catch {
+      return null; // a read that fails is "not verified", never a failed action
+    }
   }
 
   // ---- what an agent needs: the UI tree, the foreground app, the apps, buttons, a frame hash ----

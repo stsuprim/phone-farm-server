@@ -37,7 +37,8 @@ recovering) or `WDA refused the request on <name>: ...` (WDA answered but said n
 | POST | `/phones/:udid/path` | `{points: [[x, y, ms], ...], unit?}` (`ms` since the gesture began; 1-5000 points, up to 60 s) | the report: one continuous touch with that timing |
 | POST | `/phones/:udid/hold` | `{x, y, ms, unit?}` (`ms` default 1000, max 30000) | the report |
 | POST | `/phones/:udid/touch` | `{phase, x, y, t, seq, id, unit?}` | `{ok:true, via, ms, ack: seq, id, phase, ...}`; same as a live `touch` message (fallback when the WebSocket can't open) |
-| POST | `/phones/:udid/type` | `{text, enter?}` (`enter: true` presses Return after it) | the report |
+| POST | `/phones/:udid/type` | `{text, enter?, clear?}` (`enter: true` presses Return after it; `clear: true` empties the focused field in one go first, and `text` may then be `""`; see [Typing](#typing)) | the report plus `check` (the field read back), `value` (not for a secure field), and with `clear` `cleared`, `clear_method` |
+| POST | `/phones/:udid/clear` | `{}` | empties the focused field in one go: the same as `type` with `{text: "", clear: true}` |
 | POST | `/phones/:udid/key` | `{key}`: `home`, `lock`, `volumeUp`, `volumeDown`, `enter`, `delete` | the report (`lock` locks the phone: the next action wakes it first) |
 | POST | `/phones/:udid/home` | `{}` | the report |
 | POST | `/phones/:udid/launch` | `{bundleId}` or `{name}` (as `GET .../apps` lists it: `"Settings"`, `"TikTok"`) | the report; 404 with nearby names when no app has that name |
@@ -378,8 +379,9 @@ What keeps a tap on the right thing:
  "verify":{"app":"com.apple.springboard"}}
 ```
 
-Steps (1-50): `tap`, `tap-element` (a `tap` without `x` is one), `swipe`, `path`, `hold`, `type`, `key`, `home`,
-`launch`, `wake`, `lock`, each with the body its own endpoint takes (and its own `verify`), plus `{"type":"wait","ms":500}`
+Steps (1-50): `tap`, `tap-element` (a `tap` without `x` is one), `swipe`, `path`, `hold`, `type` (with `clear?`),
+`clear`, `key`, `home`, `launch`, `wake`, `lock`, each with the body its own endpoint takes (and its own `verify`; a
+`type` or `clear` step answers with the same `check`), plus `{"type":"wait","ms":500}`
 and `{"type":"wait", text | label | app, gone?, timeoutMs}`. Answer:
 
 ```json
@@ -399,7 +401,7 @@ whenever the phone turns, and `{"type":"info", udid, info}` whenever its detail 
 [Info that keeps up](#info-that-keeps-up)). Messages in:
 
 - `{id, type:"tap", x, y}`, `{id, type:"swipe", x1, y1, x2, y2, ms}`, `{id, type:"swipe", points, duration}`,
-  `{id, type:"path", points}`, `{id, type:"hold", x, y, ms}`, `{id, type:"home"}`, `{id, type:"type", text, enter?}`,
+  `{id, type:"path", points}`, `{id, type:"hold", x, y, ms}`, `{id, type:"home"}`, `{id, type:"type", text, enter?, clear?}`, `{id, type:"clear"}`,
   `{id, type:"key", key}`, `{id, type:"launch", bundleId | name}`, `{id, type:"wake"}`, all with `unit` as over HTTP.
 - `{id, type:"tap-element", element | label | name | text, index?, timeoutMs?, verify?}` (`element` = the element's id
   from `/ui`, since `id` is the ack's here).
@@ -482,8 +484,9 @@ the ~1.2 s tap on the LAN. It was replaced, not tuned. Each action takes the fir
 
 1. **`hid`: CoreDevice HID** (the path Xcode 27's Device Hub uses; iOS 27+ only). `native/hid/hid_input.py` (one per phone,
    pymobiledevice3) holds a touch session open while someone views the phone (the media-stream auth gate, ~0.5-2 s to
-   open once, not per tap) and writes 58-byte touchscreen reports to it: a tap is a few ms on the Mac, live drags, typing
-   through a virtual HID keyboard (printable ASCII; other text goes through WDA). The session closes after
+   open once, not per tap) and writes 58-byte touchscreen reports to it: a tap is a few ms on the Mac, live drags (text
+   goes through the phone's own keyboard since 2026-11-18, see [Typing](#typing); `HID_TYPING=1` types through a
+   virtual HID keyboard again). The session closes after
    2.5 s with no live view holding it (2026-11-16; `HID_IDLE_SECONDS` is ignored): while it's open the phone's camera/mic apps get black/silence, and
    it can't start while one is in the foreground. In landscape the point is turned onto the panel (`HID_LANDSCAPE=swap` if the two landscapes come out mirrored on the Mac, `off` to use WDA
    whenever the phone is turned). Any failure falls back to WDA for that gesture, with the reason in its ack, and HID
@@ -502,8 +505,8 @@ What the two quick routes mean for order and for failures:
   only when it's through, so a Home press or a tap by another route never lands in the middle of a swipe. (The HID
   sidecar plays one thing at a time; an input sent behind a long hold used to time out after 5 s and kill the sidecar
   in the middle of the gesture. It now gets that much longer.)
-- **Text is answered when it's typed.** `type` through HID answers after the last key (about 50-70 ms a key), not when
-  it's queued, so a tap or Enter sent next finds the whole text there.
+- **Text is answered when it's typed.** `type` answers after the last key, not when it's queued, so a tap or Enter
+  sent next finds the whole text there.
 - **An input whose outcome isn't known is never repeated.** A HID input that the phone refused (nothing reached it)
   goes through WDA instead, as before. One that got no answer in time, or text that broke off partway, does not: it
   may have happened (or half of it has), and doing it again would tap twice or type the text twice. The action fails
@@ -515,6 +518,32 @@ What the two quick routes mean for order and for failures:
 per action, `INPUT_LOG=0` turns them off) give receive -> injected per action. `methods` says what each phone has:
 `hid` (`ready`, `starting`, `off`, `failed` with `hid_reason`, or `unsupported` with why) and `wda_fast` (`yes`, `no` =
 this WDA build has no fast route, `unknown` = not tried yet).
+
+### Typing
+
+2026-11-18 (`src/field.ts`; the Lotus side follows `cache/phones-type-contract.md`):
+
+- **Through the phone's own keyboard.** `type` sends the whole text to WDA's `/wda/keys` in one request, played by the
+  phone itself at `TYPE_KEYS_PER_SECOND` (default 15, about the old HID pace), so the on-screen keyboard stays up and
+  the text can be watched as it's typed. It used to go through the HID keyboard, where each key was a press and a
+  lift sent down the cable as two messages: a lift that came late (the first key, while a web view made room for the
+  newly attached keyboard) held the key long enough for iOS's key repeat, which is how a password got "aaa" in front
+  of it. A HID keyboard also hides the on-screen one. `HID_TYPING=1` brings the HID keyboard back.
+- **Sent once.** Text that failed partway is never sent again (not after a WDA recovery, not on a stale socket): the
+  answer is an error saying to look at the field. Only a refused session (nothing typed) is asked once more. Errors
+  never hold the text (XCTest names its event after the first letters; that's taken out).
+- **`clear: true`** (or `{type: "clear"}`) empties the focused field in one go before typing, never one Delete per
+  letter. Our WebDriverAgent build (v4, `POST /lotus/field`) does it on the phone: the keyboard's Clear key, then
+  Cmd+A and one Delete, then a triple tap and one Delete, each only while the field still holds something (a secure
+  field always gets Cmd+A, since a web view's password field can read empty when it isn't). A stock WDA: its element
+  clear on the active element, then Cmd+A and one Delete when that left something. The answer says `cleared` and
+  `clear_method` (`empty`, `clear-key`, `select-all`, `triple-tap`, `element-clear`). An older build of ours answers
+  501 until the server has installed v4 (by itself).
+- **Read back.** The field is read before and after the text (before Return, so a form that's sent doesn't hide it):
+  `check: {match, expected_len, value_len, secure}`. `match` is exact on an empty or cleared field; with text already
+  there the length must grow by exactly the text, which must be inside. `null` when the field couldn't be read. A
+  secure field (a password field, or text that is only bullets) gives its length only; anything else adds `value`
+  (at most 200 characters). Typed text and secure values are never logged.
 
 ## Live view: WebRTC, H.264, MJPEG
 

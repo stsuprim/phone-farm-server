@@ -227,7 +227,9 @@ const tree = node('Application', 'Settings', 0, 0, 390, 844, {}, [
     // POST /type {text, enter}, POST /key
     const typed: any = await (await post(`${dev}/type`, { text: 'hello', enter: true, verify: { text: 'hello' } })).json();
     assert.deepEqual([typed.ok, typed.changed, typed.verified], [true, true, true]);
-    assert.equal(backend.inputLog(udid).pop(), 'type "hello\\n"');
+    // 2026-11-18: the text, then the field read back (the check), then Return
+    assert.deepEqual(backend.inputLog(udid).slice(-2), ['type "hello"', 'type "\\n"']);
+    assert.deepEqual([typed.check.match, typed.check.expected_len, typed.check.secure, typed.value.endsWith('hello')], [true, 5, false, true]);
     const del: any = await (await post(`${dev}/key`, { key: 'delete' })).json();
     assert.deepEqual([del.ok, del.changed], [true, true]);
     for (const key of ['enter', 'volumeUp', 'volumeDown']) assert.equal((await (await post(`${ph}/key`, { key })).json()).ok, true, key);

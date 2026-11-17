@@ -24,6 +24,13 @@ export interface InputResult {
    * action waits for it, and a report looks at the screen after it.
    */
   play_ms?: number;
+  /** 2026-11-18, `type`: the field read back after typing (src/field.ts; never a secure field's text). */
+  check?: import('./field.js').TypeCheck;
+  /** `type` on a field that isn't secure: its text after typing, at most 200 characters. */
+  value?: string;
+  /** `type` with `clear` (or `clear`): whether the field was emptied, and how. */
+  cleared?: boolean;
+  clear_method?: string;
 }
 
 export interface InputSample {

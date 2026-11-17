@@ -7,6 +7,7 @@ import { mockProducer } from './h264mock.js';
 import { isLandscape, Orientation } from './orient.js';
 import { encodePng } from './png.js';
 import type { InputResult } from './inputlog.js';
+import { FieldState, visualLength } from './field.js';
 import { AppInfo, Backend, ButtonName, ControlState, H264Want, HttpError, Image, ImageFormat, InputMethods, PathPoint, PhoneFacts, PhoneInfo, ScreenInfo, StreamSettings, WarmState } from './types.js';
 
 const MOCK: InputResult = { via: 'mock' };
@@ -398,6 +399,17 @@ export class MockBackend implements Backend {
     for (const ch of text) p.typed = ch === '\b' ? p.typed.slice(0, -1) : (p.typed + ch).slice(-200);
     p.log.push(`type ${JSON.stringify(text)}`);
     return MOCK;
+  }
+  /** The phone's one text field (what was typed), never secure here. */
+  async field(udid: string, opts: { clear?: boolean } = {}): Promise<FieldState | null> {
+    const p = this.live(udid);
+    if (opts.clear) {
+      const had = p.typed.length > 0;
+      p.typed = '';
+      p.log.push('clear');
+      return { found: true, secure: false, len: 0, value: '', method: had ? 'element-clear' : 'empty', cleared: true };
+    }
+    return { found: true, secure: false, len: visualLength(p.typed), value: p.typed };
   }
   async home(udid: string): Promise<InputResult> {
     const p = this.live(udid);

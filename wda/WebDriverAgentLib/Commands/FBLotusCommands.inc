@@ -15,6 +15,10 @@
  *                         finger (modes 1-3) or, v2 (2026-11-17), segmented drags (mode 4: short whole
  *                         gestures the Mac's server sends through /lotus/gesture as the finger moves) and, v3,
  *                         gapped segments (mode 5: the same with a pause between two segments)
+ *   POST /lotus/field     v4 (2026-11-18): the field with the keyboard, {"clear": bool} -> {found, secure, len,
+ *                         value?, method?, cleared?}; with "clear" it's emptied in one go first (Clear key, then
+ *                         Cmd+A and one Delete, then a triple tap and one Delete). A secure field's text never
+ *                         leaves the phone, only its length.
  *
  * Coordinates are points of the screen as the record's orientation says (the Mac's server sends portrait points
  * with "orientation": 1, turning a landscape touch onto the panel itself).
@@ -30,6 +34,11 @@
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 
 #import "FBCommandHandler.h"
+#import "FBConfiguration.h"
+#import "FBXCElementSnapshot.h"
+#import "XCUIApplication+FBHelpers.h"
+#import "XCUIElement+FBTyping.h"
+#import "XCUIElement+FBUtilities.h"
 #import "FBCommandStatus.h"
 #import "FBImageProcessor.h"
 #import "FBLogger.h"
@@ -51,7 +60,7 @@
 #pragma clang diagnostic ignored "-Weverything"
 
 /** The version of our changes. The Mac's server installs this build on a phone whose build says another number. */
-static const NSInteger LotusForkVersion = 3;
+static const NSInteger LotusForkVersion = 4;
 static NSString *const LotusUpstreamTag = @"v16.15.3";
 
 /** How long one step of a live move takes on the phone (seconds): about a frame. */
@@ -139,6 +148,7 @@ static BOOL LotusLiveWatching = NO;
     [[FBRoute POST:@"/lotus/touch"].withoutSession respondWithTarget:self action:@selector(handleLotusTouch:)],
     [[FBRoute GET:@"/lotus/shot"].withoutSession.standalone respondWithTarget:self action:@selector(handleLotusShot:)],
     [[FBRoute POST:@"/lotus/selftest"].withoutSession respondWithTarget:self action:@selector(handleLotusSelfTest:)],
+    [[FBRoute POST:@"/lotus/field"].withoutSession respondWithTarget:self action:@selector(handleLotusField:)],
   ];
 }
 
@@ -826,6 +836,149 @@ static BOOL LotusLiveWatching = NO;
     @"lotus": @(LotusForkVersion),
     @"jpeg": [shot base64EncodedStringWithOptions:(NSDataBase64EncodingOptions)0],
   });
+}
+
+
+#pragma mark - The focused field (v4)
+
+/** Characters as a person counts them (an emoji or an accented letter is one). */
++ (NSUInteger)lotus_length:(NSString *)text
+{
+  __block NSUInteger count = 0;
+  [text enumerateSubstringsInRange:NSMakeRange(0, text.length)
+                           options:NSStringEnumerationByComposedCharacterSequences | NSStringEnumerationSubstringNotRequired
+                        usingBlock:^(NSString *substring, NSRange range, NSRange enclosing, BOOL *stop) {
+    count++;
+  }];
+  return count;
+}
+
+/**
+ The field as it reads now: {found, secure, len, value}. A placeholder shown in an empty field is no text. A secure
+ field (a password: XCUIElementTypeSecureTextField, or text that is only bullets) never gives its text, only its length.
+ */
++ (NSMutableDictionary *)lotus_fieldState:(XCUIElement *)field
+{
+  id<FBXCElementSnapshot> snapshot = nil;
+  @try {
+    snapshot = [field fb_standardSnapshot];
+  } @catch (NSException *exception) {
+    snapshot = nil;
+  }
+  if (nil == snapshot) {
+    return [@{@"found": @NO} mutableCopy];
+  }
+  id raw = snapshot.value;
+  NSString *value = [raw isKindOfClass:NSString.class] ? (NSString *)raw : @"";
+  NSString *placeholder = snapshot.placeholderValue;
+  if (placeholder.length > 0 && [value isEqualToString:placeholder]) {
+    value = @"";
+  }
+  NSString *dots = [NSString stringWithFormat:@"%C%C", (unichar)0x2022, (unichar)0x25CF];
+  NSString *rest = [value stringByTrimmingCharactersInSet:[NSCharacterSet characterSetWithCharactersInString:dots]];
+  BOOL secure = snapshot.elementType == XCUIElementTypeSecureTextField || (value.length > 0 && rest.length == 0);
+  NSMutableDictionary *state = [@{@"found": @YES, @"secure": @(secure), @"len": @([self lotus_length:value])} mutableCopy];
+  if (!secure) {
+    state[@"value"] = value;
+  }
+  return state;
+}
+
+/** Whether the field (as last read) still holds something, or is a secure field whose length can't be trusted. */
++ (BOOL)lotus_mayHoldText:(NSDictionary *)state secure:(BOOL)secure
+{
+  return [state[@"found"] boolValue] && ([state[@"len"] unsignedIntegerValue] > 0 || secure);
+}
+
+/** One Delete: it takes the selection when there is one. */
++ (void)lotus_deleteOnce
+{
+  NSError *error = nil;
+  FBTypeText(@"\b", FBConfiguration.sharedInstance.defaultTypingFrequency, &error);
+}
+
+/** Cmd+A in the field (XCTest's typeKey, Xcode 15+). NO when this XCTest can't type a key with a modifier. */
++ (BOOL)lotus_selectAllIn:(XCUIElement *)field
+{
+#if __clang_major__ >= 15
+  if ([field respondsToSelector:@selector(typeKey:modifierFlags:)]) {
+    @try {
+      [field typeKey:@"a" modifierFlags:(XCUIKeyModifierFlags)(1 << 4)]; // XCUIKeyModifierCommand
+      return YES;
+    } @catch (NSException *exception) {
+      return NO;
+    }
+  }
+#endif
+  return NO;
+}
+
+/**
+ POST /lotus/field {"clear": bool}: the field with the keyboard (the app in front's element with keyboard focus) as
+ {found, secure, len, value?}. With "clear" it's emptied in one go first, each way tried only while the field still
+ holds something: the keyboard's Clear key (one HID keypress), then select all (Cmd+A) and one Delete, then a triple
+ tap (selects the field's text) and one Delete. Never a Delete per letter. The answer adds "method" (the last way
+ tried, "empty" when there was nothing to clear) and "cleared". A web view's password field may read empty while it
+ isn't, so a secure field always gets the select-all step.
+ */
++ (id<FBResponsePayload>)handleLotusField:(FBRouteRequest *)request
+{
+  id clearArg = request.arguments[@"clear"];
+  BOOL clear = [clearArg isKindOfClass:NSNumber.class] && ((NSNumber *)clearArg).boolValue;
+  // a gesture still playing finishes first: its record and ours never overlap
+  NSDate *until = [NSDate dateWithTimeIntervalSinceNow:5.0];
+  while (LotusSynthBusy && until.timeIntervalSinceNow > 0) {
+    [self lotus_spin:0.02];
+  }
+  XCUIElement *field = nil;
+  @try {
+    field = XCUIApplication.fb_activeApplication.fb_activeElement;
+  } @catch (NSException *exception) {
+    field = nil;
+  }
+  if (nil == field) {
+    if (clear) {
+      return FBResponseWithStatus([FBCommandStatus invalidElementStateErrorWithMessage:@"no field has the keyboard: tap the field first" traceback:nil]);
+    }
+    return FBResponseWithObject(@{@"lotus": @(LotusForkVersion), @"found": @NO});
+  }
+  NSMutableDictionary *state = [self lotus_fieldState:field];
+  if (!clear) {
+    state[@"lotus"] = @(LotusForkVersion);
+    return FBResponseWithObject(state);
+  }
+  BOOL secure = [state[@"secure"] boolValue];
+  NSString *method = @"empty";
+  if ([self lotus_mayHoldText:state secure:secure]) {
+    method = @"clear-key";
+    [[XCUIDevice sharedDevice] fb_performIOHIDEventWithPage:0x07 usage:0x9C duration:0.01 error:nil]; // kHIDUsage_KeyboardClear
+    [self lotus_spin:0.1];
+    state = [self lotus_fieldState:field];
+  }
+  if ([self lotus_mayHoldText:state secure:secure] && [self lotus_selectAllIn:field]) {
+    method = @"select-all";
+    [self lotus_spin:0.05];
+    [self lotus_deleteOnce];
+    [self lotus_spin:0.1];
+    state = [self lotus_fieldState:field];
+  }
+  if ([self lotus_mayHoldText:state secure:NO]) {
+    method = @"triple-tap";
+    @try {
+      [field tapWithNumberOfTaps:3 numberOfTouches:1];
+      [self lotus_spin:0.2];
+      [self lotus_deleteOnce];
+      [self lotus_spin:0.1];
+    } @catch (NSException *exception) {
+      // the field went away meanwhile: what's read next says so
+    }
+    state = [self lotus_fieldState:field];
+  }
+  BOOL found = [state[@"found"] boolValue];
+  state[@"method"] = method;
+  state[@"cleared"] = @(found && [state[@"len"] unsignedIntegerValue] == 0);
+  state[@"lotus"] = @(LotusForkVersion);
+  return FBResponseWithObject(state);
 }
 
 @end

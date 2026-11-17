@@ -1,6 +1,7 @@
 import { resolveApp } from './apps.js';
 import { Control, touchAck } from './control.js';
 import type { InputResult } from './inputlog.js';
+import type { TypeCheck } from './field.js';
 import type { Orientation } from './orient.js';
 import { Backend, HttpError } from './types.js';
 import { centerOf, describeQuery, ElementQuery, findElements, flattenUi, UiElement, UiTree } from './ui.js';
@@ -92,6 +93,11 @@ export interface ActionReport {
   paused?: { ms: number };
   /** 2026-11-17: where the time went (ms): the look before, the action, the settle (with the look after), the verify. */
   timing?: { look: number; act: number; settle: number; verify?: number };
+  /** 2026-11-18, `type` and `clear`: the field read back (src/field.ts), its text when it isn't secure, the clear. */
+  check?: TypeCheck;
+  value?: string;
+  cleared?: boolean;
+  clear_method?: string;
 }
 
 export interface Verify {
@@ -386,6 +392,7 @@ export class Agent {
     return {
       ok: true, ms, total_ms: total,
       ...(r ? { via: r.via, ...(r.reason ? { reason: r.reason } : {}) } : {}),
+      ...typeExtra(r),
       changed: before && after && before.kind === after.kind ? before.hash !== after.hash : null,
       app: v?.app !== undefined ? v.app : await this.app(udid),
       orientation: this.backend.orientation?.(udid) ?? null,
@@ -673,5 +680,16 @@ export class Agent {
  * server's receive -> injected time, and why a slower route took it.
  */
 export function ackExtra(r: InputResult | void, t0: number): Record<string, unknown> {
-  return r ? { via: r.via, ms: round1(performance.now() - t0), ...(r.reason ? { reason: r.reason } : {}) } : {};
+  return r ? { via: r.via, ms: round1(performance.now() - t0), ...(r.reason ? { reason: r.reason } : {}), ...typeExtra(r) } : {};
+}
+
+/** 2026-11-18: what `type` and `clear` add to their answer: the read-back `check`, the field's text (never a secure one's), the clear. */
+export function typeExtra(r: InputResult | void): Record<string, unknown> {
+  if (!r) return {};
+  return {
+    ...(r.cleared !== undefined ? { cleared: r.cleared } : {}),
+    ...(r.clear_method ? { clear_method: r.clear_method } : {}),
+    ...(r.check ? { check: r.check } : {}),
+    ...(r.check && !r.check.secure && typeof r.value === 'string' ? { value: r.value } : {}),
+  };
 }

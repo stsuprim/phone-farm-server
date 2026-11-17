@@ -255,6 +255,12 @@ export interface Backend {
   /** One continuous touch through the points (>= 2), with their timing; used for swipe, path and hold. */
   gesture(udid: string, points: PathPoint[]): Promise<InputResult | void>;
   type(udid: string, text: string): Promise<InputResult | void>;
+  /**
+   * The focused field (2026-11-18): read it (null: none could be read; never throws for a read), or with `clear` empty
+   * it in one go first (WDA's clear, else select all and one Delete; throws when it can't). A secure field's text never
+   * comes back, only its length.
+   */
+  field?(udid: string, opts?: { clear?: boolean }): Promise<import('./field.js').FieldState | null>;
   home(udid: string): Promise<InputResult | void>;
   launch(udid: string, bundleId: string): Promise<InputResult | void>;
   /** The phone takes live touch (down/move/up injected as they come) right now. */

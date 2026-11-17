@@ -1,10 +1,14 @@
 import crypto from 'node:crypto';
 import { Box, dragPath, flickMs, flickPath, Rng, seeded, LOTUS_SWIPE_STEP_MS, swipeMs, tapPlan } from './human.js';
+import { FieldState, fieldValueOut, parseTypeRequest, TypeRequest, typeCheck } from './field.js';
 import { InputMeter, InputResult, InputVia } from './inputlog.js';
 import { guessUnit, parseUnit, toPoints, Unit } from './orient.js';
 import { Backend, ButtonName, ControlState, HttpError, PathPoint } from './types.js';
 
 const MAX_WAITING = 50; // actions queued per phone before new ones are refused
+/** 2026-11-18: time allowed for reading the focused field (twice per `type`) and for emptying it. */
+const FIELD_READ_MS = 8000;
+const FIELD_CLEAR_MS = 20000;
 const MAX_POINTS = 5000;
 const MAX_GESTURE_MS = 60000;
 const TAP_MS = 250; // a still touch lifted sooner than this is a tap
@@ -376,11 +380,14 @@ export class Control {
         }
         return this.gesture(udid, pts, 'path', tRecv);
       }
-      case 'type': {
-        if (typeof msg.text !== 'string') throw new HttpError(400, '"text" must be a string');
-        const text = msg.text + (msg.enter === true ? '\n' : '');
-        if (!text) throw new HttpError(400, '"text" is empty');
-        return this.run(udid, 'type', tRecv, () => this.backend.type(udid, text), { discrete: true, timeoutMs: this.actionTimeoutMs + text.length * 150 });
+      case 'type':
+      case 'clear': {
+        // 2026-11-18: `clear` empties the focused field in one go first; the field is read back after the text
+        const req = parseTypeRequest(msg);
+        const reads = this.backend.field ? FIELD_READ_MS * 2 + (req.clear ? FIELD_CLEAR_MS : 0) : 0;
+        return this.run(udid, msg.type === 'clear' ? 'clear' : 'type', tRecv, () => this.typeInto(udid, req), {
+          discrete: true, timeoutMs: this.actionTimeoutMs + (req.text.length + 1) * 150 + reads,
+        });
       }
       case 'key':
         return this.key(udid, msg.key, tRecv);
@@ -408,6 +415,38 @@ export class Control {
       default:
         throw new HttpError(400, `unknown action type ${JSON.stringify(msg.type ?? null)}`);
     }
+  }
+
+  /**
+   * `type` and `clear` (2026-11-18, the phones typing contract): empty the field first when asked (in one go, never a
+   * Delete per letter), type the text, read the field back for the `check` (before Return, so a form that's sent and
+   * gone doesn't hide what was typed), then Return if asked. A backend that can't read fields just types.
+   */
+  private async typeInto(udid: string, req: TypeRequest): Promise<InputResult | void> {
+    const b = this.backend;
+    let cleared: FieldState | null = null;
+    let before: FieldState | null = null;
+    if (req.clear) {
+      if (!b.field) throw new HttpError(501, 'this server cannot clear a field');
+      cleared = await b.field(udid, { clear: true });
+      // what's typed next must be all the field holds: checked against an empty field (a clear that left text fails)
+      before = { found: true, secure: !!cleared?.secure, len: 0, value: '' };
+    } else if (req.text && b.field) {
+      before = await b.field(udid);
+    }
+    let r: InputResult | void = undefined;
+    if (req.text) r = await b.type(udid, req.text);
+    const after = !b.field ? null : req.text ? await b.field(udid) : cleared;
+    if (req.enter) r = (await b.type(udid, '\n')) ?? r;
+    if (!b.field) return r;
+    const out: InputResult = { ...(r ?? { via: b.mock ? 'mock' : 'wda' }) };
+    if (req.clear) {
+      out.cleared = !!cleared && (cleared.cleared ?? (cleared.found && cleared.len === 0));
+      if (cleared?.method) out.clear_method = cleared.method;
+    }
+    out.check = typeCheck(req.text, before, after);
+    Object.assign(out, fieldValueOut(after));
+    return out;
   }
 
   private key(udid: string, key: unknown, tRecv: number): Promise<Result> {

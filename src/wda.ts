@@ -3,7 +3,8 @@ import fs from 'node:fs';
 import http from 'node:http';
 import path from 'node:path';
 import { Config } from './config.js';
-import { FORK_ROUTES, ForkLaunch, launchPlan, LIVE_GAPPED, LIVE_SEGMENTED, TOKEN_ENV, TOKEN_HEADER, usableLiveMode, WdaFlavor } from './fork.js';
+import { ClearStep, FieldState, fieldFrom, nextClearStep, scrubTyped } from './field.js';
+import { FIELD_FORK_VERSION, FORK_ROUTES, ForkLaunch, launchPlan, LIVE_GAPPED, LIVE_SEGMENTED, TOKEN_ENV, TOKEN_HEADER, usableLiveMode, WdaFlavor } from './fork.js';
 import { isLandscape, Orientation, orientationFromWda, portraitSize, uprightSize, uprightToPanel } from './orient.js';
 import { Segmenter } from './segments.js';
 import { ButtonName, ControlState, HttpError, PathPoint, ScreenInfo, StreamSettings } from './types.js';
@@ -600,10 +601,11 @@ export class WdaManager {
    * connection the other side had already closed is retried once on a fresh one, so a stale socket never looks
    * like WDA being down (which would trigger a session recovery).
    */
-  private async request(e: Entry, method: string, p: string, body: string | undefined, timeout: number): Promise<{ status: number; text: string }> {
+  private async request(e: Entry, method: string, p: string, body: string | undefined, timeout: number, resend = true): Promise<{ status: number; text: string }> {
     e.busy++;
     try {
-      const r = await this.requestOnce(e, method, p, body, timeout, false);
+      // `resend: false` (typing): never sent a second time, even on a stale socket (WDA may have typed it already)
+      const r = await this.requestOnce(e, method, p, body, timeout, !resend);
       // any answer at all, whatever it says: WDA is there
       e.lastAnswer = Date.now();
       e.misses = 0;
@@ -650,10 +652,10 @@ export class WdaManager {
     });
   }
 
-  private async raw(e: Entry, method: string, p: string, body?: unknown, timeout = 30000): Promise<any> {
+  private async raw(e: Entry, method: string, p: string, body?: unknown, timeout = 30000, resend = true): Promise<any> {
     let res: { status: number; text: string; ok?: boolean };
     try {
-      res = await this.request(e, method, p, body === undefined ? undefined : JSON.stringify(body), timeout);
+      res = await this.request(e, method, p, body === undefined ? undefined : JSON.stringify(body), timeout, resend);
     } catch (err) {
       const x = err as HttpErr;
       const why = x.code === 'TIMEOUT' ? `no answer within ${Math.round(timeout / 1000)}s` : `unreachable (${x.code ?? x.message})`;
@@ -1218,6 +1220,106 @@ export class WdaManager {
   /** A hardware button (XCUIDevice's: volumeUp, volumeDown, home). */
   async pressButton(udid: string, name: ButtonName | 'home'): Promise<void> {
     await this.call(udid, 'POST', '/wda/pressButton', { name }, this.timeouts.input);
+  }
+
+  /**
+   * Text through XCTest's keyboard (2026-11-18): the whole text is one event record the phone plays itself, key by key
+   * at `keysPerSecond`, on the on-screen keyboard (each key's press and lift are played on the phone, so no delay on
+   * the cable can hold a key down long enough for iOS to repeat it). Sent once only: never again after a recovery or
+   * on a stale socket, since part of it may be typed already; only a refused session (nothing typed) is asked again.
+   */
+  async typeText(udid: string, text: string, keysPerSecond: number): Promise<void> {
+    const e = await this.usable(udid);
+    const timeout = 10000 + Math.ceil((text.length * 1000) / Math.max(1, keysPerSecond)) * 2;
+    const body = { value: Array.from(text), frequency: Math.max(1, Math.round(keysPerSecond)) };
+    e.inflight++;
+    try {
+      const sid = await this.session(e);
+      try {
+        await this.raw(e, 'POST', `/session/${sid}/wda/keys`, body, timeout, false);
+      } catch (err) {
+        // a session WDA no longer knows refused the request before typing anything: once more on a new one
+        if (!(err instanceof WdaError) || err.kind !== 'session') throw err;
+        e.sessionId = undefined;
+        await this.raw(e, 'POST', `/session/${await this.session(e)}/wda/keys`, body, timeout, false);
+      }
+      e.lastOk = Date.now();
+    } catch (err) {
+      // never the text in a log or an answer (XCTest names its event after the first letters)
+      const safe = err instanceof WdaError ? Object.assign(new WdaError(err.kind, scrubTyped(err.message, text)), { timeout: err.timeout }) : err;
+      if (safe instanceof WdaError && safe.down) void this.recover(e, safe.message, safe.kind === 'session').catch(() => {});
+      throw this.named(e, safe);
+    } finally {
+      e.inflight--;
+    }
+  }
+
+  /**
+   * The focused field (2026-11-18): read it, or with `clear` empty it in one go first. Our build (v4+) does it all on
+   * the phone (POST /lotus/field); a stock WDA through its element routes: the active element, its clear, then select
+   * all and one Delete when that left something (nextClearStep). Null when no field can be read; a clear that can't
+   * be done here throws.
+   */
+  async field(udid: string, clear: boolean): Promise<FieldState | null> {
+    const e = this.entries.get(udid);
+    if (e && e.forkInfo && e.forkInfo.lotus >= FIELD_FORK_VERSION) {
+      const v = (await this.callNoSession(udid, 'POST', FORK_ROUTES.field, { clear }, clear ? 20000 : 8000))?.value;
+      return fieldFrom(v);
+    }
+    if (e && (e.forkInfo || e.flavor === 'fork' || e.token)) {
+      // an older build of ours serves only the routes it knows: no element routes
+      if (!clear) return null;
+      throw new HttpError(501, `the WebDriverAgent build on ${this.nameOf(udid)} can't clear a field yet: the server installs the new one by itself, try again in a few minutes`);
+    }
+    const id = await this.activeElement(udid);
+    if (!id) {
+      if (clear) throw new HttpError(409, 'no field has the keyboard: tap the field first');
+      return null;
+    }
+    let now = await this.readElement(udid, id);
+    if (!clear) return now;
+    const done: ClearStep[] = [];
+    let step: ClearStep | null;
+    while ((step = nextClearStep(now, done))) {
+      done.push(step);
+      if (step === 'element-clear') {
+        await this.call(udid, 'POST', `/element/${id}/clear`, {}, 15000).catch(() => {});
+      } else {
+        // Cmd+A selects the whole field; one Delete empties it (a Delete after nothing was selected takes one letter)
+        await this.call(udid, 'POST', '/wda/element/0/keyboardInput', { keys: [{ key: 'a', modifierFlags: 1 << 4 }] }, 8000);
+        await this.call(udid, 'POST', '/wda/keys', { value: [''] }, 8000);
+      }
+      now = await this.readElement(udid, id);
+    }
+    const method = done.length ? done[done.length - 1]! : 'empty';
+    return now ? { ...now, method, cleared: now.found && now.len === 0 } : { found: false, secure: false, len: null, method, cleared: false };
+  }
+
+  /** The id of the element with the keyboard (GET /element/active), or null. */
+  private async activeElement(udid: string): Promise<string | null> {
+    try {
+      const v = (await this.call(udid, 'GET', '/element/active', undefined, 8000))?.value;
+      // {ELEMENT: id} or the W3C form {"element-6066-…": id}: the one string in it
+      const id = v?.ELEMENT ?? (v && typeof v === 'object' ? Object.values(v).find((x) => typeof x === 'string') : undefined);
+      return typeof id === 'string' && id ? id : null;
+    } catch {
+      return null;
+    }
+  }
+
+  /** One element's type, value and placeholder as a field (a secure one keeps only its length). */
+  private async readElement(udid: string, id: string): Promise<FieldState | null> {
+    const attr = async (name: string) => {
+      try {
+        return (await this.call(udid, 'GET', `/element/${id}/attribute/${name}`, undefined, 6000))?.value ?? null;
+      } catch {
+        return undefined;
+      }
+    };
+    const type = await attr('type');
+    if (type === undefined) return null;
+    const [value, placeholder] = [await attr('value'), await attr('placeholderValue')];
+    return fieldFrom({ found: true, type, value, placeholder });
   }
 
   /** Whether this phone's WDA has the fast touch route (unknown until the first touch tries it). */
