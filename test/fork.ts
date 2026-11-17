@@ -13,10 +13,12 @@ import path from 'node:path';
 import { PassThrough } from 'node:stream';
 import { fileURLToPath } from 'node:url';
 import type { Config } from '../src/config.js';
-import { FORK_ROUTES, ForkInstaller, forkPort, ForkTokens, launchPlan, parsePorts, readForkMeta, retryAfter, RETRY_AFTER_MS, STOCK_MJPEG_PORT, STOCK_WDA_PORT, TOKEN_ENV, TOKEN_HEADER, WdaFlavor } from '../src/fork.js';
+import { FORK_ROUTES, ForkInstaller, LIVE_GAPPED, LIVE_SEGMENTED, usableLiveMode, forkPort, ForkTokens, launchPlan, parsePorts, readForkMeta, retryAfter, RETRY_AFTER_MS, STOCK_MJPEG_PORT, STOCK_WDA_PORT, TOKEN_ENV, TOKEN_HEADER, WdaFlavor } from '../src/fork.js';
+import { Control } from '../src/control.js';
 import { curvePath, seeded } from '../src/human.js';
 import { MockBackend } from '../src/mock.js';
 import { provisionDates, provisionTeam, WdaResigner } from '../src/resign.js';
+import type { Backend, PathPoint } from '../src/types.js';
 import { createServer } from '../src/server.js';
 import { FAST_TOUCH_ROUTE, gestureBody, gestureRoute, liveBody, WdaManager } from '../src/wda.js';
 
@@ -84,6 +86,8 @@ interface Fake {
   token: string | null;
   hits: { method: string; path: string; token: string | undefined; body: any }[];
   failedOnce: string | null;
+  /** W3C actions refused (a 400) while set: the gesture broke off on the phone. */
+  failActions?: boolean;
   close(): void;
 }
 const fakeWda = async (token: string | null): Promise<Fake> => {
@@ -117,6 +121,7 @@ const fakeWda = async (token: string | null): Promise<Fake> => {
       if (p === '/session/S1/window/size') return json(200, { value: { width: 390, height: 844 } });
       if (p === '/session/S1/orientation') return json(200, { value: 'PORTRAIT' });
       if (p === '/session/S1/appium/settings') return json(200, { value: null });
+      if (p === '/session/S1/actions' && req.method === 'POST' && w.failActions) return json(400, { value: { error: 'invalid argument', message: 'the gesture broke off' } });
       if (p === '/session/S1/actions') return json(200, { value: null });
       if (!w.token) return p === FAST_TOUCH_ROUTE ? json(200, { value: { queued: 1, lotus: 1 } }) : unknown();
       if (p === FORK_ROUTES.info) return json(200, { value: { lotus: 1, upstream: 'v16.15.3', mjpeg: false } });
@@ -285,10 +290,23 @@ const fakeSpawn = ((cmd: string, args: string[], opts: { env?: NodeJS.ProcessEnv
     // 2026-11-17, mode 4 (segmented, src/segments.ts): no /lotus/touch at all; the drag goes in short whole gestures
     // while it happens (the first one before the finger lifts), each starting where the last ended
     liveMode = 4;
+    // 2026-11-17 (the regression): by default a segmented finding is never used: the touch plays whole on "up"
+    assert.match(m.liveWhy('U1') ?? '', /segmented drags, which break quick swipes/);
+    await assert.rejects(m.liveTouch('U1', 'down', 100, 300), /segmented/);
+    liveMode = 5;
+    liveGap = 100;
+    assert.match(m.liveWhy('U1') ?? '', /segmented/, 'mode 5 neither');
+    liveGap = 0;
+    liveMode = 4;
+    (cfg as { wdaLiveTouch: string }).wdaLiveTouch = 'segmented'; // opt-in only
+    assert.equal(m.liveWhy('U1'), null);
     const n4 = ours.hits.length;
     await m.liveTouch('U1', 'down', 100, 300);
     assert.equal(ours.hits.length, n4, 'a press alone sends nothing yet (a tap or a long press goes whole)');
     await sleep(90);
+    await m.liveTouch('U1', 'move', 100, 315);
+    assert.equal(ours.hits.length, n4, 'nothing is cut in the first 350 ms: a quick swipe goes whole');
+    await sleep(300);
     await m.liveTouch('U1', 'move', 100, 330);
     assert.equal(ours.hits.length, n4 + 1, 'a segment goes while the finger is still down');
     await sleep(250);
@@ -307,7 +325,7 @@ const fakeSpawn = ((cmd: string, args: string[], opts: { env?: NodeJS.ProcessEnv
     await sleep(400); // the phone is thought busy with the last drag until then (src/segments.ts pacing)
     const n5 = ours.hits.length;
     await m.liveTouch('U1', 'down', 200, 300);
-    await sleep(90);
+    await sleep(380);
     await m.liveTouch('U1', 'move', 200, 340);
     await m.liveTouch('U1', 'up', 200, 380);
     const segs5 = ours.hits.slice(n5);
@@ -318,6 +336,7 @@ const fakeSpawn = ((cmd: string, args: string[], opts: { env?: NodeJS.ProcessEnv
     assert.deepEqual(gestureBody([[1, 2, 0]], 0, 0), { hold: 0, points: [[1, 2, 0]], orientation: 1 }, 'no gap: none sent');
     liveMode = 2;
     liveGap = 0;
+    (cfg as { wdaLiveTouch: string }).wdaLiveTouch = 'auto';
     // XCTest refused a live record on the phone: said once, and live touch is left alone until the runner restarts
     ours.failedOnce = 'XCTest refused the record';
     await assert.rejects(m.liveTouch('U1', 'down', 5, 5), /could not play the live touch/);
@@ -328,6 +347,94 @@ const fakeSpawn = ((cmd: string, args: string[], opts: { env?: NodeJS.ProcessEnv
     assert.match(m.liveWhy('U1') ?? '', /turned off/);
     (cfg as { wdaLiveTouch: string }).wdaLiveTouch = 'auto';
     ok('live touch: off until the self-test finds a mode, then down/move/up go as they come with that mode; a failure turns it off');
+
+    // ---- 2026-11-17, the settled design (the regression of d86e36f / 6d4266e) ----
+    // Both phones' self-tests found only segmented drags (iPhone-2 mode 4, iPhone-1 mode 5 with a gap). By default the
+    // owner's touch on such a phone is buffered and goes whole on "up" through the route that worked before the fork:
+    // ONE command with every point at its own time, the same body the stock era sent to /wda/lotus/touch (11a1caf).
+    assert.deepEqual([0, 1, 2, 3, 4, 5].map((f) => usableLiveMode(f, 'auto')), [0, 1, 2, 3, 0, 0], 'auto: a proven hold mode, never segmented');
+    assert.deepEqual([0, 2, 4, 5].map((f) => usableLiveMode(f, 'segmented')), [0, 2, 4, 5], 'segmented: opt-in');
+    assert.deepEqual([2, 4, 5].map((f) => usableLiveMode(f, 'off')), [0, 0, 0]);
+    {
+      const wb = {
+        mock: true,
+        screen: () => m.screen('U1'),
+        liveTouchReady: () => m.liveWhy('U1') === null,
+        liveTouchWhy: () => m.liveWhy('U1'),
+        liveTouch: async (_u: string, phase: 'down' | 'move' | 'up', x: number, y: number) => (await m.liveTouch('U1', phase, x, y), { via: 'wda-live' as const }),
+        tap: async (_u: string, x: number, y: number, hold?: number) => ({ via: await m.tap('U1', x, y, hold) }),
+        gesture: async (_u: string, pts: PathPoint[]) => ({ via: await m.actions('U1', pts) }),
+      } as unknown as Backend;
+      const c = new Control(wb);
+      let id = 0;
+      const t = (phase: string, x: number, y: number, seq: number, ms: number) => ({ type: 'touch', phase, x, y, t: ms, seq, id, unit: 'pt' });
+      for (const [mode, gap] of [[LIVE_SEGMENTED, 0], [LIVE_GAPPED, 100]] as const) {
+        liveMode = mode;
+        liveGap = gap;
+        assert.notEqual(m.liveWhy('U1'), null, 'no live touch: buffered');
+        // the owner's quick swipe: 120 ms, 300 pt up (a page swipe, a fling)
+        id++;
+        const n0 = ours.hits.length;
+        assert.equal((await c.handle('U1', t('down', 200, 700, 1, 0)))?.via, 'buffered');
+        for (let i = 1; i <= 4; i++) await c.handle('U1', t('move', 200, 700 - i * 60, 1 + i, i * 25));
+        assert.equal(ours.hits.length, n0, 'nothing reaches the phone before the lift (no segment, no live record)');
+        const r = await c.handle('U1', t('up', 200, 400, 6, 120));
+        assert.equal(r?.via, 'wda-fast');
+        const sent = ours.hits.slice(n0);
+        assert.deepEqual(sent.map((h) => [h.method, h.path]), [['POST', FORK_ROUTES.gesture]], `mode ${mode}: the quick swipe is ONE whole gesture`);
+        assert.deepEqual(sent[0]!.body, { points: [[200, 700, 0], [200, 640, 25], [200, 580, 50], [200, 520, 75], [200, 460, 100], [200, 400, 120]], orientation: 1 },
+          'every point at its own time, no settle, no gap, no hold: the last-good body, so iOS sees the flick');
+        // a tap: one command, a press lifted after its hold (50 ms on the route)
+        id++;
+        const n1 = ours.hits.length;
+        await c.handle('U1', t('down', 50, 60, 1, 0));
+        assert.equal((await c.handle('U1', t('up', 50, 60, 2, 70)))?.via, 'wda-fast');
+        assert.deepEqual(ours.hits.slice(n1).map((h) => [h.path, h.body]), [[FORK_ROUTES.gesture, { hold: 50, points: [[50, 60, 0]], orientation: 1 }]]);
+        // a long press: held still 600 ms (its place said again meanwhile), one gesture that lifts at 600 ms
+        id++;
+        const n2 = ours.hits.length;
+        await c.handle('U1', t('down', 80, 90, 1, 0));
+        await c.handle('U1', t('move', 80, 90, 2, 300));
+        await c.handle('U1', t('up', 80, 90, 3, 600));
+        const lp = ours.hits.slice(n2);
+        assert.deepEqual(lp.map((h) => h.path), [FORK_ROUTES.gesture]);
+        assert.deepEqual([lp[0]!.body.points[0], lp[0]!.body.points.at(-1), lp[0]!.body.hold], [[80, 90, 0], [80, 90, 600], undefined], 'a long press: one record, lifted at 600 ms');
+        // a held drag (press, drag, hold still, release): one gesture ending in its lift, nothing ever left down
+        id++;
+        const n3 = ours.hits.length;
+        await c.handle('U1', t('down', 100, 100, 1, 0));
+        await c.handle('U1', t('move', 100, 200, 2, 400));
+        await c.handle('U1', t('move', 100, 200, 3, 1200));
+        await c.handle('U1', t('up', 100, 200, 4, 1500));
+        const hd = ours.hits.slice(n3);
+        assert.deepEqual(hd.map((h) => h.path), [FORK_ROUTES.gesture], 'a held drag: one whole record, which ends in a lift');
+        assert.deepEqual(hd[0]!.body.points.at(-1), [100, 200, 1500]);
+        assert.ok(!hd.some((h) => h.path === FORK_ROUTES.touch), 'never a live record that could stay down');
+        assert.equal(c.touching('U1'), false);
+      }
+      liveMode = 2;
+      liveGap = 0;
+    }
+    ok('settled: on a phone with only segmented drags, quick swipes, taps, long presses and held drags each go as one whole gesture (the last-good body), released by the record itself');
+
+    // a W3C gesture that breaks off on the phone: its input state is released (DELETE /session/:id/actions)
+    {
+      process.env.WDA_FAST = '0';
+      ours.failActions = true;
+      const n = ours.hits.length;
+      await assert.rejects(m.actions('U1', [[10, 20, 0], [10, 200, 300]]));
+      const w3 = ours.hits.slice(n).filter((h) => h.path === '/session/S1/actions').map((h) => h.method);
+      assert.deepEqual([w3[0], w3.at(-1)], ['POST', 'DELETE'], 'the broken gesture is followed by a release of every pointer');
+      ours.failActions = false;
+      const n2 = ours.hits.length;
+      await m.actions('U1', [[10, 20, 0], [10, 200, 300]]);
+      const ok3 = ours.hits.slice(n2).filter((h) => h.path === '/session/S1/actions');
+      assert.deepEqual(ok3.map((h) => h.method), ['POST'], 'a whole W3C gesture ends in its own pointerUp: nothing more');
+      const acts = ok3[0]!.body.actions[0].actions as { type: string }[];
+      assert.deepEqual([acts[0]!.type, acts[1]!.type, acts.at(-1)!.type], ['pointerMove', 'pointerDown', 'pointerUp']);
+      delete process.env.WDA_FAST;
+    }
+    ok('W3C: a whole gesture is pointerDown..pointerUp; one that broke off is released with DELETE /session/:id/actions');
 
     // a still from our build (it has no MJPEG stream)
     const jpeg = await m.shot('U1', 50, 50);

@@ -27,7 +27,7 @@ export interface ForkMeta {
   version: number;
   upstream: string;
   enabled?: boolean;
-  liveTouch?: 'auto' | 'off';
+  liveTouch?: 'auto' | 'segmented' | 'off';
 }
 
 export function readForkMeta(root: string): ForkMeta | null {
@@ -37,7 +37,7 @@ export function readForkMeta(root: string): ForkMeta | null {
     if (!Number.isInteger(version) || version < 1) return null;
     return {
       version, upstream: typeof j.upstream === 'string' ? j.upstream : 'unknown',
-      enabled: j.enabled !== false, liveTouch: j.liveTouch === 'off' ? 'off' : 'auto',
+      enabled: j.enabled !== false, liveTouch: j.liveTouch === 'off' || j.liveTouch === 'segmented' ? j.liveTouch : 'auto',
     };
   } catch {
     return null;
@@ -124,6 +124,24 @@ export function pickLiveMode(modes: LiveModeResult[]): { mode: number; gapMs: nu
   const best = usable[0];
   if (!best) return { mode: 0, gapMs: 0 };
   return { mode: best.mode, gapMs: best.mode === LIVE_GAPPED ? best.gapMs || LIVE_GAP_DEFAULT_MS : 0 };
+}
+
+/**
+ * 2026-11-17, the settled rule: which of the self-test's findings the owner's live touch may use. The regression:
+ * since d86e36f (mode 4) and 6d4266e (mode 5) a phone whose self-test passed segmented drags sent the owner's live
+ * touch through src/segments.ts, so every quick swipe was cut into a segment that stood still 30 ms before its lift
+ * (no flick: a page swipe or a fling did nothing, on both phones) and, on iPhone-1 (iOS 18.5), a segment's lift could
+ * be lost so a held drag never let go. Before the fork (and with it, until v2) the owner's touch without HID was
+ * buffered and played whole on "up" as ONE record that ends in a lift: the path that worked. So:
+ *   - a hold mode (1-3) is used only when the self-test proved it from the press to the lift (it never has on iOS 18);
+ *   - the segmented modes (4, 5) only when asked for (`liveTouch: "segmented"`), never by default;
+ *   - otherwise 0: the touch is buffered and goes whole on "up" (a tap, a long press, a quick swipe, a drag), a mode
+ *     that can't leave a finger down.
+ */
+export function usableLiveMode(found: number, setting: 'auto' | 'segmented' | 'off' | undefined): number {
+  if (setting === 'off' || !Number.isInteger(found) || found < 1 || found > LIVE_GAPPED) return 0;
+  if (found >= LIVE_SEGMENTED) return setting === 'segmented' ? found : 0;
+  return found;
 }
 
 export const FORK_ROUTES = { info: '/lotus/info', gesture: '/lotus/gesture', touch: '/lotus/touch', shot: '/lotus/shot', selftest: '/lotus/selftest' } as const;
@@ -297,7 +315,8 @@ export interface ForkStatus {
   upstream: string | null;
   /** Why nothing can be installed at all (no team id, not macOS...), or null. */
   problem: string | null;
-  perDevice: Record<string, Omit<ForkDevice, 'nextTryAt' | 'at'> & { nextTryAt: string | null; at: string; port: number | null }>;
+  /** `liveUsed` (2026-11-17): the mode the owner's touch really uses (usableLiveMode); 0 = whole on "up". */
+  perDevice: Record<string, Omit<ForkDevice, 'nextTryAt' | 'at'> & { nextTryAt: string | null; at: string; port: number | null; liveUsed: number }>;
 }
 
 const MIN = 60_000;
@@ -333,6 +352,8 @@ export interface ForkOptions {
   switchTo: (udid: string, flavor: WdaFlavor) => Promise<{ ok: boolean; why?: string }>;
   /** The phone's own live-touch self-test (our build's POST /lotus/selftest). */
   selftest?: (udid: string) => Promise<SelfTestAnswer>;
+  /** WDA_LIVE_TOUCH / LOTUS_FORK.json's "liveTouch" (2026-11-17): which found modes the owner's touch may use. */
+  liveSetting?: 'auto' | 'segmented' | 'off';
   /**
    * Whether the phone is awake and unlocked now (2026-11-17: the self-test is only run on a phone that is; WDA's
    * /wda/locked and a look at the screen). null: can't tell (the test goes ahead).
@@ -669,7 +690,8 @@ export class ForkInstaller {
       } catch {
         port = null;
       }
-      perDevice[udid] = { ...d, nextTryAt: d.nextTryAt ? new Date(d.nextTryAt).toISOString() : null, at: new Date(d.at).toISOString(), port };
+      const liveUsed = d.live?.tested ? usableLiveMode(d.live.mode, this.o.liveSetting ?? 'auto') : 0;
+      perDevice[udid] = { ...d, nextTryAt: d.nextTryAt ? new Date(d.nextTryAt).toISOString() : null, at: new Date(d.at).toISOString(), port, liveUsed };
     }
     return { enabled: this.o.enabled, version: this.o.meta?.version ?? null, upstream: this.o.meta?.upstream ?? null, problem: this.problem(), perDevice };
   }

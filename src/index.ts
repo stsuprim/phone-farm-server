@@ -28,7 +28,11 @@ if (!cfg.mock && !cfg.wdaProject) {
   console.error('WDA_PROJECT is not set in .env (see README), or set MOCK=true.');
   process.exit(1);
 }
-if (readForkMeta(ROOT)?.liveTouch === 'off') cfg.wdaLiveTouch = 'off';
+// LOTUS_FORK.json's "liveTouch" (pushed from afar) wins over the default; WDA_LIVE_TOUCH=off on the Mac wins over both
+{
+  const lt = readForkMeta(ROOT)?.liveTouch;
+  if (lt && lt !== 'auto' && cfg.wdaLiveTouch !== 'off') cfg.wdaLiveTouch = lt;
+}
 const real = cfg.mock ? null : new RealBackend(cfg);
 const backend = real ?? new MockBackend(cfg.mockPhones);
 const updater = cfg.mock ? undefined : createUpdater(() => shutdown());
@@ -84,6 +88,7 @@ const fork = real
       build: buildWdaRunner(ROOT, teamId, undefined, () => forkEnv),
       switchTo: (udid, flavor) => real.switchWda(udid, flavor),
       selftest: cfg.wdaLiveTouch === 'off' ? undefined : (udid) => real.wdaSelftest(udid),
+      liveSetting: cfg.wdaLiveTouch ?? 'auto',
       devices: onlinePhones,
       prepare: (udid) => idle.wake(udid),
       // 2026-11-17: the self-test runs only on a phone that's awake and unlocked (WDA's word and a look at the screen)

@@ -27,6 +27,12 @@ export const SEG_SETTLE_MS = 30;
 export const SEG_OVERHEAD_MS = 60;
 /** A segment is sent only while the phone is at most this far behind (ms of estimated work queued). */
 export const SEG_MAX_BEHIND_MS = 120;
+/**
+ * 2026-11-17: no segment is cut before the touch has lasted this long (ms), so a quick swipe or flick always goes as
+ * one whole gesture with its real speed (cutting it stopped it 30 ms before a lift: no flick, on both phones). Since
+ * the same day segmented drags are opt-in only (src/fork.ts usableLiveMode).
+ */
+export const SEG_FIRST_MS = 350;
 /** At most this many points in one segment (a finger held still for long adds only time). */
 const SEG_MOST_POINTS = 2000;
 
@@ -43,8 +49,11 @@ export type PlaySegment = (points: PathPoint[], hold: number, gap: number) => Pr
 export class Segmenter {
   /** The pause between two segments on the phone (ms); 0 (mode 4) sends none. Set by the caller before a touch. */
   gapMs = 0;
+  /** No segment before the touch is this old (ms): SEG_FIRST_MS; 0 cuts from the start (tests of the pacing). */
+  firstMs = SEG_FIRST_MS;
   private down_ = false;
   private start = 0; // when the segment began (now() ms)
+  private touchStart = 0; // when the finger landed (now() ms)
   private pts: PathPoint[] = [];
   private busyUntil = 0; // when the phone should be done with what was sent (estimate)
   private chain: Promise<unknown> = Promise.resolve();
@@ -60,7 +69,7 @@ export class Segmenter {
   /** The finger lands: nothing is sent yet (a tap or a long press goes whole). */
   down(x: number, y: number): Promise<void> {
     this.down_ = true;
-    this.start = this.now();
+    this.start = this.touchStart = this.now();
     this.pts = [[x, y, 0]];
     this.segments = 0;
     return Promise.resolve();
@@ -72,7 +81,7 @@ export class Segmenter {
     const now = this.now();
     this.add(x, y, now);
     const first = this.pts[0]!;
-    const due = now - this.start >= SEG_MIN_MS && Math.hypot(x - first[0], y - first[1]) >= SEG_MIN_PT && this.busyUntil - now <= SEG_MAX_BEHIND_MS;
+    const due = now - this.touchStart >= this.firstMs && now - this.start >= SEG_MIN_MS && Math.hypot(x - first[0], y - first[1]) >= SEG_MIN_PT && this.busyUntil - now <= SEG_MAX_BEHIND_MS;
     if (!due) return Promise.resolve();
     return this.send(SEG_SETTLE_MS, now, [x, y]);
   }

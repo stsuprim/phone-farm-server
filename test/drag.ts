@@ -53,7 +53,7 @@ function phone(live = true, delay = 0) {
 const touch = (phase: string, x: number, y: number, seq: number, id = 1, t = seq * 10) => ({ type: 'touch', phase, x, y, t, seq, id, unit: 'pt' });
 const count = (calls: string[], word: string) => calls.filter((c) => c.startsWith(word)).length;
 
-assert.deepEqual([TOUCH_RELEASE_MS, TOUCH_QUIET_MS, HOLD_REPEAT_MS, OWNER_GRACE_MS], [6000, 30000, 800, 2500]);
+assert.deepEqual([TOUCH_RELEASE_MS, TOUCH_QUIET_MS, HOLD_REPEAT_MS, OWNER_GRACE_MS], [6000, 5000, 800, 2500]);
 
 // ---- a live drag: one contact from down to up, every move in the order it was made ----
 {

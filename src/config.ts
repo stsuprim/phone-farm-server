@@ -56,10 +56,13 @@ export interface Config {
   /** A phone's own port (WDA_FORK_PORTS=udid=port,udid=port), when base + index doesn't suit. */
   wdaForkPorts?: Record<string, number>;
   /**
-   * Live touch through our build (WDA_LIVE_TOUCH): auto (default) = only with the mode a phone's own self-test found
-   * working; on = mode 1 even without the self-test's word; off = never (drags play whole on "up").
+   * Live touch through our build (WDA_LIVE_TOUCH, or "liveTouch" in wda/LOTUS_FORK.json): auto (default) = only a
+   * held contact (modes 1-3) the phone's own self-test proved from press to lift, else the owner's drag plays whole
+   * on "up" (the path that always worked); segmented = also modes 4-5 (short whole gestures as the finger moves; opt
+   * in only); off = never. 2026-11-17: "on" (mode 1 without the self-test's word) is gone: it reads as auto, since an
+   * untested hold mode can leave a finger down.
    */
-  wdaLiveTouch?: 'auto' | 'on' | 'off';
+  wdaLiveTouch?: 'auto' | 'segmented' | 'off';
 }
 
 function loadDotEnv(file: string): void {
@@ -119,6 +122,6 @@ export function loadConfig(envFile = '.env'): Config {
     wdaForkDerivedData: expand(e.WDA_FORK_DERIVED_DATA || '~/wda-fork-build'),
     wdaForkBasePort: Math.min(65000, Math.max(1024, Math.round(num(e.WDA_FORK_BASE_PORT, 28100)))),
     wdaForkPorts: parsePorts(e.WDA_FORK_PORTS),
-    wdaLiveTouch: /^(on|off)$/i.test(e.WDA_LIVE_TOUCH ?? '') ? (e.WDA_LIVE_TOUCH!.toLowerCase() as 'on' | 'off') : 'auto',
+    wdaLiveTouch: /^(segmented|off)$/i.test(e.WDA_LIVE_TOUCH ?? '') ? (e.WDA_LIVE_TOUCH!.toLowerCase() as 'segmented' | 'off') : 'auto',
   };
 }

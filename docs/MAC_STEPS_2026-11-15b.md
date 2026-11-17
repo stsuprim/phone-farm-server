@@ -337,7 +337,7 @@ To see a build's errors yourself: `WDA_BUILD_FLAVOR=fork scripts/build-wda.sh <T
 | `WDA_FORK_BASE_PORT` | `28100` | Our build's port for the first phone, on the phone and on the Mac; the next phone's is one higher. |
 | `WDA_FORK_PORTS` | none | A phone's own port: `udid=port,udid=port`. |
 | `WDA_FORK_DERIVED_DATA` | `~/wda-fork-build` | Where our build is built. The stock one's (`WDA_DERIVED_DATA`) stays, for a rollback. |
-| `WDA_LIVE_TOUCH` | `auto` | `auto`: live touch only with the mode the phone's self-test found. `off`: never. `on`: mode 1 without the self-test's word. |
+| `WDA_LIVE_TOUCH` | `auto` | `auto`: a held contact only with a hold mode (1-3) the phone's self-test proved from press to lift; otherwise the owner's touch plays whole on release (2026-11-17). `segmented`: segmented drags (modes 4-5) too, opt-in. `off`: never. |
 
 During the switch-over both kinds run side by side: a phone still on the stock WebDriverAgent is talked to on
 8100 (+ MJPEG on 9100) as before, one on ours on its own port with its token. The server knows which is which.

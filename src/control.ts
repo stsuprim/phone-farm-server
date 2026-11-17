@@ -19,9 +19,10 @@ const STALE_TOUCH_MS = 60000; // a buffered touch (nothing on the phone yet) nev
 export const TOUCH_RELEASE_MS = 6000;
 /**
  * ...and one whose sender is alive but has said nothing of the touch for this long (a frozen page; a healthy client
- * repeats a still finger's place a few times a second) is lifted too.
+ * repeats a still finger's place a few times a second: the page every 0.4 s) is lifted too. 2026-11-17: 30 s became
+ * 5 s (the watchdog: no finger is ever left down for long). A buffered touch has nothing on the phone to lift.
  */
-export const TOUCH_QUIET_MS = 30_000;
+export const TOUCH_QUIET_MS = 5000;
 /** A finger held still: its contact is said again to the phone this often, so nothing on the way takes it for stuck. */
 export const HOLD_REPEAT_MS = 800;
 /**
@@ -771,6 +772,7 @@ export class Control {
     const live = g.live && !g.liveFailed;
     if (g.orphanAt !== undefined && now - g.orphanAt >= this.ownerGraceMs) return this.end(udid, g, 'closed');
     if (!live) {
+      // nothing is down on the phone (it plays whole on "up", or is dropped when its sender closed): as before the fork
       if (now - g.eventAt >= STALE_TOUCH_MS) this.end(udid, g, 'stale');
       return;
     }

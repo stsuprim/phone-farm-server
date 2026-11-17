@@ -893,8 +893,9 @@ stream of its own, no lip sync).
 `WDA_PATCH=0` makes `scripts/build-wda.sh` build WDA unpatched. WDA re-sign: `WDA_TEAM_ID` (the Apple Team ID),
 `WDA_RESIGN` (true), `WDA_RESIGN_HOUR` (3: the quiet window is 03:00-06:00 local). Our own WebDriverAgent build:
 `WDA_FORK` (true; `false` keeps the stock one), `WDA_FORK_BASE_PORT` (28100), `WDA_FORK_PORTS` (`udid=port,…`),
-`WDA_FORK_DERIVED_DATA` (`~/wda-fork-build`), `WDA_LIVE_TOUCH` (`auto`: live touch with the mode the phone's self-test found;
-`off`; `on`: mode 1 without the self-test). Video: `RTC_PLAYOUT_ZERO=1` gives far viewers
+`WDA_FORK_DERIVED_DATA` (`~/wda-fork-build`), `WDA_LIVE_TOUCH` (`auto`: a held contact only when the phone's self-test
+proved it from press to lift, else the owner's touch plays whole on release; `segmented`: also segmented drags, opt-in;
+`off`. 2026-11-17: `on` is gone). Video: `RTC_PLAYOUT_ZERO=1` gives far viewers
 playout-delay 0/0 again.
 
 ## Notes / known limits

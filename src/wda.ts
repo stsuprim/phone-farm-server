@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import http from 'node:http';
 import path from 'node:path';
 import { Config } from './config.js';
-import { FORK_ROUTES, ForkLaunch, launchPlan, LIVE_GAPPED, LIVE_SEGMENTED, TOKEN_ENV, TOKEN_HEADER, WdaFlavor } from './fork.js';
+import { FORK_ROUTES, ForkLaunch, launchPlan, LIVE_GAPPED, LIVE_SEGMENTED, TOKEN_ENV, TOKEN_HEADER, usableLiveMode, WdaFlavor } from './fork.js';
 import { isLandscape, Orientation, orientationFromWda, portraitSize, uprightSize, uprightToPanel } from './orient.js';
 import { Segmenter } from './segments.js';
 import { ButtonName, ControlState, HttpError, PathPoint, ScreenInfo, StreamSettings } from './types.js';
@@ -1301,10 +1301,27 @@ export class WdaManager {
     return 'wda';
   }
 
+  /**
+   * W3C actions: one finger, pointerDown ... pointerUp. 2026-11-17: when the request fails or times out partway, the
+   * input state is released (DELETE /session/:id/actions: every pointer still down is lifted), so a gesture that
+   * broke off never leaves a finger on the screen.
+   */
   private async w3c(udid: string, pts: PathPoint[]): Promise<void> {
     const ms = pts[pts.length - 1]![2];
     const actions = [{ type: 'pointer', id: 'finger1', parameters: { pointerType: 'touch' }, actions: pointerActions(pts) }];
-    await this.call(udid, 'POST', '/actions', { actions }, this.timeouts.input + ms);
+    try {
+      await this.call(udid, 'POST', '/actions', { actions }, this.timeouts.input + ms);
+    } catch (err) {
+      await this.releaseActions(udid);
+      throw err;
+    }
+  }
+
+  /** Best effort: lift whatever W3C actions left down (DELETE /session/:id/actions); never recovers anything. */
+  async releaseActions(udid: string): Promise<void> {
+    const sid = this.entries.get(udid)?.sessionId;
+    if (!sid) return;
+    await this.callSoft(udid, 'DELETE', `/session/${sid}/actions`, undefined, 3000).catch(() => {});
   }
 
   /** Every ~10 s per phone: /status; recover before the owner notices. Skipped right after a successful action. */
@@ -1366,21 +1383,26 @@ export class WdaManager {
   /**
    * Why this phone's WDA can't hold a finger down across requests right now, or null when it can: our build is up,
    * its self-test found a working mode (src/fork.ts), nothing broke since, and the phone is in portrait (or
-   * WDA_FAST_LANDSCAPE=1). WDA_LIVE_TOUCH=off turns it off; =on uses mode 1 without the self-test's word.
+   * WDA_FAST_LANDSCAPE=1). WDA_LIVE_TOUCH=off turns it off; segmented drags (modes 4-5) only with WDA_LIVE_TOUCH=segmented (2026-11-17).
    */
   liveWhy(udid: string): string | null {
     const e = this.entries.get(udid);
     if ((this.cfg.wdaLiveTouch ?? 'auto') === 'off') return 'live touch through WebDriverAgent is turned off (WDA_LIVE_TOUCH=off)';
     if (!e || e.status !== 'ready' || !e.forkInfo) return 'the stock WebDriverAgent cannot hold a finger down between requests: the drag plays on "up" (our own build can)';
     if (e.liveFailed) return `live touch stopped working on this phone (${e.liveFailed}): the drag plays on "up"`;
-    if (!this.liveModeOf(udid)) return 'the self-test on this phone found no way to hold a finger down (or has not run yet): the drag plays on "up"';
+    if (!this.liveModeOf(udid)) {
+      // 2026-11-17: segmented drags (modes 4-5) broke quick swipes and could leave a touch down: opt-in only
+      const found = this.fork?.liveMode(udid) ?? 0;
+      if (found >= LIVE_SEGMENTED) return 'this phone can only do segmented drags, which break quick swipes: the touch plays whole on "up" (liveTouch "segmented" turns them on)';
+      return 'the self-test on this phone found no way to hold a finger down (or has not run yet): the drag plays on "up"';
+    }
     if (e.orientation && e.orientation !== 'portrait' && process.env.WDA_FAST_LANDSCAPE !== '1') return `live touch is portrait only here and the phone is ${e.orientation}: the drag plays on "up"`;
     return null;
   }
 
+  /** The mode the owner's live touch uses on this phone (src/fork.ts usableLiveMode): 0 plays it whole on "up". */
   private liveModeOf(udid: string): number {
-    const found = this.fork?.liveMode(udid) ?? 0;
-    return found || ((this.cfg.wdaLiveTouch ?? 'auto') === 'on' ? 1 : 0);
+    return usableLiveMode(this.fork?.liveMode(udid) ?? 0, this.cfg.wdaLiveTouch ?? 'auto');
   }
 
   /**

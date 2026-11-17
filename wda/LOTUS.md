@@ -79,6 +79,16 @@ about 110 pt), so one of the two back-to-back segments never reached the window,
   itself: a hold mode, else 4, else 5 with its smallest working gap (kept as `live.gapMs`). In mode 5 every segment
   is sent with that `gap` and the pacing (`src/segments.ts`) counts it. Mode 4 sends no `gap`: iPhone-2 is unchanged.
 
+**2026-11-17, settled: segmented drags off by default (server only, no new build).** Segmented drags were the
+regression: since v2 (`d86e36f`) and v3 (`6d4266e`) the owner's live touch on a phone whose self-test passed mode 4 or
+5 went through the segmenter, so every quick swipe was cut into a segment that stood still 30 ms before its lift (no
+flick on either phone), and on iPhone-1 a held drag could be left without its lift. The server now uses a found mode
+only when it's a hold mode (1-3, proven from press to lift; never on iOS 18); otherwise the owner's touch is buffered
+and played whole on release through `/lotus/gesture`: one record that ends in a lift, the same body the stock era sent
+to `/wda/lotus/touch` (tap, quick swipe, long press, held drag). `"liveTouch": "segmented"` turns segmented drags back
+on (and even then nothing is cut in a touch's first 350 ms, so a quick swipe stays whole). `GET /api/wda` says the mode
+in use per phone as `fork.perDevice.<udid>.liveUsed` (0: whole on release). The v3 build on the phones is unchanged.
+
 ## What has to be seen on the Mac
 
 This was written on a PC with no Xcode. The additions were parsed with clang's Objective-C front end against
@@ -106,6 +116,7 @@ commit that changes it:
 |---|---|
 | `"enabled": false` | Every phone goes back to the stock WebDriverAgent (the server restarts on the pull and starts each runner as stock). `true` again installs ours again. |
 | `"liveTouch": "off"` | Our build stays, but live touch through it is not used: a drag is played whole on release. `"auto"` uses it again (with the mode the self-test found). |
+| `"liveTouch": "segmented"` | Also uses a segmented finding (modes 4-5) for the owner's drags. Off by default since 2026-11-17 (below). |
 
 ## Updating to a newer upstream
 

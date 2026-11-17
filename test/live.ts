@@ -7,7 +7,7 @@ import crypto from 'node:crypto';
 import { AddressInfo } from 'node:net';
 import { countTouches, ForkInstaller, ForkTokens, LIVE_GAP_DEFAULT_MS, LIVE_GAPPED, LIVE_SEGMENTED, pickLiveMode, readSelfTest, segmentsSeparate, SELFTEST_ATTEMPTS, SelfTestAnswer } from '../src/fork.js';
 import { MockBackend } from '../src/mock.js';
-import { SEG_MIN_MS, SEG_MIN_PT, SEG_OVERHEAD_MS, SEG_SETTLE_MS, Segmenter } from '../src/segments.js';
+import { SEG_FIRST_MS, SEG_MIN_MS, SEG_MIN_PT, SEG_OVERHEAD_MS, SEG_SETTLE_MS, Segmenter } from '../src/segments.js';
 import { createServer } from '../src/server.js';
 import type { PathPoint } from '../src/types.js';
 
@@ -23,6 +23,7 @@ const tick = () => new Promise((r) => setImmediate(r));
   let now = 0;
   const sent: { points: PathPoint[]; hold: number }[] = [];
   const s = new Segmenter(async (points, hold) => void sent.push({ points, hold }), () => now);
+  s.firstMs = 0; // the pacing alone (a quick swipe's whole-gesture rule is tested below)
 
   // a tap: one gesture on the lift, at its own length
   await s.down(10, 10);
@@ -83,6 +84,26 @@ const tick = () => new Promise((r) => setImmediate(r));
   assert.equal(sent.length, 3);
   ok('segments: a tap and a long press go whole; a drag goes in segments while it happens, paced by the phone');
 
+  // 2026-11-17 (the regression): a quick swipe is never cut, even with segmented drags turned on: one whole gesture
+  // on the lift, at its own speed, with no settle (cutting it stopped it 30 ms before a lift: no flick)
+  {
+    let t = 0;
+    const got: { points: PathPoint[]; hold: number }[] = [];
+    const q = new Segmenter(async (points, hold) => void got.push({ points, hold }), () => t);
+    assert.equal(q.firstMs, SEG_FIRST_MS);
+    await q.down(100, 600);
+    for (let i = 1; i <= 6; i++) {
+      t = i * 25;
+      await q.move(100, 600 - i * 50);
+    }
+    assert.equal(got.length, 0, 'nothing is cut in the first SEG_FIRST_MS');
+    t = 160;
+    await q.up(100, 280);
+    assert.equal(got.length, 1);
+    assert.deepEqual([got[0]!.points.length, got[0]!.points[0], got[0]!.points.at(-1), got[0]!.hold], [8, [100, 600, 0], [100, 280, 160], 0]);
+  }
+  ok('segments: a quick swipe goes whole at its own speed (no settle, no cut), whatever the mode');
+
   // in order, even when an answer is slow
   const order: number[] = [];
   let release!: () => void;
@@ -94,6 +115,7 @@ const tick = () => new Promise((r) => setImmediate(r));
     if (k === 1) await gate;
     order.push(k);
   }, () => t);
+  s2.firstMs = 0; // the pacing alone (a quick swipe's whole-gesture rule is tested below)
   await s2.down(0, 0);
   t = 100;
   const p1 = s2.move(0, 50);
@@ -173,6 +195,7 @@ const tick = () => new Promise((r) => setImmediate(r));
   let now = 0;
   const sent: { points: PathPoint[]; hold: number; gap: number }[] = [];
   const s = new Segmenter(async (points, hold, gap) => void sent.push({ points, hold, gap }), () => now);
+  s.firstMs = 0; // the pacing alone (a quick swipe's whole-gesture rule is tested below)
   // without a gap (mode 4): a segment is due once SEG_MIN_MS long, as long as the phone isn't too far behind
   await s.down(0, 0);
   now = SEG_MIN_MS;
@@ -209,6 +232,7 @@ const tick = () => new Promise((r) => setImmediate(r));
     if (order.length === 1) await gate;
     order.push('end');
   }, () => t);
+  s3.firstMs = 0; // the pacing alone (a quick swipe's whole-gesture rule is tested below)
   s3.gapMs = 40;
   await s3.down(0, 0);
   t = 100;
