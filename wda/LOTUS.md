@@ -66,6 +66,19 @@ result. The server wakes and unlocks the phone first and checks it's awake (WDA'
 screen), tries once more when it found nothing, runs it after each install and on demand
 (`POST /api/wda/:udid/selftest`), and never when Lotus's page merely opens.
 
+**v3 (2026-11-17): gapped segments, mode 5.** On v2, iPhone-2 (iOS 18.7.8) passed mode 4, but iPhone-1 (iOS 18.5)
+gave `'BMMMMMMMME'`, 48 pt, 811 ms: one touch of one segment's length (60 pt less a frame; a merge of both would be
+about 110 pt), so one of the two back-to-back segments never reached the window, and a record without a lift
+(modes 1-3: press `''`, move `''`) plays nothing at all there. v3:
+- `/lotus/gesture` takes `gap` (0-500 ms): the phone's queue, which already plays one record at a time and each only
+  after XCTest's completion of the one before, stays busy that long after the gesture before the next record.
+- The self-test runs mode 4 (two segments back to back, each its own record and path at offset 0) and then mode 5
+  (the same with a pause of 40, then 100, then 200 ms, stopping at the first that works). Each run says what the
+  window saw (`seen`), its `gapMs`, and in the notes the first segment's letters and each segment's time.
+- The server recounts `seen` as separate begin..end pairs (`countTouches` in `src/fork.ts`) and picks the mode
+  itself: a hold mode, else 4, else 5 with its smallest working gap (kept as `live.gapMs`). In mode 5 every segment
+  is sent with that `gap` and the pacing (`src/segments.ts`) counts it. Mode 4 sends no `gap`: iPhone-2 is unchanged.
+
 ## What has to be seen on the Mac
 
 This was written on a PC with no Xcode. The additions were parsed with clang's Objective-C front end against
@@ -79,7 +92,8 @@ the real check:
    `Content-Length: 0`; with `-H "X-Lotus-Token: …"` (the server has it) it answers.
 3. **The self-test.** `fork.perDevice.<udid>.live` in `GET /api/wda` says the mode it found (v2: 4, `kind:
    "segmented"`, unless a hold mode works), each mode's result under `modes`, and its notes (for mode 4 the two
-   segments' touches, e.g. `'BMMEBMME'`, and how long both took to play: about 250-400 ms is fine).
+   segments' touches, e.g. `'BMMEBMME'`, and how long both took to play: about 250-400 ms is fine). v3: iPhone-2
+   should still say mode 4; iPhone-1 mode 5 with `gapMs` 40, 100 or 200 (each run's `seen` under `modes`).
 4. **A live drag** on the Phones page follows the pointer while the button is down (with mode 4, a few segments a
    second, each about 100-150 ms behind the pointer); a list scrolls without flinging between segments.
 

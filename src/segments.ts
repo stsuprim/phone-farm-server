@@ -30,9 +30,19 @@ export const SEG_MAX_BEHIND_MS = 120;
 /** At most this many points in one segment (a finger held still for long adds only time). */
 const SEG_MOST_POINTS = 2000;
 
-export type PlaySegment = (points: PathPoint[], hold: number) => Promise<unknown>;
+/** `gap` (ms): the pause the phone keeps after this segment before the next record (mode 5); 0 for mode 4. */
+export type PlaySegment = (points: PathPoint[], hold: number, gap: number) => Promise<unknown>;
 
+/**
+ * Mode 5 (fork v3, 2026-11-17): on iPhone-1 (iOS 18.5) two segments played back to back reached the phone as one
+ * touch of one segment's length: the second's press right after the first's lift was lost. There the phone waits
+ * `gapMs` (what its self-test found) after each segment before playing the next record: the fork's queue
+ * plays one record at a time, each after XCTest's completion of the one before, then the gap. The pacing here counts
+ * the gap as part of each segment's time on the phone.
+ */
 export class Segmenter {
+  /** The pause between two segments on the phone (ms); 0 (mode 4) sends none. Set by the caller before a touch. */
+  gapMs = 0;
   private down_ = false;
   private start = 0; // when the segment began (now() ms)
   private pts: PathPoint[] = [];
@@ -87,13 +97,16 @@ export class Segmenter {
   private send(hold: number, now: number, next: [number, number] | null): Promise<void> {
     const pts = this.pts;
     const length = pts[pts.length - 1]![2];
-    this.busyUntil = Math.max(this.busyUntil, now) + length + hold + SEG_OVERHEAD_MS;
+    // the last one too: the next touch's press could come straight after its lift as well
+    const gap = Math.max(0, Math.round(this.gapMs));
+    this.busyUntil = Math.max(this.busyUntil, now) + length + hold + gap + SEG_OVERHEAD_MS;
     this.segments++;
     if (next) {
       this.start = now;
       this.pts = [[next[0], next[1], 0]];
     } else this.pts = [];
-    const p = this.chain.then(() => this.play(pts, hold));
+    // one after the other: a segment's request goes only once the one before it was answered
+    const p = this.chain.then(() => this.play(pts, hold, gap));
     this.chain = p.catch(() => {});
     return p.then(() => {});
   }

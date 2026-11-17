@@ -190,6 +190,7 @@ const fakeSpawn = ((cmd: string, args: string[], opts: { env?: NodeJS.ProcessEnv
   const cfg = { wdaBasePort: stock.port, mjpegBasePort: stock.port + 1, wdaProject: '/stock/wda', wdaDerivedData: '/stock/build', wdaLiveTouch: 'auto' } as unknown as Config;
   const m = new WdaManager(cfg, (u) => u, fakeSpawn, { input: 400, launch: 1000, probe: 400, restart: 5000 });
   let liveMode = 0;
+  let liveGap = 0;
   const failures: string[] = [];
   let atStart: WdaFlavor = 'stock';
   m.fork = {
@@ -197,6 +198,7 @@ const fakeSpawn = ((cmd: string, args: string[], opts: { env?: NodeJS.ProcessEnv
     launch: () => ({ project: '/repo/wda', derivedData: '/fork/build', port: ours.port, token: TOKEN }),
     failed: (_u, why) => void failures.push(why),
     liveMode: () => liveMode,
+    liveGap: () => liveGap,
   };
   try {
     // without the token (or with a wrong one) our build says nothing of itself: a bare 404, no body, no JSON, closed
@@ -297,7 +299,25 @@ const fakeSpawn = ((cmd: string, args: string[], opts: { env?: NodeJS.ProcessEnv
     assert.deepEqual([s1!.points[0], s1!.points.at(-1)!.slice(0, 2), s1!.hold, s1!.orientation], [[100, 300, 0], [100, 330], 30, 1], 'the first: from the press, still a moment before its lift');
     assert.ok(s1!.points.at(-1)![2]! >= 80, 'at the pace it was made');
     assert.deepEqual([s2!.points[0], s2!.points.at(-1)!.slice(0, 2), s2!.hold], [[100, 330, 0], [100, 360], 0], 'the last: from where the first ended, lifting as the finger did');
+    assert.ok(segs.every((h) => !('gap' in h.body)), 'mode 4 sends no gap (iPhone-2 plays exactly as with v2)');
+    // fork v3, mode 5 (segmented with a gap, iPhone-1 on iOS 18.5): the same segments, each asking the phone to
+    // pause the gap its self-test found before the next record
+    liveMode = 5;
+    liveGap = 100;
+    await sleep(400); // the phone is thought busy with the last drag until then (src/segments.ts pacing)
+    const n5 = ours.hits.length;
+    await m.liveTouch('U1', 'down', 200, 300);
+    await sleep(90);
+    await m.liveTouch('U1', 'move', 200, 340);
+    await m.liveTouch('U1', 'up', 200, 380);
+    const segs5 = ours.hits.slice(n5);
+    assert.deepEqual(segs5.map((h) => [h.path, h.body.gap, h.body.points[0], h.body.hold]), [
+      ['/lotus/gesture', 100, [200, 300, 0], 30], ['/lotus/gesture', 100, [200, 340, 0], 0],
+    ], 'mode 5: every segment carries the gap; the second starts where the first ended');
+    assert.deepEqual(gestureBody([[1, 2, 0]], 0, 100), { gap: 100, hold: 0, points: [[1, 2, 0]], orientation: 1 });
+    assert.deepEqual(gestureBody([[1, 2, 0]], 0, 0), { hold: 0, points: [[1, 2, 0]], orientation: 1 }, 'no gap: none sent');
     liveMode = 2;
+    liveGap = 0;
     // XCTest refused a live record on the phone: said once, and live touch is left alone until the runner restarts
     ours.failedOnce = 'XCTest refused the record';
     await assert.rejects(m.liveTouch('U1', 'down', 5, 5), /could not play the live touch/);

@@ -5,13 +5,16 @@
  *
  *   GET  /lotus/info      which build this is (the Mac's server tells our build from a stock WebDriverAgent by it)
  *   POST /lotus/gesture   one whole gesture in one command, played by the phone itself:
- *                         {"points": [[x, y, ms], ...], "hold": ms, "orientation": 1} -> {"queued": n}
+ *                         {"points": [[x, y, ms], ...], "hold": ms, "gap": ms, "orientation": 1} -> {"queued": n}
+ *                         v3: "gap" (0-500 ms) is a pause the phone keeps after this gesture has played, before
+ *                         the next record (live mode 5)
  *   POST /lotus/touch     one event of a live touch: {"phase": "down" | "move" | "up", "x": .., "y": .., "mode": 1-3}
  *                         The finger stays down on the phone between requests (see "Live touch" below).
  *   GET  /lotus/shot      one still as a JPEG: ?scale=1-100&quality=1-100 -> {"jpeg": "<base64>"}
  *   POST /lotus/selftest  finds out, on this phone, which way of live touch works (see "Self-test"): a held
  *                         finger (modes 1-3) or, v2 (2026-11-17), segmented drags (mode 4: short whole
- *                         gestures the Mac's server sends through /lotus/gesture as the finger moves)
+ *                         gestures the Mac's server sends through /lotus/gesture as the finger moves) and, v3,
+ *                         gapped segments (mode 5: the same with a pause between two segments)
  *
  * Coordinates are points of the screen as the record's orientation says (the Mac's server sends portrait points
  * with "orientation": 1, turning a landscape touch onto the panel itself).
@@ -48,7 +51,7 @@
 #pragma clang diagnostic ignored "-Weverything"
 
 /** The version of our changes. The Mac's server installs this build on a phone whose build says another number. */
-static const NSInteger LotusForkVersion = 2;
+static const NSInteger LotusForkVersion = 3;
 static NSString *const LotusUpstreamTag = @"v16.15.3";
 
 /** How long one step of a live move takes on the phone (seconds): about a frame. */
@@ -62,7 +65,7 @@ static const NSUInteger LotusMostWaiting = 64;
 /** A record is with XCTest now (one at a time: the phone plays them in order). */
 static BOOL LotusSynthBusy = NO;
 static NSUInteger LotusSynthGeneration = 0;
-/** Whole gestures waiting to be played (XCSynthesizedEventRecord). */
+/** Whole gestures waiting to be played: @{@"record": XCSynthesizedEventRecord, @"gap": seconds to wait after it}. */
 static NSMutableArray *LotusGestureQueue;
 /** Live touch events waiting to be played: @{@"phase", @"x", @"y", @"mode", @"orientation"}. */
 static NSMutableArray *LotusLiveOps;
@@ -196,6 +199,8 @@ static BOOL LotusLiveWatching = NO;
   }
   XCSynthesizedEventRecord *record = nil;
   BOOL live = NO;
+  // v3: how long the phone waits after this record has played before the next one (a gesture's "gap", live mode 5)
+  double gapAfter = 0;
   while (nil == record && LotusLiveOps.count > 0) {
     NSDictionary *op = LotusLiveOps.firstObject;
     [LotusLiveOps removeObjectAtIndex:0];
@@ -203,8 +208,10 @@ static BOOL LotusLiveWatching = NO;
     live = nil != record;
   }
   if (nil == record && LotusGestureQueue.count > 0) {
-    record = LotusGestureQueue.firstObject;
+    NSDictionary *entry = LotusGestureQueue.firstObject;
     [LotusGestureQueue removeObjectAtIndex:0];
+    record = entry[@"record"];
+    gapAfter = ((NSNumber *)entry[@"gap"]).doubleValue;
   }
   if (nil == record) {
     return;
@@ -232,10 +239,24 @@ static BOOL LotusLiveWatching = NO;
           LotusLiveError = invokeError.localizedDescription ?: @"XCTest refused a live touch record";
         }
       }
-      if (LotusSynthGeneration == generation) {
+      if (LotusSynthGeneration != generation) {
+        return;
+      }
+      if (gapAfter <= 0) {
         LotusSynthBusy = NO;
         [FBLotusCommands lotus_pump];
+        return;
       }
+      // v3 (live mode 5): the queue stays busy for the gap, so the next record's press never comes straight after
+      // this one's lift (iOS 18.5 lost one of two back-to-back segments). A new generation: the timeout above
+      // no longer applies to this record.
+      NSUInteger afterGap = ++LotusSynthGeneration;
+      dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(gapAfter * (double)NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        if (LotusSynthBusy && LotusSynthGeneration == afterGap) {
+          LotusSynthBusy = NO;
+          [FBLotusCommands lotus_pump];
+        }
+      });
     });
   }];
 }
@@ -280,6 +301,8 @@ static BOOL LotusLiveWatching = NO;
     hold = 0.05;
   }
   [path liftUpAtOffset:offset + hold];
+  // v3: a pause after this gesture before the next record (live mode 5); 0, the default, is v2's behaviour
+  double gap = [self lotus_number:request.arguments[@"gap"] fallback:0 low:0 high:500] / 1000.0;
   XCSynthesizedEventRecord *record = [[XCSynthesizedEventRecord alloc] initWithName:@"Lotus gesture"
                                                                interfaceOrientation:orientation];
   [record addPointerEventPath:path];
@@ -294,7 +317,7 @@ static BOOL LotusLiveWatching = NO;
   if (LotusLiveQueuedDown) {
     [self lotus_queueLive:@"up" at:LotusLiveQueuedPoint mode:LotusLiveMode orientation:LotusLiveOrientation];
   }
-  [LotusGestureQueue addObject:record];
+  [LotusGestureQueue addObject:@{@"record": record, @"gap": @(gap)}];
   NSUInteger waiting = LotusGestureQueue.count + LotusLiveOps.count + (LotusSynthBusy ? (NSUInteger)1 : (NSUInteger)0);
   [self lotus_pump];
   return FBResponseWithObject(@{@"queued": @(waiting), @"lotus": @(LotusForkVersion)});
@@ -489,6 +512,65 @@ static BOOL LotusLiveWatching = NO;
   return error.localizedDescription ?: @"XCTest refused the record";
 }
 
+/**
+ v3: the touches in what the probe saw, one by one: a touch is "B", then only "M", then "E". `complete` counts those,
+ `moved` the complete ones with at least one "M"; anything else (a "B" while a touch is open, a "C", an "M" or "E" with
+ no touch open, a touch never ended) counts in `broken`. 'BMMEBMME' is 2 complete, 2 moved, 0 broken; 'BMMMMMMMME' is
+ 1 complete. The Mac's server counts the same way from `seen` (src/fork.ts countTouches) and has the last word.
+ */
++ (void)lotus_count:(NSString *)seen complete:(NSUInteger *)complete moved:(NSUInteger *)moved broken:(NSUInteger *)broken
+{
+  NSUInteger c = 0, m = 0, b = 0, moves = 0;
+  BOOL open = NO;
+  for (NSUInteger i = 0; i < seen.length; i++) {
+    unichar ch = [seen characterAtIndex:i];
+    if (ch == 'B') {
+      if (open) {
+        b++;
+      }
+      open = YES;
+      moves = 0;
+    } else if (ch == 'M') {
+      if (open) {
+        moves++;
+      } else {
+        b++;
+      }
+    } else if (ch == 'E') {
+      if (open) {
+        c++;
+        if (moves > 0) {
+          m++;
+        }
+      } else {
+        b++;
+      }
+      open = NO;
+    } else {
+      // "C" (cancelled) or anything unknown
+      b++;
+      open = NO;
+    }
+  }
+  if (open) {
+    b++;
+  }
+  *complete = c;
+  *moved = m;
+  *broken = b;
+}
+
+/** v3: one segment as the Mac's server sends it: its own new record and path (offset 0), moving 80 ms, still 30 ms, lifting. */
++ (XCSynthesizedEventRecord *)lotus_segmentFrom:(CGPoint)from to:(CGPoint)to orientation:(long long)orientation
+{
+  XCPointerEventPath *path = [[XCPointerEventPath alloc] initForTouchAtPoint:from offset:0];
+  [path moveToPoint:to atOffset:0.08];
+  [path liftUpAtOffset:0.11];
+  XCSynthesizedEventRecord *record = [[XCSynthesizedEventRecord alloc] initWithName:@"Lotus self-test segment" interfaceOrientation:orientation];
+  [record addPointerEventPath:path];
+  return record;
+}
+
 /** Why a held-finger mode's run didn't give one clean touch, in words (for /api/wda and the control app status). */
 + (NSString *)lotus_whyDown:(NSString *)afterDown move:(NSString *)afterMove up:(NSString *)afterUp travelled:(double)travelled
 {
@@ -518,14 +600,16 @@ static BOOL LotusLiveWatching = NO;
    mode 4 (segmented, v2, 2026-11-17): two short whole gestures one after the other, each press -> move -> a still
      moment -> lift, the second starting where the first ended (what the Mac's server sends through /lotus/gesture as
      a finger moves when no finger can be held). Works when the window sees two complete touches that moved.
- The answer is the first of 1-3 that works, else 4 when it works, else 0. Every mode's result is said (`modes`).
+   mode 5 (v3): as 4 with a pause between the two (40, 100 then 200 ms; the first that works is said as `gapMs`).
+ The answer is the first of 1-5 that works, else 0. Every run's result is said (`modes`, with `seen` and `gapMs` for
+ 4 and 5); the Mac's server recounts `seen` itself and picks the mode (and gap) it uses.
  The Mac's server wakes and unlocks the phone before it asks (v1 also ran on a locked phone, which saw nothing).
  Nothing else on the phone is touched; afterwards the phone goes back to its Home Screen ({"home": false} leaves the
  app in front).
- -> {"tested": true, "mode": 0-4, "modes": [{"mode", "works", "why"}], "notes": [...]}
+ -> {"tested": true, "mode": 0-5, "modes": [{"mode", "works", "why", "seen"?, "gapMs"?}], "notes": [...]}
  -> {"tested": false, "why": "..."} when the app couldn't come to the front (a locked or dark phone): try later.
- TO VERIFY ON THE MAC (v2): it compiles; GET /api/wda shows fork.perDevice.<udid>.live.mode 4 (or 1-3) and each
- mode's "why"; a drag on the Phones page moves on the phone while the pointer moves.
+ TO VERIFY ON THE MAC (v3): it compiles; GET /api/wda shows fork.perDevice.<udid>.live.mode 4 on iPhone-2 (as with
+ v2) and 5 with a gapMs on iPhone-1, each run's "seen"; a drag on the Phones page moves while the pointer moves.
  */
 + (id<FBResponsePayload>)handleLotusSelfTest:(FBRouteRequest *)request
 {
@@ -626,35 +710,36 @@ static BOOL LotusLiveWatching = NO;
       [self lotus_spin:0.3];
     }
   }
-  // 4: segmented. Two whole gestures, a -> b then b -> c, each still for a moment before its lift, as the server
-  // sends them (src/segments.ts); played one after the other like the phone's queue does.
-  {
+  // 4: segmented, and v3's 5: segmented with a gap. Two whole gestures a -> b then b -> c, each a new record with its
+  // own path, played one after the other and each waited for (XCTest's completion) as the phone's queue does. Mode 4
+  // sends the second at once; mode 5 waits `gap` ms between them (the first gap of 40, 100, 200 that works). iOS
+  // 18.5 (iPhone-1, v2) showed one touch of one segment's length ('BMMMMMMMME', 48 pt, 811 ms for both): one of the
+  // two back-to-back segments never reached the window. Each segment's own letters and time are in the notes.
+  NSArray<NSNumber *> *gaps = @[@0, @40, @100, @200];
+  BOOL gappedDone = NO;
+  for (NSNumber *gapMs in gaps) {
+    NSInteger mode = gapMs.integerValue > 0 ? 5 : 4;
+    if (mode == 5 && gappedDone) {
+      break;
+    }
     [probe.seen setString:@""];
-    XCPointerEventPath *p1 = [[XCPointerEventPath alloc] initForTouchAtPoint:a offset:0];
-    [p1 moveToPoint:b atOffset:0.08];
-    [p1 liftUpAtOffset:0.11];
-    XCSynthesizedEventRecord *r1 = [[XCSynthesizedEventRecord alloc] initWithName:@"Lotus self-test segment" interfaceOrientation:orientation];
-    [r1 addPointerEventPath:p1];
-    XCPointerEventPath *p2 = [[XCPointerEventPath alloc] initForTouchAtPoint:b offset:0];
-    [p2 moveToPoint:c atOffset:0.08];
-    [p2 liftUpAtOffset:0.11];
-    XCSynthesizedEventRecord *r2 = [[XCSynthesizedEventRecord alloc] initWithName:@"Lotus self-test segment" interfaceOrientation:orientation];
-    [r2 addPointerEventPath:p2];
     CFAbsoluteTime t0 = CFAbsoluteTimeGetCurrent();
-    NSString *e1 = [self lotus_play:r1];
-    NSString *e2 = [self lotus_play:r2];
-    double ms = (CFAbsoluteTimeGetCurrent() - t0) * 1000.0;
+    NSString *e1 = [self lotus_play:[self lotus_segmentFrom:a to:b orientation:orientation]];
+    double ms1 = (CFAbsoluteTimeGetCurrent() - t0) * 1000.0;
+    NSString *seen1 = [probe.seen copy];
+    if (gapMs.integerValue > 0) {
+      [self lotus_spin:gapMs.doubleValue / 1000.0];
+    }
+    CFAbsoluteTime t1 = CFAbsoluteTimeGetCurrent();
+    NSString *e2 = [self lotus_play:[self lotus_segmentFrom:b to:c orientation:orientation]];
+    double ms2 = (CFAbsoluteTimeGetCurrent() - t1) * 1000.0;
     [self lotus_spin:0.35];
     NSString *seen = [probe.seen copy];
+    // the last touch began at b: it travelled about 60 pt (less a frame)
     double travelled = hypot(probe.lastAt.x - probe.beganAt.x, probe.lastAt.y - probe.beganAt.y);
-    // two touches, each "B", moves, "E" (e.g. "BMMEBMME"); the second began at b, so it travelled about 60 pt
-    NSUInteger complete = 0;
-    for (NSString *t in [seen componentsSeparatedByString:@"E"]) {
-      if (t.length > 1 && [t hasPrefix:@"B"] && [self lotus_text:[t substringFromIndex:1] only:@"M"]) {
-        complete++;
-      }
-    }
-    BOOL good = nil == e1 && nil == e2 && 2 == complete && [seen hasSuffix:@"E"] && travelled >= 30.0;
+    NSUInteger complete = 0, moved = 0, broken = 0;
+    [self lotus_count:seen complete:&complete moved:&moved broken:&broken];
+    BOOL good = nil == e1 && nil == e2 && 2 == complete && 2 == moved && 0 == broken && travelled >= 30.0;
     NSString *why = nil;
     if (!good) {
       if (nil != e1) {
@@ -664,14 +749,22 @@ static BOOL LotusLiveWatching = NO;
       } else if (0 == seen.length) {
         why = @"no touch reached the test window (is the phone awake and unlocked?)";
       } else {
-        why = [NSString stringWithFormat:@"the two segments gave '%@' (%.0f pt)", seen, travelled];
+        why = [NSString stringWithFormat:@"the two segments gave '%@' (%lu complete, %lu broken, %.0f pt)", seen,
+               (unsigned long)complete, (unsigned long)broken, travelled];
       }
     }
-    [modes addObject:@{@"mode": @4, @"works": @(good), @"why": (nil != why ? why : (id)[NSNull null])}];
-    [notes addObject:[NSString stringWithFormat:@"mode 4 (segmented): '%@' (%.0f pt, both played in %.0f ms) -> %@", seen, travelled, ms, good ? @"works" : why]];
+    [modes addObject:@{@"mode": @(mode), @"works": @(good), @"why": (nil != why ? why : (id)[NSNull null]),
+                       @"seen": seen, @"gapMs": gapMs}];
+    [notes addObject:[NSString stringWithFormat:@"mode %ld (segmented, gap %ld ms): first '%@' in %.0f ms, both '%@' (second in %.0f ms, %.0f pt) -> %@",
+                      (long)mode, (long)gapMs.integerValue, seen1, ms1, seen, ms2, travelled, good ? @"works" : why]];
     if (good && 0 == found) {
-      found = 4;
+      found = mode;
     }
+    if (good && mode == 5) {
+      gappedDone = YES;
+    }
+    // what a failed run left behind settles before the next one
+    [self lotus_spin:0.3];
   }
   window.hidden = YES;
   window.rootViewController = nil;

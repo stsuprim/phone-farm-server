@@ -5,7 +5,7 @@ process.env.INPUT_LOG = '0';
 import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
 import { AddressInfo } from 'node:net';
-import { ForkInstaller, ForkTokens, LIVE_SEGMENTED, readSelfTest, SELFTEST_ATTEMPTS, SelfTestAnswer } from '../src/fork.js';
+import { countTouches, ForkInstaller, ForkTokens, LIVE_GAP_DEFAULT_MS, LIVE_GAPPED, LIVE_SEGMENTED, pickLiveMode, readSelfTest, segmentsSeparate, SELFTEST_ATTEMPTS, SelfTestAnswer } from '../src/fork.js';
 import { MockBackend } from '../src/mock.js';
 import { SEG_MIN_MS, SEG_MIN_PT, SEG_OVERHEAD_MS, SEG_SETTLE_MS, Segmenter } from '../src/segments.js';
 import { createServer } from '../src/server.js';
@@ -110,12 +110,117 @@ const tick = () => new Promise((r) => setImmediate(r));
 // ---- the self-test: what the phone answered, made sure of ----
 {
   assert.deepEqual(readSelfTest({ tested: true, mode: 4, modes: [{ mode: 1, works: false, why: 'x'.repeat(300) }, { mode: 9, works: true, why: null }, { mode: 4, works: true, why: null }] }), {
-    tested: true, mode: 4, modes: [{ mode: 1, works: false, why: 'x'.repeat(200) }, { mode: 4, works: true, why: null }],
+    tested: true, mode: 4, gapMs: 0, modes: [{ mode: 1, works: false, why: 'x'.repeat(200) }, { mode: 4, works: true, why: null }],
   });
   assert.equal(readSelfTest({ tested: true, mode: 7 }).mode, 0, 'a mode this server does not know is none');
   assert.equal(readSelfTest({ tested: false, mode: 4 }).mode, 0);
   assert.equal(LIVE_SEGMENTED, 4);
   ok('self-test: modes 1-4 known, each mode result kept short');
+}
+
+// ---- fork v3: the self-test's touches counted as begin..end pairs, and the mode (and gap) picked per phone ----
+{
+  assert.deepEqual(countTouches('BMMEBMME'), { complete: 2, moved: 2, broken: 0 }, 'two separate touches');
+  assert.deepEqual(countTouches('BMMMMMMMME'), { complete: 1, moved: 1, broken: 0 }, "iPhone-1's v2 result: one touch for two segments");
+  assert.deepEqual(countTouches('BE'), { complete: 1, moved: 0, broken: 0 });
+  assert.deepEqual(countTouches(''), { complete: 0, moved: 0, broken: 0 });
+  assert.deepEqual(countTouches('BMMBMME'), { complete: 1, moved: 1, broken: 1 }, 'a begin inside an open touch is broken');
+  assert.deepEqual(countTouches('BMMCBMME'), { complete: 1, moved: 1, broken: 1 }, 'a cancel is broken');
+  assert.deepEqual(countTouches('MEBME'), { complete: 1, moved: 1, broken: 2 }, 'a move and an end with no touch open');
+  assert.deepEqual(countTouches('BMMEBMM'), { complete: 1, moved: 1, broken: 1 }, 'a touch never ended');
+  assert.deepEqual(countTouches('BEBMME'), { complete: 2, moved: 1, broken: 0 });
+  assert.equal(segmentsSeparate('BMMEBMME'), true);
+  assert.equal(segmentsSeparate('BMMMMMMMME'), false);
+  assert.equal(segmentsSeparate('BEBMME'), false, 'both must have moved');
+  assert.equal(segmentsSeparate('BMMEBMMEBME'), false, 'exactly two');
+  ok('self-test (v3): touches counted as separate begin..end pairs; merged, lost, cancelled or unfinished ones never pass');
+
+  // iPhone-1 (iOS 18.5): back-to-back segments lose one; the first gap that works is kept
+  const iphone1: SelfTestAnswer = {
+    tested: true, mode: 5, modes: [
+      { mode: 1, works: false, why: "the lift gave 'BE'" },
+      { mode: 4, works: false, why: 'x', seen: 'BMMMMMMMME', gapMs: 0 },
+      { mode: 5, works: false, why: 'x', seen: 'BMMMMMMME', gapMs: 40 },
+      { mode: 5, works: true, why: null, seen: 'BMMMEBMMME', gapMs: 100 },
+    ],
+  };
+  assert.deepEqual([readSelfTest(iphone1).mode, readSelfTest(iphone1).gapMs], [LIVE_GAPPED, 100]);
+  // iPhone-2 (iOS 18.7.8): mode 4 works and stays (no gap), even when a gap works too
+  const iphone2: SelfTestAnswer = {
+    tested: true, mode: 4, modes: [
+      { mode: 4, works: true, why: null, seen: 'BMMEBMME', gapMs: 0 },
+      { mode: 5, works: true, why: null, seen: 'BMMEBMME', gapMs: 40 },
+    ],
+  };
+  assert.deepEqual([readSelfTest(iphone2).mode, readSelfTest(iphone2).gapMs], [LIVE_SEGMENTED, 0]);
+  // the phone's word isn't enough: a "works" whose letters show one touch is recounted as not working
+  assert.deepEqual(pickLiveMode([{ mode: 4, works: true, why: null, seen: 'BMMMMMMMME' }, { mode: 5, works: true, why: null, seen: 'BMEBME', gapMs: 200 }]), { mode: 5, gapMs: 200 });
+  assert.deepEqual(pickLiveMode([{ mode: 4, works: true, why: null, seen: 'BMMMMMMMME' }]), { mode: 0, gapMs: 0 });
+  // the smallest working gap, whatever the order; a hold mode wins over any segmented one
+  assert.deepEqual(pickLiveMode([{ mode: 5, works: true, why: null, seen: 'BMEBME', gapMs: 200 }, { mode: 5, works: true, why: null, seen: 'BMEBME', gapMs: 40 }]), { mode: 5, gapMs: 40 });
+  assert.deepEqual(pickLiveMode([{ mode: 5, works: true, why: null, seen: 'BMEBME', gapMs: 40 }, { mode: 2, works: true, why: null }]), { mode: 2, gapMs: 0 });
+  // a v2 build's answer (no letters): its word is kept; a mode 5 with no gap gets the default
+  assert.deepEqual(pickLiveMode([{ mode: 4, works: true, why: null }]), { mode: 4, gapMs: 0 });
+  assert.deepEqual(readSelfTest({ tested: true, mode: 5 }), { tested: true, mode: 5, gapMs: LIVE_GAP_DEFAULT_MS, modes: [] });
+  // what the phone says is kept short and in range
+  const kept = readSelfTest({ tested: true, mode: 5, modes: [{ mode: 5, works: true, why: null, seen: 'BME'.repeat(40), gapMs: 9999 }] }).modes[0]!;
+  assert.deepEqual([kept.seen!.length, kept.gapMs], [64, 500]);
+  ok('self-test (v3): the server picks the mode per phone from every result: hold, else segmented, else gapped with its smallest working gap');
+}
+
+// ---- fork v3: segments with a gap, one after the other ----
+{
+  let now = 0;
+  const sent: { points: PathPoint[]; hold: number; gap: number }[] = [];
+  const s = new Segmenter(async (points, hold, gap) => void sent.push({ points, hold, gap }), () => now);
+  // without a gap (mode 4): a segment is due once SEG_MIN_MS long, as long as the phone isn't too far behind
+  await s.down(0, 0);
+  now = SEG_MIN_MS;
+  await s.move(0, 30);
+  now = 2 * SEG_MIN_MS + 30;
+  await s.move(0, 60);
+  assert.deepEqual(sent.map((x) => x.gap), [0, 0], 'mode 4: two segments, no gap');
+  await s.up(0, 60);
+  sent.length = 0;
+  // with a gap (mode 5): each segment asks for it, and the phone's estimated time counts it, so the next waits longer
+  s.gapMs = 100;
+  now = 10_000;
+  await s.down(0, 0);
+  now += SEG_MIN_MS;
+  await s.move(0, 30);
+  assert.equal(sent.length, 1);
+  now += SEG_MIN_MS + 30;
+  await s.move(0, 60);
+  assert.equal(sent.length, 1, 'still busy with the first segment and its gap');
+  now += 100;
+  await s.move(0, 70);
+  assert.equal(sent.length, 2, 'once the gap is played, the next goes');
+  await s.up(0, 80);
+  assert.deepEqual(sent.map((x) => [x.points[0], x.gap]), [[[0, 0, 0], 100], [[0, 30, 0], 100], [[0, 70, 0], 100]], 'each from where the last ended, each with the gap');
+  ok('segments (v3): with a gap every segment asks the phone to pause after it, and the pacing waits for it');
+
+  // the requests go strictly one after the other: the next only once the one before was answered
+  const order: string[] = [];
+  let release!: () => void;
+  const gate = new Promise<void>((r) => (release = r));
+  let t = 0;
+  const s3 = new Segmenter(async (_p, _h, gap) => {
+    order.push(`start ${order.length} ${gap}`);
+    if (order.length === 1) await gate;
+    order.push('end');
+  }, () => t);
+  s3.gapMs = 40;
+  await s3.down(0, 0);
+  t = 100;
+  const p1 = s3.move(0, 50);
+  t = 1000;
+  const p2 = s3.up(0, 90);
+  await tick();
+  assert.deepEqual(order, ['start 0 40'], 'the second is not sent while the first is unanswered');
+  release();
+  await Promise.all([p1, p2]);
+  assert.deepEqual(order, ['start 0 40', 'end', 'start 2 40', 'end']);
+  ok('segments (v3): serialised, each request after the one before it was answered');
 }
 
 // ---- the self-test's flow: woken and checked awake first, one more try, after an install and on demand ----

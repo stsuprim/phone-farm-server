@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import http from 'node:http';
 import path from 'node:path';
 import { Config } from './config.js';
-import { FORK_ROUTES, ForkLaunch, launchPlan, LIVE_SEGMENTED, TOKEN_ENV, TOKEN_HEADER, WdaFlavor } from './fork.js';
+import { FORK_ROUTES, ForkLaunch, launchPlan, LIVE_GAPPED, LIVE_SEGMENTED, TOKEN_ENV, TOKEN_HEADER, WdaFlavor } from './fork.js';
 import { isLandscape, Orientation, orientationFromWda, portraitSize, uprightSize, uprightToPanel } from './orient.js';
 import { Segmenter } from './segments.js';
 import { ButtonName, ControlState, HttpError, PathPoint, ScreenInfo, StreamSettings } from './types.js';
@@ -171,10 +171,11 @@ export function gestureRoute(flavor: WdaFlavor): string {
 /**
  * The body of a whole gesture in one command (both builds take the same): every point with its time, in portrait
  * points; the phone plays all of it by itself, so a natural swipe's curve stays smooth whatever the link does
- * meanwhile. `hold`: lift this long after the last point (a tap's hold).
+ * meanwhile. `hold`: lift this long after the last point (a tap's hold). `gap` (our build v3, live mode 5): the
+ * phone waits this long after playing it before the next record; sent only when above 0.
  */
-export function gestureBody(points: PathPoint[], hold?: number): { points: PathPoint[]; orientation: 1; hold?: number } {
-  return { ...(hold !== undefined ? { hold } : {}), points, orientation: 1 };
+export function gestureBody(points: PathPoint[], hold?: number, gap?: number): { points: PathPoint[]; orientation: 1; hold?: number; gap?: number } {
+  return { ...(hold !== undefined ? { hold } : {}), ...(gap ? { gap } : {}), points, orientation: 1 };
 }
 
 /** The body of one live touch event for our build (POST /lotus/touch): the place in portrait points and the mode its self-test found. */
@@ -239,7 +240,7 @@ export class WdaManager {
   // ---- stock WebDriverAgent or our own build (src/fork.ts) ----
 
   /** Set by the backend: how a phone's WDA starts when the server does, and what our build needs to be launched on it. */
-  fork?: { flavorAtStart(udid: string): WdaFlavor; launch(udid: string): ForkLaunch; failed(udid: string, why: string): void; liveMode(udid: string): number };
+  fork?: { flavorAtStart(udid: string): WdaFlavor; launch(udid: string): ForkLaunch; failed(udid: string, why: string): void; liveMode(udid: string): number; liveGap?(udid: string): number };
 
   /** Which WebDriverAgent the phone runs (or is being started with). */
   flavor(udid: string): WdaFlavor {
@@ -1392,12 +1393,14 @@ export class WdaManager {
     if (!e || why) throw new HttpError(503, why ?? 'WebDriverAgent is not running for this phone');
     const mode = this.liveModeOf(udid);
     const at = this.panel(e, x, y);
-    if (mode === LIVE_SEGMENTED) {
+    if (mode === LIVE_SEGMENTED || mode === LIVE_GAPPED) {
       // 2026-11-17: no finger can stay down between XCTest's records on iOS 18: the drag goes in short whole
-      // gestures as it happens (src/segments.ts), each starting where the last ended
-      const seg = (e.seg ??= new Segmenter((points, hold) => this.raw(e, 'POST', FORK_ROUTES.gesture, gestureBody(points, hold), LIVE_TOUCH_TIMEOUT_MS)));
+      // gestures as it happens (src/segments.ts), each starting where the last ended; mode 5 (fork v3) with the
+      // pause between two segments the phone's self-test found (iOS 18.5 lost one of two back-to-back segments)
+      const seg = (e.seg ??= new Segmenter((points, hold, gap) => this.raw(e, 'POST', FORK_ROUTES.gesture, gestureBody(points, hold, gap), LIVE_TOUCH_TIMEOUT_MS)));
       if (phase === 'down') {
         if (seg.isDown) await seg.up(at[0], at[1]).catch(() => {});
+        seg.gapMs = mode === LIVE_GAPPED ? this.fork?.liveGap?.(udid) ?? 0 : 0;
         return seg.down(at[0], at[1]);
       }
       return phase === 'move' ? seg.move(at[0], at[1]) : seg.up(at[0], at[1]);

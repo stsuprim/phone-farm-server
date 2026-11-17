@@ -1,5 +1,5 @@
 {
-  "version": 2,
+  "version": 3,
   "upstream": "v16.15.3",
   "upstreamCommit": "02cb92f0e93c8b021443bcbb8eeb80932c113220",
   "upstreamRepo": "https://github.com/appium/WebDriverAgent",

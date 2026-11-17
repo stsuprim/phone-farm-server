@@ -52,15 +52,78 @@ export const TOKEN_ENV = 'LOTUS_WDA_TOKEN';
 /**
  * The live-touch modes: 1-3 hold a finger down between requests (`/lotus/touch`, a mode each way of asking XCTest);
  * 4 (2026-11-17, `LIVE_SEGMENTED`) plays the drag in short whole gestures as it happens (src/segments.ts), for a phone
- * where none of 1-3 works (iOS 18: XCTest lifts every finger at the end of each record). 0: drags play on release.
+ * where none of 1-3 works (iOS 18: XCTest lifts every finger at the end of each record). 5 (fork v3, `LIVE_GAPPED`):
+ * segmented with a pause between two segments (`gapMs`), for a phone where back-to-back segments lose one (iPhone-1,
+ * iOS 18.5: 'BMMMMMMMME', one touch for two segments). 0: drags play on release.
  */
 export const LIVE_SEGMENTED = 4;
-export const LIVE_MODES: Record<number, string> = { 0: 'none', 1: 'hold (plain)', 2: 'hold (persistent state)', 3: 'hold (persistent on every move)', 4: 'segmented' };
+export const LIVE_GAPPED = 5;
+export const LIVE_MODES: Record<number, string> = { 0: 'none', 1: 'hold (plain)', 2: 'hold (persistent state)', 3: 'hold (persistent on every move)', 4: 'segmented', 5: 'segmented with a gap' };
+/** The gap a mode 5 answer without one is given (ms), and the most the phone keeps (FBLotusCommands.inc). */
+export const LIVE_GAP_DEFAULT_MS = 100;
+export const LIVE_GAP_MAX_MS = 500;
 /** One mode's result in the phone's self-test. */
 export interface LiveModeResult {
   mode: number;
   works: boolean;
   why: string | null;
+  /** Modes 4 and 5 (fork v3): what the test window saw (B began, M moved, E ended, C cancelled) and the gap tried. */
+  seen?: string;
+  gapMs?: number;
+}
+
+/**
+ * The touches in what the self-test's window saw (fork v3, the same count as FBLotusCommands.inc's lotus_count): a
+ * touch is "B", only "M", then "E". `complete` counts those, `moved` the complete ones with an "M"; anything else (a
+ * "B" while a touch is open, a "C", an "M" or "E" with none open, a touch never ended) is `broken`.
+ */
+export function countTouches(seen: string): { complete: number; moved: number; broken: number } {
+  let complete = 0;
+  let moved = 0;
+  let broken = 0;
+  let open = false;
+  let moves = 0;
+  for (const ch of seen) {
+    if (ch === 'B') {
+      if (open) broken++;
+      open = true;
+      moves = 0;
+    } else if (ch === 'M') {
+      if (open) moves++;
+      else broken++;
+    } else if (ch === 'E') {
+      if (open) {
+        complete++;
+        if (moves > 0) moved++;
+      } else broken++;
+      open = false;
+    } else {
+      broken++;
+      open = false;
+    }
+  }
+  if (open) broken++;
+  return { complete, moved, broken };
+}
+
+/** Two segments reached the window as two separate touches that each moved (modes 4 and 5). */
+export function segmentsSeparate(seen: string): boolean {
+  const t = countTouches(seen);
+  return t.complete === 2 && t.moved === 2 && t.broken === 0;
+}
+
+/**
+ * The mode (and gap) this server uses on a phone, from every mode's result: the first that works of 1-3, else 4,
+ * else 5 with its smallest working gap. A segmented result is recounted from what the window saw (`seen`), so a
+ * merged or lost segment never counts as working whatever the phone said. 0: none works.
+ */
+export function pickLiveMode(modes: LiveModeResult[]): { mode: number; gapMs: number } {
+  const usable = modes
+    .filter((m) => m.works && (m.mode < LIVE_SEGMENTED || m.seen === undefined || segmentsSeparate(m.seen)))
+    .sort((a, b) => a.mode - b.mode || (a.gapMs ?? 0) - (b.gapMs ?? 0));
+  const best = usable[0];
+  if (!best) return { mode: 0, gapMs: 0 };
+  return { mode: best.mode, gapMs: best.mode === LIVE_GAPPED ? best.gapMs || LIVE_GAP_DEFAULT_MS : 0 };
 }
 
 export const FORK_ROUTES = { info: '/lotus/info', gesture: '/lotus/gesture', touch: '/lotus/touch', shot: '/lotus/shot', selftest: '/lotus/selftest' } as const;
@@ -199,8 +262,10 @@ export type ForkState = 'stock' | 'building' | 'installing' | 'fork' | 'waiting'
 export interface LiveTest {
   /** It ran (false: the WebDriverAgent app couldn't come to the front; tried again later). */
   tested: boolean;
-  /** The live-touch mode that works on this phone (1-3 a held finger, 4 segmented), 0 when none does. */
+  /** The live-touch mode that works on this phone (1-3 a held finger, 4 segmented, 5 gapped), 0 when none does. */
   mode: number;
+  /** Mode 5: the pause the phone keeps between two segments (ms); 0 otherwise. */
+  gapMs?: number;
   why: string | null;
   notes?: string[];
   /** Each mode's result (2026-11-17), what it is ('hold', 'segmented') and what started the test. */
@@ -298,14 +363,23 @@ export interface SelfTestAnswer {
   modes?: LiveModeResult[];
 }
 
-/** A self-test's answer, made sure of: the mode one this server knows, each mode's result kept short. */
-export function readSelfTest(r: SelfTestAnswer): { tested: boolean; mode: number; modes: LiveModeResult[] } {
-  const mode = r.tested && Number.isInteger(r.mode) && r.mode >= 1 && r.mode <= LIVE_SEGMENTED ? r.mode : 0;
+/**
+ * A self-test's answer, made sure of: modes this server knows, each mode's result kept short, and the mode (and gap)
+ * picked by this server from every result (pickLiveMode). An answer without results (an older build) keeps its mode.
+ */
+export function readSelfTest(r: SelfTestAnswer): { tested: boolean; mode: number; gapMs: number; modes: LiveModeResult[] } {
   const modes = (Array.isArray(r.modes) ? r.modes : [])
-    .filter((m) => m && Number.isInteger(m.mode) && m.mode >= 1 && m.mode <= LIVE_SEGMENTED)
-    .slice(0, 8)
-    .map((m) => ({ mode: m.mode, works: m.works === true, why: typeof m.why === 'string' ? m.why.slice(0, 200) : null }));
-  return { tested: !!r.tested, mode, modes };
+    .filter((m) => m && Number.isInteger(m.mode) && m.mode >= 1 && m.mode <= LIVE_GAPPED)
+    .slice(0, 10)
+    .map((m) => ({
+      mode: m.mode, works: m.works === true, why: typeof m.why === 'string' ? m.why.slice(0, 200) : null,
+      ...(typeof m.seen === 'string' ? { seen: m.seen.slice(0, 64) } : {}),
+      ...(Number.isFinite(m.gapMs) ? { gapMs: Math.min(LIVE_GAP_MAX_MS, Math.max(0, Math.round(m.gapMs!))) } : {}),
+    }));
+  if (!r.tested) return { tested: false, mode: 0, gapMs: 0, modes };
+  if (modes.length) return { tested: true, ...pickLiveMode(modes), modes };
+  const mode = Number.isInteger(r.mode) && r.mode >= 1 && r.mode <= LIVE_GAPPED ? r.mode : 0;
+  return { tested: true, mode, gapMs: mode === LIVE_GAPPED ? LIVE_GAP_DEFAULT_MS : 0, modes };
 }
 
 /** Keeps each phone's state and installs our build wherever it's missing or older than the repo's. */
@@ -395,6 +469,12 @@ export class ForkInstaller {
   liveMode(udid: string): number {
     const l = this.devices[udid]?.live;
     return l?.tested ? l.mode : 0;
+  }
+
+  /** Mode 5 (fork v3): the pause between two segments the self-test found on this phone (ms); 0 for any other mode. */
+  liveGap(udid: string): number {
+    const l = this.devices[udid]?.live;
+    return l?.tested && l.mode === LIVE_GAPPED ? l.gapMs || LIVE_GAP_DEFAULT_MS : 0;
   }
 
   state(udid: string): ForkDevice | null {
@@ -520,16 +600,16 @@ export class ForkInstaller {
       if (r.notes?.length) notes.push(...r.notes.map((n) => `try ${attempt}: ${n}`));
       if (r.tested && readSelfTest(r).mode) break;
     }
-    const { tested, mode, modes } = readSelfTest(r);
-    const kind = mode >= 1 && mode <= 3 ? 'hold' : mode === LIVE_SEGMENTED ? 'segmented' : null;
+    const { tested, mode, gapMs, modes } = readSelfTest(r);
+    const kind = mode >= 1 && mode <= 3 ? 'hold' : mode === LIVE_SEGMENTED || mode === LIVE_GAPPED ? 'segmented' : null;
     const why = tested
       ? mode
         ? null
         : 'no live-touch mode worked on this phone (not even segmented): drags are played whole'
       : r.why ?? 'the self-test could not run';
-    this.set(udid, { live: { tested, mode, why, notes: notes.slice(-8), modes, kind, trigger, at: this.now(), tries } });
+    this.set(udid, { live: { tested, mode, ...(mode === LIVE_GAPPED ? { gapMs } : {}), why, notes: notes.slice(-12), modes, kind, trigger, at: this.now(), tries } });
     const l = this.device(udid).live!;
-    this.log(`${udid.slice(-8)}: live touch self-test (${trigger}): ${l.tested ? (l.mode ? `mode ${l.mode} (${LIVE_MODES[l.mode]}) works` : 'no mode works (drags stay whole gestures)') : `not run (${l.why}); try ${tries} of ${LIVE_TRIES}`}${notes.length ? ` [${notes.join('; ').slice(0, 500)}]` : ''}`);
+    this.log(`${udid.slice(-8)}: live touch self-test (${trigger}): ${l.tested ? (l.mode ? `mode ${l.mode} (${LIVE_MODES[l.mode]}${l.gapMs ? `, ${l.gapMs} ms` : ''}) works` : 'no mode works (drags stay whole gestures)') : `not run (${l.why}); try ${tries} of ${LIVE_TRIES}`}${notes.length ? ` [${notes.join('; ').slice(0, 500)}]` : ''}`);
     return l;
   }
 
