@@ -94,6 +94,8 @@ async function info(udid: string, args: string[]): Promise<string> {
 const LOCK_TIMEOUT_MS = 3000;
 /** The screenshot that says whether the screen is dark waits this long at most. */
 const DARK_SHOT_MS = 5000;
+/** A wake waits this long at most for the phone's WDA to come up (a restart under way) before it says it can't. */
+const WAKE_WDA_WAIT_MS = 15_000;
 
 
 export class RealBackend implements Backend {
@@ -118,14 +120,23 @@ export class RealBackend implements Backend {
 
   constructor(private cfg: Config) {
     this.wda = new WdaManager(cfg, (udid) => this.phones.get(udid)?.name ?? udid);
+    const silent = cfg.phoneSilent !== false;
     this.volume = new VolumeGuard({
-      percent: cfg.audio === false ? 0 : cfg.audioPhoneVolume ?? 50,
-      press: (udid, dir) => this.wda.pressButton(udid, dir === 'up' ? 'volumeUp' : 'volumeDown'),
+      percent: cfg.audio === false || silent ? 0 : cfg.audioPhoneVolume ?? 0,
+      silent,
+      // 2026-11-18: presses that never recover WDA (a silence is tried again when it comes up); never "up" while silent
+      press: (udid, dir) => (dir === 'up' ? (silent ? Promise.reject(new Error('the phones stay silent')) : this.wda.pressButton(udid, 'volumeUp')) : this.wda.pressSoft(udid, 'volumeDown')),
       file: path.join(cfg.dataDir, 'audio-volume.json'),
       gapMs: 60,
     });
     // a phone left raised by a crash or a restart goes back to 0 first (tried again while its WDA isn't up yet)
     this.volume.recover();
+    // its known screen size by model (src/screens.ts), when WDA gives nothing usable
+    this.wda.modelOf = (udid) => this.phones.get(udid)?.model || null;
+    // 2026-11-18: every time a phone's WDA comes up (a start, a restart, a rebuild), its volume goes all the way down
+    this.wda.onSession = (udid, fresh) => {
+      if (silent && fresh) void this.volume.silence(udid, true, 'its WebDriverAgent came up').catch(() => {});
+    };
     this.wda.onOrientation = (udid) => {
       const c = this.capture.get(udid);
       if (c) c.tries = 0; // the phone turned: a new chance for the capture to follow
@@ -794,8 +805,18 @@ export class RealBackend implements Backend {
 
   async pressButton(udid: string, name: ButtonName): Promise<InputResult> {
     this.known(udid);
+    // 2026-11-18 (the owner: the phones never make a sound): nothing on this server turns a phone's volume up
+    if (name === 'volumeUp' && this.cfg.phoneSilent !== false) {
+      throw new HttpError(403, "the phones stay silent: volume up is never pressed (the sound plays on the owner's PC through the live view; PHONE_SILENT=false allows it)");
+    }
     await this.wda.pressButton(udid, name);
     return { via: 'wda' };
+  }
+
+  /** 2026-11-18: after a wake, the phone's volume goes down again (at most every few minutes: src/audio.ts). */
+  silence(udid: string, why: string): void {
+    if (this.cfg.phoneSilent === false || !this.phones.get(udid)?.online) return;
+    void this.volume.silence(udid, false, why).catch(() => {});
   }
 
   /** A hash of a still (WDA's own screenshot: identical screens give identical bytes); null without one. Never the live capture. */
@@ -889,9 +910,17 @@ export class RealBackend implements Backend {
    * iOS's own Auto-Lock), so a dark screen gets what WDA's unlock does: Home (the screen comes on), a moment, Home
    * again (past the lock screen). Never pressed on a screen that shows something (it would leave the app in front).
    */
-  async unlock(udid: string): Promise<void> {
+  async unlock(udid: string, opts: { force?: boolean } = {}): Promise<void> {
     this.known(udid);
+    // 2026-11-18 (iPhone-2's live view stuck on "connecting" with its screen off): a wake used to find nothing to
+    // ask while the phone's WDA was starting or restarting, and quietly did nothing. It waits for WDA first now, and
+    // says plainly when it can't.
+    if (!(await this.wda.whenReady(udid, WAKE_WDA_WAIT_MS))) {
+      const st = this.wda.state(udid);
+      throw new Error(st === 'recovering' ? "the phone's control link is restarting, so its screen can't be woken yet" : "the phone's control link is down, so its screen can't be woken");
+    }
     await wakeScreen({
+      force: opts.force,
       locked: () => this.wdaLocked(udid),
       // home press + swipe up: past the lock screen when the phone has no passcode
       unlock: () => this.wdaPower(udid, 'POST', '/wda/unlock', 20000),

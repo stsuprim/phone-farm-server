@@ -136,16 +136,30 @@ export function flattenUi(root: unknown, screen: Size | null, opts: FlattenOptio
     const visible = n.isVisible === undefined && n.visible === undefined ? true : truthy(n.isVisible ?? n.visible);
     const enabled = n.isEnabled === undefined && n.enabled === undefined ? true : truthy(n.isEnabled ?? n.enabled);
     if (r && W > 0 && H > 0) {
-      const x = round4(r.x / W);
-      const y = round4(r.y / H);
-      const w = round4(r.width / W);
-      const h = round4(r.height / H);
+      let x = round4(r.x / W);
+      let y = round4(r.y / H);
+      let w = round4(r.width / W);
+      let h = round4(r.height / H);
       const cx = x + w / 2;
       const cy = y + h / 2;
       const onScreen = w > 0 && h > 0 && cx >= 0 && cx <= 1 && cy >= 0 && cy <= 1;
       const said = n.isHittable ?? n.hittable;
       const hittable = said !== undefined ? truthy(said) : visible && enabled && onScreen;
-      const worth = visible && w > 0 && h > 0 && (!!label || !!value || !!name || INTERACTIVE.has(type.toLowerCase()));
+      let worth = visible && w > 0 && h > 0 && (!!label || !!value || !!name || INTERACTIVE.has(type.toLowerCase()));
+      if (worth && !opts.all) {
+        // 2026-11-18: the list is what's on the screen, in 0..1 of it. Something wholly off it (another Home Screen
+        // page, a row below the fold), or the size of a screen or less with its middle off it, isn't listed;
+        // something bigger than the screen (a tall scroll view, a web view) is given as the part that shows. Before,
+        // one place beyond 1.5 made Lotus's reader take the whole list for points and show every place as 0 or 1.
+        // `all` keeps the tree's own rectangles.
+        const x0 = Math.max(0, x);
+        const y0 = Math.max(0, y);
+        const x1 = Math.min(1, x + w);
+        const y1 = Math.min(1, y + h);
+        const big = w > 1 || h > 1;
+        if (x1 - x0 <= 0 || y1 - y0 <= 0 || (!onScreen && !big)) worth = false;
+        else if (x !== x0 || y !== y0 || x + w !== x1 || y + h !== y1) [x, y, w, h] = [round4(x0), round4(y0), round4(x1 - x0), round4(y1 - y0)];
+      }
       const container = type === 'Application' || type === 'Window';
       if (opts.all || (worth && !container)) {
         if (elements.length < max) elements.push({ id, type, label, name, value, x, y, w, h, enabled, visible, hittable });

@@ -43,7 +43,7 @@ restarting (attempt N)", "state": "restarting"}`; after the restarts gave up, 50
 | POST | `/phones/:udid/touch` | `{phase, x, y, t, seq, id, unit?}` | `{ok:true, via, ms, ack: seq, id, phase, ...}`; same as a live `touch` message (fallback when the WebSocket can't open) |
 | POST | `/phones/:udid/type` | `{text, enter?, clear?}` (`enter: true` presses Return after it; `clear: true` empties the focused field in one go first, and `text` may then be `""`; see [Typing](#typing)) | the report plus `check` (the field read back), `value` (not for a secure field), and with `clear` `cleared`, `clear_method` |
 | POST | `/phones/:udid/clear` | `{}` | empties the focused field in one go: the same as `type` with `{text: "", clear: true}` |
-| POST | `/phones/:udid/key` | `{key}`: `home`, `lock`, `volumeUp`, `volumeDown`, `enter`, `delete` | the report (`lock` locks the phone: the next action wakes it first) |
+| POST | `/phones/:udid/key` | `{key}`: `home`, `lock`, `volumeUp`, `volumeDown`, `enter`, `delete` | the report (`lock` locks the phone: the next action wakes it first; `volumeUp` is refused with 403 while `PHONE_SILENT` is on) |
 | POST | `/phones/:udid/home` | `{}` | the report |
 | POST | `/phones/:udid/launch` | `{bundleId}` or `{name}` (as `GET .../apps` lists it: `"Settings"`, `"TikTok"`) | the report; 404 with nearby names when no app has that name |
 | GET | `/phones/:udid/ui` | `?all=1` (every node, hidden ones and containers too), `?max=` (elements, default 400), `?fresh=1` (skip the 300 ms cache), `?settle=1` (wait for the picture to stop changing first) | the screen as an agent reads it, see [AI control](#ai-control-read-the-screen-act-verify) |
@@ -672,6 +672,13 @@ The owner hears each phone through the live view, and the phone itself stays qui
   raised phone before its first press, so after a crash or a restart the server puts it back to 0 at start (retried
   while WDA isn't up). `AUDIO_PHONE_VOLUME=0` never touches the volume. Do Not Disturb doesn't mute media sound; the
   Ring/Silent switch (or a silent mode) mutes some apps' sound (alerts, games that use the ambient category), not media.
+- **Silent phones (2026-11-18, `PHONE_SILENT`, on by default)**: the phones never make a sound (they sit where people
+  live). The raise above is **off** while silent (whatever `AUDIO_PHONE_VOLUME` says; its default is now 0), the
+  `volumeUp` key is refused (403), and each phone's volume is pressed all the way down (17 presses of WDA's volume-down,
+  presses that never restart WDA) every time its WebDriverAgent comes up (a start, a restart, a rebuild) and after a
+  wake (at most every 10 minutes). The sound still reaches the live view as the capture gives it. What the server
+  can't reach (keyboard clicks, the lock sound, haptics, the Ring/Silent switch) is set on the phones once, in Settings:
+  see "Phone settings for silence" below.
 - **Numbers**: `GET /phones` -> `stats.audio` `{codec, reason, level_db, peak_db, frames, listeners, volume_raised}`
   (`level_db` / `peak_db` every 2 s from the helper: a phone playing sound with `peak_db` near -120 means the capture
   carries silence, e.g. a phone volume that does scale it), and `stats.sessions[].audio` `{on, reason, sent}`.
@@ -958,7 +965,8 @@ and comes back by itself.
 Input: `HID_INPUT` (`auto` = iOS 27+ phones, `on` = try every phone, `off`), `HID_PYTHON` (the Python with pymobiledevice3;
 default `~/.phonefarm-hid/bin/python` if it exists, else `python3`), `HID_IDLE_SECONDS` (120), `HID_TUNNEL` (`auto`,
 `userspace`, `native`, `tunneld`), `WDA_FAST` (`0` = never try the fast route), `INPUT_LOG` (`0` = no per-action lines), `HID_LANDSCAPE` (`on` default, `swap`, `off`), `WDA_FAST_LANDSCAPE` (`1` = the fast route in landscape too), `CAPTURE_ROTATE` (`off` default; `cw`/`ccw` turn a sideways picture upright; `90`/`180`/`270` always turn it);
-Sound: `AUDIO` (true), `AUDIO_PHONE_VOLUME` (50 %; 0 = never touch the phone's volume), `AUDIO_SYNC` (`0` = the sound in a
+Sound: `AUDIO` (true), `PHONE_SILENT` (true: never raised, volume-up refused, driven to 0 when WDA comes up and after a
+wake), `AUDIO_PHONE_VOLUME` (0 %; only with `PHONE_SILENT=false`), `AUDIO_SYNC` (`0` = the sound in a
 stream of its own, no lip sync).
 `WDA_PATCH=0` makes `scripts/build-wda.sh` build WDA unpatched. WDA re-sign: `WDA_TEAM_ID` (the Apple Team ID),
 `WDA_RESIGN` (true), `WDA_RESIGN_HOUR` (3: the quiet window is 03:00-06:00 local). Our own WebDriverAgent build:
@@ -980,3 +988,18 @@ playout-delay 0/0 again.
 - Rotation, landscape touch and the UI tree were written against WDA's documented behaviour and a mock phone, without a Mac: [docs/MAC_STEPS_2026-11-15b.md](docs/MAC_STEPS_2026-11-15b.md) is the on-Mac check, with the knobs to flip if a landscape tap lands mirrored or a picture stays sideways.
 - `/apps` needs `ideviceinstaller` (`brew install ideviceinstaller`); without it only well-known apps are listed, unconfirmed.
 - `/info`'s temperature needs `idevicediagnostics` (part of libimobiledevice); `uptimeSec` / `bootedAt` are `null` on stock WDA (an iPhone doesn't say its boot time to lockdown or WDA). The detail card, the warm capture and the reliability fixes of 2026-11-16 were written against the mock and fake WDA / HID sidecars: [docs/MAC_STEPS_2026-11-15b.md](docs/MAC_STEPS_2026-11-15b.md) steps 9-12 are their on-Mac check.
+
+## Phone settings for silence (set once on each phone, 2026-11-18)
+
+The server keeps the media volume at 0, but these sounds and vibrations are the phone's own and only Settings stops them:
+
+1. **Ring/Silent switch** (iPhone 13 / 14 have the side switch): to **Silent** (orange showing). Mutes ringer, alerts,
+   lock sound and keyboard clicks.
+2. **Settings > Sounds & Haptics**: Ringtone and Alert Volume slider all the way left; **Change with Buttons** off;
+   **Keyboard Feedback**: Sound off, Haptic off; **Lock Sound** off; **System Haptics** off; **Haptics**: **Never Play**.
+3. **Settings > Accessibility > Touch > Vibration**: off (no vibration of any kind, alerts and emergency included).
+4. **Settings > Focus > Do Not Disturb**: on (always), so no notification sound or buzz gets through.
+
+Screen and wake: with no passcode, the server wakes a dark phone itself (Home, Home) before a live view or an action;
+a live view that gets no picture wakes it again after 2.5 s and 6.5 s and says why when it can't
+(`rtc-error` "no picture: the phone's screen is off and could not be woken (...)").

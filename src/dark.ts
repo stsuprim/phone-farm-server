@@ -122,6 +122,11 @@ export interface WakeOps {
   home(): Promise<unknown>;
   sleep?(ms: number): Promise<void>;
   log?(m: string): void;
+  /**
+   * 2026-11-18: the live view's capture gave no picture (a screen that's on always gives one): a screen that can't
+   * be told (no screenshot came) counts as dark, so it gets Home, a moment, Home, rather than being left off.
+   */
+  force?: boolean;
 }
 
 /**
@@ -142,8 +147,14 @@ export async function wakeScreen(ops: WakeOps): Promise<void> {
     }
   }
   for (let n = 0; n < 2; n++) {
-    if ((await ops.dark()) !== true) return;
-    ops.log?.(`the screen is dark${locked === false ? ' (the phone says it is not locked)' : ''}: pressing Home`);
+    const dark = await ops.dark();
+    if (dark === false) return;
+    if (dark === null && !(ops.force && n === 0)) return;
+    ops.log?.(
+      dark === null
+        ? 'the live view has no picture and the screen could not be looked at: pressing Home'
+        : `the screen is dark${locked === false ? ' (the phone says it is not locked)' : ''}: pressing Home`,
+    );
     await ops.home().catch(() => {});
     await sleep(WAKE_PRESS_GAP_MS);
     await ops.home().catch(() => {});

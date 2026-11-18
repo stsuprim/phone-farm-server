@@ -513,6 +513,18 @@ export class Agent {
       await sleep(Math.min(300, Math.max(0, until - Date.now())));
     }
     const i = q.index ?? 0;
+    if (!found.length && !paused) {
+      // 2026-11-18: the list holds only what's on the screen; one that's there but off it (its middle beyond the
+      // edge) is said so, rather than "no element"
+      const off = await this.ui(udid, { all: true }).then((all) => findElements(all.elements, q)[0], () => undefined);
+      if (off) {
+        const cx = off.x + off.w / 2;
+        const cy = off.y + off.h / 2;
+        if (!(off.w > 0) || !(off.h > 0) || cx < 0 || cx > 1 || cy < 0 || cy > 1) {
+          throw new HttpError(409, `${off.type} ${JSON.stringify(off.label ?? off.name ?? off.id)} is off the screen (its middle is at ${cx.toFixed(2)}, ${cy.toFixed(2)}): scroll it into view first`);
+        }
+      }
+    }
     if (!found.length) {
       const says = snap.text.replace(/\n/g, ' | ').slice(0, 240);
       // the owner's touches moved the screen away from what Lotus read: said so, for a fresh read and a new plan

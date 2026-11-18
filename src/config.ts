@@ -21,10 +21,16 @@ export interface Config {
   /** The phone's sound in the live view (AUDIO, on by default; src/audio.ts). */
   audio?: boolean;
   /**
-   * The phone's media volume while its sound is routed to the Mac, percent (AUDIO_PHONE_VOLUME, default 50; 0 = the
-   * phone's volume is never touched). Back to 0 when nobody listens.
+   * The phone's media volume while its sound is routed to the Mac, percent (AUDIO_PHONE_VOLUME, default 0 since
+   * 2026-11-18, and never raised while PHONE_SILENT is on). Back to 0 when nobody listens.
    */
   audioPhoneVolume?: number;
+  /**
+   * 2026-11-18: the phones never make a sound (PHONE_SILENT, on by default): their volume is never raised (whatever
+   * AUDIO_PHONE_VOLUME says), the volume-up key is refused, and their volume is driven to 0 whenever their
+   * WebDriverAgent comes up and after a wake (src/audio.ts VolumeGuard.silence).
+   */
+  phoneSilent?: boolean;
   /** CoreDevice HID live touch (docs/BEST_METHOD.md): auto = on iOS 27+ phones, on = try on every phone, off. */
   hidInput: 'auto' | 'on' | 'off';
   /** The Python that has pymobiledevice3 (native/hid/hid_input.py runs with it). */
@@ -109,7 +115,8 @@ export function loadConfig(envFile = '.env'): Config {
     h264: bool(e.H264, true),
     h264BitrateMbps: Math.min(50, Math.max(1, num(e.H264_BITRATE_MBPS, 8))),
     audio: bool(e.AUDIO, true),
-    audioPhoneVolume: Math.min(100, Math.max(0, num(e.AUDIO_PHONE_VOLUME, 50))),
+    audioPhoneVolume: Math.min(100, Math.max(0, num(e.AUDIO_PHONE_VOLUME, 0))),
+    phoneSilent: bool(e.PHONE_SILENT, true),
     hidInput: /^(on|off)$/i.test(e.HID_INPUT ?? '') ? (e.HID_INPUT!.toLowerCase() as 'on' | 'off') : 'auto',
     hidPython: expand(e.HID_PYTHON || 'python3'),
     hidIdleSeconds: Math.max(10, num(e.HID_IDLE_SECONDS, 120)),

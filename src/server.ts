@@ -12,7 +12,7 @@ import { appName, InfoCache, WdaSigning } from './info.js';
 import { THUMB_DEFAULT_FPS, THUMB_MAX_FPS, THUMB_MIN_FPS } from './lanes.js';
 import { frameAgrees, Size } from './orient.js';
 import type { WdaResigner, WdaSignStatus } from './resign.js';
-import { isRemote, pathKind, rtcSignaling } from './rtc.js';
+import { isRemote, NO_PICTURE_WAKE_MS, pathKind, rtcSignaling } from './rtc.js';
 import { SettingsStore } from './settings.js';
 import { Backend, H264Want, HttpError, PhoneInfo, Profile, QualityTier, SessionStats, StreamSettings, WarmState } from './types.js';
 import type { Updater } from './updater.js';
@@ -839,7 +839,10 @@ export function createServer(backend: Backend, token: string, updater?: Updater,
       try {
         // warm: its capture already has a picture (it ran for another viewer, or was kept or started ahead)
         const warm = src.ready;
-        const info = await src.open();
+        // 2026-11-18: a capture that gives no picture in a moment means the phone's screen is off: it's woken
+        const wakeT = warm ? undefined : setTimeout(() => void idle.wakeForPicture(udid, true), NO_PICTURE_WAKE_MS[0]);
+        wakeT?.unref?.();
+        const info = await src.open().finally(() => clearTimeout(wakeT));
         if (ws.readyState !== WebSocket.OPEN) return;
         const h = src;
         // Congestion control: a ping after the frames measures the queue in front of this viewer; frames are
@@ -942,6 +945,8 @@ export function createServer(backend: Backend, token: string, updater?: Updater,
       offer: () => {
         if (idle.supported) void idle.wake(udid, true).catch(() => {});
       },
+      // 2026-11-18: the capture gives no picture (the screen went or stayed off): woken now, and why not if it can't be
+      noPicture: (force) => idle.wakeForPicture(udid, force),
     });
     // an open live view: keep the phone's live touch channel (HID session) open so the first tap doesn't pay for it
     const releaseInput = backend.warmInput?.(udid);

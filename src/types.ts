@@ -289,7 +289,9 @@ export interface Backend {
   /** Lock the phone (screen off): WDA /wda/lock. */
   lock?(udid: string): Promise<void>;
   /** Wake and unlock the phone (past the lock screen when it has no passcode): WDA /wda/unlock. */
-  unlock?(udid: string): Promise<void>;
+  unlock?(udid: string, opts?: { force?: boolean }): Promise<void>;
+  /** 2026-11-18: keep the phone silent after a wake (its volume driven down, at most every few minutes). */
+  silence?(udid: string, why: string): void;
   /**
    * Whether the phone is locked or its screen is dark now (WDA /wda/locked, and a look at the screen: a phone without
    * a passcode never says "locked"); `quick`: no look at the screen (true, or null). null when it can't tell.

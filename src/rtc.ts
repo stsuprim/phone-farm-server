@@ -271,7 +271,18 @@ export interface RtcHooks {
   view?: () => Record<string, unknown>;
   /** A viewer asks for the picture (an offer came): the server sees that the phone's screen is on. */
   offer?: () => void;
+  /**
+   * 2026-11-18: the capture gave no picture for a while (an offer that brought none, or a picture that stopped while
+   * the viewer asks for keyframes): the phone's screen is likely off. The server wakes it and resolves null when it's
+   * awake, else why not. `force` (an offer that never had a picture): a screen that can't be looked at counts as dark.
+   */
+  noPicture?: (force: boolean) => Promise<string | null>;
 }
+
+/** An offer whose capture has given no picture this long has the phone woken (and again at the second mark). */
+export const NO_PICTURE_WAKE_MS = [2500, 6500];
+/** A picture that gave no frame this long while the viewer asks for keyframes has the phone woken (at most this often). */
+export const STALL_WAKE_MS = 4000;
 
 /** One WebRTC session for one control WebSocket: a sendonly H.264 track plus the "input"/"input-r" channels. */
 export class RtcSession {
@@ -321,6 +332,12 @@ export class RtcSession {
   private aReason: string | null = null;
   private aSent = 0;
   private tsBaseA = (Math.random() * 0xffffffff) >>> 0;
+  // 2026-11-18: no picture -> wake the phone (NO_PICTURE_WAKE_MS), and why it couldn't be woken (the failure's reason)
+  private wakeTimers: NodeJS.Timeout[] = [];
+  private waking?: Promise<string | null>;
+  private wakeWhy: string | null = null;
+  private wokeAt = 0;
+  private lastFrameAt = 0;
 
   constructor(
     private backend: Backend,
@@ -379,6 +396,16 @@ export class RtcSession {
     this.warm = src.ready;
     const opening = src.open();
     opening.catch(() => {}); // heard below; this only keeps a failure from going unheard if the setup throws first
+    // 2026-11-18: an offer that brings no picture: the phone's screen is likely off, so it's woken (twice at most)
+    if (!src.ready && this.hooks.noPicture) {
+      for (const ms of NO_PICTURE_WAKE_MS) {
+        const t = setTimeout(() => {
+          if (!this.closed && !this.ready) void this.wakeForPicture('the capture has given no picture yet', true);
+        }, ms);
+        t.unref?.();
+        this.wakeTimers.push(t);
+      }
+    }
 
     const pc = new ndc.PeerConnection(`phone-${this.udid.slice(-8)}`, { iceServers: [] }); // host candidates only
     this.pc = pc;
@@ -468,8 +495,51 @@ export class RtcSession {
         });
         this.attach();
       },
-      (err) => this.fail(errText(err)),
+      (err) => void this.noPictureFail(errText(err)),
     );
+  }
+
+  /** The phone woken because the capture gives no picture (one wake at a time); its result kept for the failure's reason. */
+  private wakeForPicture(why: string, force: boolean): Promise<string | null> {
+    if (this.waking) return this.waking;
+    if (!this.hooks.noPicture) return Promise.resolve(null);
+    console.log(`[rtc] ${this.udid.slice(-8)}: ${why}: waking the phone`);
+    this.wokeAt = Date.now();
+    const p = this.hooks
+      .noPicture(force)
+      .catch((err) => errText(err))
+      .then((r) => {
+        this.wakeWhy = r;
+        if (r) console.log(`[rtc] ${this.udid.slice(-8)}: the phone could not be woken: ${r}`);
+        return r;
+      })
+      .finally(() => {
+        if (this.waking === p) this.waking = undefined;
+      });
+    this.waking = p;
+    return p;
+  }
+
+  /**
+   * The capture gave no picture in time: the session ends with a reason the viewer can show. A wake under way is
+   * waited for first (a few seconds at most), so the reason says whether the phone could be woken.
+   */
+  private async noPictureFail(err: string): Promise<void> {
+    if (this.closed) return;
+    if (this.waking) await Promise.race([this.waking, new Promise((r) => setTimeout(r, 4000).unref?.())]);
+    if (this.closed) return;
+    const why = this.wakeWhy;
+    if (why) return this.fail(`no picture: the phone's screen is off and could not be woken (${why})`);
+    if (this.wokeAt && /no H\.264 keyframe/i.test(err)) return this.fail(`no picture yet: the phone's screen was off and is being woken; trying again (${err})`);
+    this.fail(err);
+  }
+
+  /** The viewer's picture stalled (it asks for a keyframe): no frame for STALL_WAKE_MS means the screen likely went off. */
+  stalled(): void {
+    if (this.closed || !this.ready || !this.hooks.noPicture) return;
+    const now = Date.now();
+    if (!this.lastFrameAt || now - this.lastFrameAt < STALL_WAKE_MS || now - this.wokeAt < 15_000) return;
+    void this.wakeForPicture(`no frame for ${Math.round((now - this.lastFrameAt) / 1000)} s`, false);
   }
 
   // ---- the phone's sound ----
@@ -658,6 +728,7 @@ export class RtcSession {
     const data = r.kind === KIND.KEY ? keyUnit(this.config, r.payload) : r.payload;
     // the RTP clock follows the capture time; a cached (old) keyframe is stamped as just captured (RtpClock)
     const now = Date.now();
+    this.lastFrameAt = now;
     const { ts, stale } = this.clock.stamp(r.time, now);
     this.rtp.timestamp = (this.tsBase + ts) >>> 0;
     this.pace?.add(data.length, now);
@@ -732,6 +803,8 @@ export class RtcSession {
   close(_why = 'closed'): void {
     if (this.closed) return;
     this.closed = true;
+    for (const t of this.wakeTimers) clearTimeout(t);
+    this.wakeTimers = [];
     this.uninfo?.();
     if (this.ccTimer) clearInterval(this.ccTimer);
     if (this.viewer) this.src?.remove(this.viewer);
@@ -783,8 +856,10 @@ export function rtcSignaling(backend: Backend, control: Control, udid: string, s
           session?.addIce(msg.candidate, msg.mid);
           return true;
         case 'rtc-key':
-          // the client's picture stalled (its watchdog): a fresh keyframe, as a PLI would ask
+          // the client's picture stalled (its watchdog): a fresh keyframe, as a PLI would ask; and when the capture has
+          // given nothing for a while, the phone is woken (its screen went off: 2026-11-18)
           session?.key();
+          session?.stalled();
           return true;
         case 'rtc-close':
           session?.close('closed by the client');

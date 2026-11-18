@@ -124,6 +124,7 @@ export class IdleLock {
       e.locked = true;
       e.screenOn = false;
       await this.backend.unlock!(udid);
+      this.backend.silence?.(udid, 'woken before an input');
       const still = await this.backend.isLocked!(udid).catch(() => null);
       e.screenOn = true;
       e.locked = still === true;
@@ -173,8 +174,12 @@ export class IdleLock {
     };
   }
 
-  /** Wake and unlock now. `check`: ask first and do nothing if it's already unlocked. */
-  wake(udid: string, check = false): Promise<PowerState> {
+  /**
+   * Wake and unlock now. `check`: ask first and do nothing if it's already unlocked. `force` (2026-11-18: the live
+   * view's capture gives no picture): a screen that can't be looked at counts as dark (src/dark.ts wakeScreen).
+   * After a wake the phone is silenced again (src/audio.ts, at most every few minutes).
+   */
+  wake(udid: string, check = false, force = false): Promise<PowerState> {
     const e = this.entry(udid);
     e.lastActive = this.now();
     e.known = true;
@@ -188,7 +193,8 @@ export class IdleLock {
           return;
         }
       }
-      await this.backend.unlock(udid);
+      await (force ? this.backend.unlock(udid, { force: true }) : this.backend.unlock(udid));
+      this.backend.silence?.(udid, 'woken');
       const still = this.backend.isLocked ? await this.backend.isLocked(udid).catch(() => null) : false;
       e.asked = false;
       e.screenOn = true;
@@ -196,6 +202,22 @@ export class IdleLock {
       e.error = still ? 'still locked after wake (a passcode is set: enter it on the phone once, or remove it)' : null;
       if (!still) this.log(`${udid.slice(-8)} woke`);
     }).then(() => this.state(udid));
+  }
+
+  /**
+   * 2026-11-18 (a live view stuck on "connecting" while the phone's screen was off): the capture gave no picture, so
+   * the phone is woken now, whatever was thought of it (`force`: a screen that can't be looked at counts as dark).
+   * Resolves null when it's awake, else why not, in a line for the viewer.
+   */
+  async wakeForPicture(udid: string, force = true): Promise<string | null> {
+    if (!this.supported) return 'this server cannot wake phones';
+    try {
+      const st = await this.wake(udid, false, force);
+      if (st.locked) return st.error ?? 'the phone stayed locked (a passcode is set: enter it on the phone once, or remove it)';
+      return null;
+    } catch (err) {
+      return (err as Error)?.message?.slice(0, 200) || 'the wake failed';
+    }
   }
 
   /** Lock (screen off) now. */

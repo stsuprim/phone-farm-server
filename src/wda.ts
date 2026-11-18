@@ -5,7 +5,8 @@ import path from 'node:path';
 import { Config } from './config.js';
 import { ClearStep, FieldState, fieldFrom, nextClearStep, scrubTyped } from './field.js';
 import { FIELD_FORK_VERSION, FORK_ROUTES, ForkLaunch, launchPlan, LIVE_GAPPED, LIVE_SEGMENTED, TOKEN_ENV, TOKEN_HEADER, usableLiveMode, WdaFlavor } from './fork.js';
-import { isLandscape, Orientation, orientationFromWda, portraitSize, uprightSize, uprightToPanel } from './orient.js';
+import { isLandscape, Orientation, orientationFromWda, uprightSize, uprightToPanel } from './orient.js';
+import { pickScreen } from './screens.js';
 import { Segmenter } from './segments.js';
 import { ButtonName, ControlState, HttpError, PathPoint, ScreenInfo, StreamSettings } from './types.js';
 
@@ -46,6 +47,11 @@ interface Entry {
   lastOk: number;
   /** The screen in points as held in portrait (short side across), with the pixel scale. */
   screen?: ScreenInfo;
+  /** What the log last said of the screen (said again only when it changes), and reads tried again since the last good one. */
+  screenSaid?: string;
+  screenTries?: number;
+  /** A session has been made on this runner (the first one since it started tells onSession it's fresh). */
+  runnerSession?: boolean;
   /** How the phone is turned (WDA's /orientation: the foreground app's), when it was last asked, and an ask in flight. */
   orientation: Orientation | null;
   orientAt: number;
@@ -395,6 +401,13 @@ export class WdaManager {
   onOrientation?: (udid: string) => void;
   /** Whether someone is watching the phone now: its health check probes the session, not just /status. */
   watched?: (udid: string) => boolean;
+  /** The phone's model identifier (ideviceinfo's ProductType: "iPhone14,8"), for its known screen size. */
+  modelOf?: (udid: string) => string | null;
+  /**
+   * Called when a phone's WDA has a new session: `fresh` when it's the first since its runner (re)started (a start,
+   * a restart, a rebuild), else a session remade on the same runner. The phone is kept silent from here (src/real.ts).
+   */
+  onSession?: (udid: string, fresh: boolean) => void;
 
   constructor(
     private cfg: Config,
@@ -599,6 +612,27 @@ export class WdaManager {
     if (e.control !== 'ready' && Date.now() - e.unreadyAt < (this.timeouts.debounce ?? CONTROL_DEBOUNCE_MS)) return 'ready';
     return e.control;
   }
+  /**
+   * 2026-11-18 (a live view that stayed on "connecting" while a phone's screen was off): waits up to `ms` for the
+   * phone's WDA to take requests (up, a session made, no restart under way), so a wake isn't tried, and silently
+   * given up, on a control link that's still coming up. True once it can; false when it didn't in time or is down.
+   */
+  async whenReady(udid: string, ms: number): Promise<boolean> {
+    const until = Date.now() + Math.max(0, ms);
+    for (;;) {
+      const e = this.entries.get(udid);
+      if (!e || !e.wanted || e.downWhy) return false;
+      if (e.status === 'ready' && !e.restartP && e.sessionId) return true;
+      if (e.status === 'ready' && !e.restartP && !e.sessionId && !e.sessionP) {
+        // up without a session (one that failed to be made): one is made now
+        await this.session(e).catch(() => {});
+        if (e.sessionId) return true;
+      }
+      if (Date.now() >= until) return false;
+      await sleep(250);
+    }
+  }
+
   /** The screen in points, upright: as the phone is turned now (844 x 390 in landscape). */
   screen(udid: string): ScreenInfo | null {
     const e = this.entries.get(udid);
@@ -888,6 +922,8 @@ export class WdaManager {
   private launch(e: Entry): void {
     e.fast = 'unknown'; // a rebuilt WDA may have (or lack) the fast route
     e.fastFails = 0;
+    e.runnerSession = false; // the next session is this runner's first: the screen is read anew, the phone silenced
+    e.screenTries = 0;
     e.status = 'starting';
     e.control = 'recovering';
     e.sessionId = undefined;
@@ -1151,15 +1187,28 @@ export class WdaManager {
     e.sessionId = id;
     e.lastOk = Date.now();
     await Promise.all([this.readScreen(e, id), this.applySettings(e, id)]);
+    const fresh = !e.runnerSession;
+    e.runnerSession = true;
+    try {
+      this.onSession?.(e.udid, fresh);
+    } catch (err) {
+      this.log(e, `after the session: ${(err as Error).message}`);
+    }
     return id;
   }
 
   /**
-   * Screen size in points (window size), scale (/wda/screen) and orientation, read with each new session. WDA's
-   * window size is the foreground app's, so it's wide when the phone is in landscape at that moment: it's kept as
-   * held in portrait, and `screen()` turns it by the orientation, which is asked again as the phone turns
-   * (refreshOrientation). Before this the size was kept as it came, for the whole session: a phone that was (or
-   * went) landscape had a list size, a clamp and an HID check for the wrong shape.
+   * Screen size in points, scale and orientation, read with each new session (so after every start, restart and
+   * rebuild of the runner). WDA's window size is the foreground app's, so it's wide when the phone is in landscape at
+   * that moment: it's kept as held in portrait, and `screen()` turns it by the orientation, which is asked again as
+   * the phone turns (refreshOrientation).
+   *
+   * 2026-11-18 (taps in the wrong place on iPhone-1 after its runner was rebuilt): the size was the app in front's
+   * window alone, read once a session and never checked; after the install the self-test had WebDriverAgent's own
+   * (letterboxed) app in front, and every tap and element place was worked out on a far smaller screen. Now it's the
+   * screen's own size (/wda/screen `screenSize`), checked (src/screens.ts pickScreen: never zero, never pixels, never
+   * a letterboxed app's window), with the model's known size when WDA gives nothing usable; a read that failed is
+   * tried again shortly, and what it found and why goes in the log when it changes.
    */
   private async readScreen(e: Entry, sid: string): Promise<void> {
     const [size, scr, orient] = await Promise.allSettled([
@@ -1167,12 +1216,27 @@ export class WdaManager {
       this.raw(e, 'GET', '/wda/screen', undefined, 5000),
       this.readOrientation(e, sid),
     ]);
-    const w = size.status === 'fulfilled' ? Number(size.value?.value?.width) : NaN;
-    const h = size.status === 'fulfilled' ? Number(size.value?.value?.height) : NaN;
-    const s = scr.status === 'fulfilled' ? Number(scr.value?.value?.scale) : NaN;
+    const win = size.status === 'fulfilled' ? size.value?.value ?? null : null;
+    const w = Number(win?.width);
+    const h = Number(win?.height);
+    const sv = scr.status === 'fulfilled' ? scr.value?.value ?? null : null;
     const before = JSON.stringify([e.screen, e.orientation]);
-    if (w > 0 && h > 0) e.screen = { ...portraitSize({ width: w, height: h }), scale: s > 0 ? s : e.screen?.scale ?? null };
-    else if (s > 0 && e.screen) e.screen.scale = s;
+    const pick = pickScreen({ screen: sv?.screenSize ?? null, window: win, scale: sv?.scale, model: this.modelOf?.(e.udid) ?? null, previous: e.screen ?? null });
+    if (pick) {
+      e.screen = { width: pick.width, height: pick.height, scale: pick.scale };
+      const said = `${pick.width} x ${pick.height} pt @${pick.scale ?? '?'}x from ${pick.from === 'screen' ? 'the screen' : pick.from === 'window' ? "the app's window" : pick.from === 'model' ? "the model's known size" : 'before'}${pick.note ? ` (${pick.note})` : ''}`;
+      if (said !== e.screenSaid) this.log(e, `screen ${said}`);
+      e.screenSaid = said;
+    }
+    // the screen's own size didn't answer (WDA busy, a session that went at once): asked again shortly, a few times
+    const settled = pick?.from === 'screen' || (pick?.from === 'window' && scr.status === 'fulfilled');
+    if (!settled && (e.screenTries ?? 0) < 3 && e.sessionId === sid) {
+      e.screenTries = (e.screenTries ?? 0) + 1;
+      const t = setTimeout(() => {
+        if (e.sessionId === sid && e.status === 'ready') void this.readScreen(e, sid).catch(() => {});
+      }, 3000);
+      t.unref?.();
+    } else if (settled) e.screenTries = 0;
     // WDA without /orientation: the window's shape still says wide or tall
     const shape: Orientation | null = w > 0 && h > 0 ? (w > h ? (isLandscape(e.orientation) ? e.orientation : 'landscape-left') : isLandscape(e.orientation) || !e.orientation ? 'portrait' : e.orientation) : null;
     const o = (orient.status === 'fulfilled' ? orient.value : null) ?? shape;
@@ -1855,6 +1919,25 @@ export class WdaManager {
     } catch {
       return null;
     }
+  }
+
+  /**
+   * 2026-11-18: one press of a button that never heals or recovers WDA (the phone's silence: src/audio.ts), on the
+   * session when there is one, else session-less. Rejects like callSoft (a WDA that isn't up is tried again later).
+   */
+  async pressSoft(udid: string, name: ButtonName, timeout = 4000): Promise<void> {
+    const sid = this.entries.get(udid)?.sessionId;
+    if (sid) {
+      try {
+        await this.callSoft(udid, 'POST', `/session/${sid}/wda/pressButton`, { name }, timeout);
+        return;
+      } catch (err) {
+        if (!(err instanceof WdaError) || err.kind !== 'unknown') {
+          if (this.entries.get(udid)?.sessionId === sid) throw err;
+        }
+      }
+    }
+    await this.callSoft(udid, 'POST', '/wda/pressButton', { name }, timeout);
   }
 
   /** A hardware button (XCUIDevice's: volumeUp, volumeDown, home). */

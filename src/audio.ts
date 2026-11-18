@@ -28,6 +28,13 @@ import path from 'node:path';
  * until it's done), and at once if the capture dies. A small state file (data/audio-volume.json) says which phones
  * were raised, so a crash or a restart puts them back to 0 when the server starts. AUDIO_PHONE_VOLUME=0 turns the
  * raise off; AUDIO=false turns the sound off.
+ *
+ * 2026-11-18 (the owner: the phones must never make a sound or vibrate; Rinor lives with them): the phones are kept
+ * SILENT (PHONE_SILENT, on by default). Whether iOS really takes the sound off the speaker while it's captured wasn't
+ * sure, and raising the volume made the phone audible, so nothing raises it any more: the raise above is off while
+ * silent, the volume-up key is refused (src/real.ts), and `silence` drives each phone's volume all the way down with
+ * WDA's volume-down button every time its WebDriverAgent comes up (a start, a restart, a rebuild) and after a wake
+ * (at most every SILENCE_EVERY_MS). The sound still goes to the live view as the capture gives it.
  */
 
 export const AUDIO_KIND = { FRAME: 5, INFO: 6 } as const;
@@ -254,8 +261,15 @@ export interface VolumeOptions {
   gapMs?: number;
   /** A press that failed (WDA busy or down) is tried again after this long (ms). */
   retryMs?: number;
+  /** 2026-11-18: the phones stay silent: the volume is never raised (`raise` does nothing), only driven down. */
+  silent?: boolean;
+  /** `silence` without `force` presses at most this often per phone (ms; default SILENCE_EVERY_MS). */
+  silenceEveryMs?: number;
   log?: (m: string) => void;
 }
+
+/** A wake silences a phone again at most this often (its WDA coming up always does). */
+export const SILENCE_EVERY_MS = 10 * 60_000;
 
 /** iOS's volume has 16 steps; one button press is one step. */
 export const VOLUME_STEPS = 16;
@@ -273,6 +287,10 @@ export const pressesFor = (percent: number) => Math.max(0, Math.min(VOLUME_STEPS
  */
 export class VolumeGuard {
   private raised: Record<string, { presses: number; at: number }> = {};
+  /** When each phone was last silenced (src: silence), and the silences under way (not written to the file). */
+  private silencedAt = new Map<string, number>();
+  private silencing = new Set<string>();
+  private silenceFails = new Map<string, number>();
   private want = new Map<string, boolean>();
   private busy = new Map<string, Promise<void>>();
   private retry = new Map<string, NodeJS.Timeout>();
@@ -296,14 +314,21 @@ export class VolumeGuard {
   }
 
   get enabled(): boolean {
-    return pressesFor(this.o.percent) > 0;
+    return !this.o.silent && pressesFor(this.o.percent) > 0;
+  }
+
+  /** The phones the file holds as raised (a silence under way isn't written there). */
+  private fileRaised(): Record<string, { presses: number; at: number }> {
+    const out: Record<string, { presses: number; at: number }> = {};
+    for (const [u, v] of Object.entries(this.raised)) if (v.presses > 0) out[u] = v;
+    return out;
   }
   /** The phones the file says are raised now. */
   pending(): string[] {
-    return Object.keys(this.raised);
+    return Object.keys(this.fileRaised());
   }
   isRaised(udid: string): boolean {
-    return !!this.raised[udid];
+    return (this.raised[udid]?.presses ?? 0) > 0;
   }
 
   /** At start: every phone left raised (a crash, a restart) goes back to 0. */
@@ -318,6 +343,25 @@ export class VolumeGuard {
   raise(udid: string): Promise<void> {
     if (!this.enabled) return Promise.resolve();
     this.want.set(udid, true);
+    return this.kick(udid);
+  }
+
+  /**
+   * 2026-11-18: the phone's volume all the way down now (VOLUME_STEPS + 1 presses of volume-down: 0 whatever it
+   * was), whatever this guard thinks it is (someone may have pressed the phone's own buttons). `force` (its WDA just
+   * came up) presses even if it was done lately; otherwise not more often than SILENCE_EVERY_MS. A raise asked
+   * meanwhile is dropped. Resolves when done; a press that fails is tried again later, like a lower.
+   */
+  silence(udid: string, force = false, why = ''): Promise<void> {
+    const now = Date.now();
+    const last = this.silencedAt.get(udid) ?? -Infinity;
+    if (!force && now - last < (this.o.silenceEveryMs ?? SILENCE_EVERY_MS)) return Promise.resolve();
+    this.silencedAt.set(udid, now);
+    this.want.set(udid, false);
+    // what the work loop reads: the file says raised, so it presses all the way down (and forgets it after)
+    if (!this.raised[udid]) this.raised[udid] = { presses: 0, at: now };
+    this.silencing.add(udid);
+    if (why) this.log(`${udid.slice(-8)}: keeping it silent (${why})`);
     return this.kick(udid);
   }
 
@@ -383,14 +427,31 @@ export class VolumeGuard {
           this.want.delete(udid);
           return;
         }
-        this.log(`${udid.slice(-8)}: volume back to 0`);
+        const quiet = this.silencing.has(udid);
+        if (!quiet) this.log(`${udid.slice(-8)}: volume back to 0`);
         await this.press(udid, 'down', VOLUME_STEPS + 1);
+        this.silencing.delete(udid);
+        this.silenceFails.delete(udid);
         delete this.raised[udid];
         this.save();
         if (this.want.get(udid) === true) continue; // wanted up again meanwhile (a new listener)
         this.want.delete(udid);
         return;
       } catch (err) {
+        if (this.silencing.has(udid) && !this.raised[udid]?.presses) {
+          // a silence (nothing this server raised): tried again a few times; its WDA's next start silences it anyway
+          const n = (this.silenceFails.get(udid) ?? 0) + 1;
+          this.silenceFails.set(udid, n);
+          if (n > 4) {
+            this.log(`${udid.slice(-8)}: the volume couldn't be pressed down (${(err as Error).message}); its WDA's next start tries again`);
+            this.silenceFails.delete(udid);
+            this.silencing.delete(udid);
+            this.silencedAt.delete(udid);
+            delete this.raised[udid];
+            this.want.delete(udid);
+            return;
+          }
+        }
         // WDA busy or down: tried again a little later, the file still says raised
         this.log(`${udid.slice(-8)}: a volume press failed (${(err as Error).message}); trying again`);
         const t = setTimeout(() => {
