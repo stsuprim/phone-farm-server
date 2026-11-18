@@ -19,6 +19,11 @@ export interface PhoneInfo {
    * back-off, then "control down" until a recover or WDA answering again); null otherwise.
    */
   controlDown?: string | null;
+  /**
+   * 2026-11-18: control is down because the phone's XCTest session looked jammed and a software reset of its device
+   * link didn't help either: only unplugging the phone's USB cable and plugging it back in fixes it.
+   */
+  needsReplug?: boolean;
   /** A WDA restart under way now: which attempt of how many, and since when (ms since the epoch); null otherwise. */
   restarting?: { attempt: number; of: number; since: number } | null;
   /** Screen scale (points -> pixels), from WDA; null until a WDA session has been made. */

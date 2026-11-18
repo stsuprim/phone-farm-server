@@ -190,6 +190,7 @@ export class RealBackend implements Backend {
         control: p.online ? this.wda.state(p.udid) : 'down',
         controlDown: p.online ? this.wda.controlDown(p.udid) : null,
         restarting: p.online ? this.wda.restarting(p.udid) : null,
+        needsReplug: p.online ? this.wda.needsReplug(p.udid) : false,
         scale: s?.scale ?? null,
         point_width: s?.width ?? null,
         point_height: s?.height ?? null,
@@ -980,7 +981,7 @@ export class RealBackend implements Backend {
     for (const h of this.hosts.values()) h.close();
     for (const h of this.hid.values()) h.close();
     this.volume.close();
-    this.wda.shutdown();
+    await this.wda.shutdown(); // runners' sessions deleted and their processes gone, not left on the phones
   }
 }
 

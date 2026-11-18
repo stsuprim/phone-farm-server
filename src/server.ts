@@ -579,7 +579,7 @@ export function createServer(backend: Backend, token: string, updater?: Updater,
         return send(res, 200, {
           ok: true, udid, ...(await info.get(p, flag(url.searchParams.get('fresh')))),
           // the control link as it is (2026-11-18): a restart under way, or down after the restarts gave up, and why
-          control: p.control, controlDown: p.controlDown ?? null, restarting: p.restarting ?? null,
+          control: p.control, controlDown: p.controlDown ?? null, restarting: p.restarting ?? null, needsReplug: p.needsReplug ?? false,
         });
       }
       if (action === 'warm') {

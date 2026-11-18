@@ -185,13 +185,19 @@ const fast503 = async (p: Promise<unknown>, re: RegExp, state: string): Promise<
     assert.equal(xcodes() - before, 4, 'four attempts');
     assert.ok(took >= 80 + 160 + 240, `backed off between them (${took} ms)`);
     assert.deepEqual([m.state('U1'), m.restarting('U1')], ['down', null]);
-    assert.match(m.controlDown('U1')!, /^WebDriverAgent did not come back after 4 restarts \(last: WDA did not answer \/status within 2 s\)$/);
-    const ms2 = await fast503(m.tap('U1', 10, 10), /^control down: WebDriverAgent did not come back after 4 restarts/, 'down');
+    // 2026-11-18: the runner didn't come up twice in a row (a jammed XCTest session): the device link was reset once,
+    // and when that didn't help either, the phone needs a replug (said so, never "recovering" for ever)
+    assert.match(m.controlDown('U1')!, /^needs replug: WebDriverAgent did not come back after 4 restarts and a reset of the device link \(last: WDA did not answer \/status within 2 s\); .*unplug its USB cable and plug it back in$/);
+    assert.equal(m.needsReplug('U1'), true);
+    assert.equal(m.linkHealth('U1')!.needsReplug, true);
+    assert.equal(logs.filter((l) => /^\[wda-restart\] U1 the runner did not come up 2 times in a row: the XCTest session looks jammed; resetting the device link$/.test(l)).length, 1, 'one reset, after attempt 2');
+    const ms2 = await fast503(m.tap('U1', 10, 10), /^control down: needs replug: WebDriverAgent did not come back after 4 restarts/, 'down');
+    await assert.rejects(m.tap('U1', 10, 10), (err: HttpError) => err.extra?.needsReplug === true);
     assert.ok(ms2 < 1000);
     assert.equal(await m.probe('U1', 'watch'), false);
     const waits = logs.filter((l) => /^\[wda-restart\] U1 waiting [\d.]+ s before attempt/.test(l)).slice(-3);
     assert.deepEqual(waits.map((l) => /waiting ([\d.]+) s before attempt (\d)/.exec(l)!.slice(1).join('@')), ['0.1@2', '0.2@3', '0.2@4']);
-    assert.ok(logs.some((l) => /^\[wda-restart\] U1 control down after 4 attempts in [\d.]+ s: .*stays down until a recover/.test(l)));
+    assert.ok(logs.some((l) => /^\[wda-restart\] U1 control down \(needs replug\) after 4 attempts in [\d.]+ s: .*stays down until a recover/.test(l)));
     await sleep(300);
     assert.equal(xcodes() - before, 4, 'no more restarts by itself');
     ok('a WDA that never comes back: 4 attempts backed off, then "control down" with the last error; calls get a 503 at once');
@@ -199,7 +205,7 @@ const fast503 = async (p: Promise<unknown>, re: RegExp, state: string): Promise<
     // 5. a recover while down starts the attempts afresh; WDA is back
     await w.open();
     assert.equal(await m.recoverNow('U1'), 'ready');
-    assert.deepEqual([m.state('U1'), m.controlDown('U1'), m.restarting('U1')], ['ready', null, null]);
+    assert.deepEqual([m.state('U1'), m.controlDown('U1'), m.restarting('U1'), m.needsReplug('U1')], ['ready', null, null, false]);
     assert.ok(logs.some((l) => /^\[wda-restart\] U1 a recover was asked \(control was down: .*\): the attempts start afresh$/.test(l)));
     await m.tap('U1', 10, 10);
 
@@ -220,6 +226,96 @@ const fast503 = async (p: Promise<unknown>, re: RegExp, state: string): Promise<
     console.log = origLog;
     delete process.env.WDA_FAST;
     m.shutdown();
+    w.close();
+    process.chdir(prevCwd);
+  }
+}
+
+// ---- 2026-11-18, leftovers that jammed XCTest: the old runner is torn down for good before a new one starts ----
+// (its WDA session deleted, its xcodebuild SIGTERMed and waited for, strays for the phone killed), never two runners
+// per phone, and restarts go one phone at a time.
+{
+  const prevCwd = process.cwd();
+  process.chdir(fs.mkdtempSync(path.join(os.tmpdir(), 'pf-reap-')));
+  const origLog = console.log;
+  const logs: string[] = [];
+  console.log = (...a: unknown[]) => void logs.push(a.join(' '));
+  const w = await fakeWda();
+  const cfg = { wdaBasePort: w.port, mjpegBasePort: w.port + 1000, wdaProject: '/x', wdaDerivedData: '/y' } as unknown as import('../src/config.js').Config;
+  type P = ChildProcess & EventEmitter & { cmd: string; udid: string; dead: boolean };
+  const procs: P[] = [];
+  const events: string[] = [];
+  let nextPid = 5000;
+  const runnersAlive = (udid: string) => procs.filter((p) => p.cmd === 'xcodebuild' && p.udid === udid && !p.dead).length;
+  const spawn2 = ((cmd: string, args: string[]) => {
+    const p = new EventEmitter() as P;
+    const udid = cmd === 'iproxy' ? args[1]! : /id=(\S+)/.exec(args.join(' '))![1]!;
+    if (cmd === 'xcodebuild') {
+      assert.equal(runnersAlive(udid), 0, `never two runners for ${udid}`);
+      events.push(`spawn ${udid}`);
+    }
+    Object.assign(p, {
+      cmd, udid, dead: false, pid: nextPid++, exitCode: null, signalCode: null, stdout: new PassThrough(), stderr: new PassThrough(),
+      kill: (sig: string) => {
+        if (p.dead) return false;
+        if (cmd === 'xcodebuild') events.push(`${sig} ${udid} (session deleted first: ${w.hits.some((h) => h.startsWith('DELETE /session/'))})`);
+        // xcodebuild takes a moment to end its test run; a forward ends at once
+        setTimeout(() => {
+          p.dead = true;
+          (p as { signalCode: string }).signalCode = sig;
+          p.emit('exit', null, sig);
+        }, cmd === 'xcodebuild' ? 150 : 0);
+        return true;
+      },
+    });
+    procs.push(p);
+    return p;
+  }) as unknown as typeof import('node:child_process').spawn;
+  const ran: string[] = [];
+  const sys = {
+    real: true,
+    run: async (cmd: string, args: string[]) => (ran.push(`${cmd} ${args.join(' ')}`), { ok: false, out: '' }),
+    descendants: async () => [],
+    signal: () => false,
+    alive: (pid: number) => procs.some((p) => p.pid === pid && !p.dead),
+    listeners: async () => [],
+  };
+  const m = new WdaManager(cfg, (u) => u, spawn2, {
+    input: 300, launch: 1000, probe: 150, restart: 600, status: 100, probes: 3, probeEvery: 150,
+    backoff: [80, 160, 240], attempts: 4, sessionWait: 500, recoverWait: 5000, killWait: 1000,
+  }, sys);
+  try {
+    m.start('U1');
+    assert.ok(await until(() => m.state('U1') === 'ready'), 'ready');
+    assert.ok(ran.includes('pkill -TERM -f xcodebuild test-without-building.*id=U1') && ran.includes('pkill -TERM -f iproxy -u U1'), 'strays from an earlier server ended at the first start');
+    assert.ok(!ran.some((r) => /build-for-testing/.test(r)), 'a build is never touched');
+    const sid = w.current;
+    events.length = 0;
+    m.restartRunner('U1');
+    assert.ok(await until(() => m.state('U1') === 'ready' && events.length >= 2, 5000), 'back after the restart');
+    assert.deepEqual(events, ['SIGTERM U1 (session deleted first: true)', 'spawn U1'], 'session deleted, old runner ended, then the new one');
+    assert.ok(w.hits.includes(`DELETE /session/${sid}`));
+    assert.ok(logs.some((l) => /^\[wda U1\] old runner stopped in [\d.]+ s$/.test(l)));
+    ok('a restart deletes the session, ends the old runner (waited for) and its strays, then starts the new one: never two');
+
+    // two phones restarted together: one at a time (the second waits for the first's runner to come up or give up)
+    m.start('U2'); // nothing answers on its port: it stays starting
+    await sleep(50);
+    events.length = 0;
+    m.restartRunner('U2');
+    m.restartRunner('U1');
+    await sleep(300);
+    assert.deepEqual(events.filter((x) => x.startsWith('spawn')), ['spawn U2'], 'U1 waits while U2 restarts');
+    assert.ok(logs.some((l) => /^\[wda-restart\] U1 waiting for U2's restart to finish first \(one phone at a time\)$/.test(l)));
+    assert.ok(await until(() => events.includes('spawn U1'), 5000), 'then U1');
+    assert.ok(await until(() => m.state('U1') === 'ready', 5000));
+    ok('restarts go one phone at a time');
+  } catch (err) {
+    origLog(logs.slice(-30).join('\n'));
+    throw err;
+  } finally {
+    console.log = origLog;
+    await m.shutdown(2000);
     w.close();
     process.chdir(prevCwd);
   }

@@ -1,4 +1,4 @@
-import { ChildProcess, spawn } from 'node:child_process';
+import { ChildProcess, execFile, spawn } from 'node:child_process';
 import fs from 'node:fs';
 import http from 'node:http';
 import path from 'node:path';
@@ -108,6 +108,26 @@ interface Entry {
   downWhy: string | null;
   /** Bumped by start() and stop(): a restart begun before stops at its next step. */
   epoch: number;
+  /**
+   * 2026-11-18, leftovers: the old runner's teardown under way (its session deleted, its xcodebuild and forwards
+   * killed and waited for, strays for this phone killed, its ports free). A launch waits for it: never two runners.
+   */
+  stopping?: Promise<void>;
+  /** Bumped by every launch and kill: a launch waiting for a teardown goes ahead only while it's still the newest. */
+  launchSeq: number;
+  /** The Mac ports this runner's forwards listen on (checked free before the next one starts). */
+  fwdPorts: number[];
+  /** Control is down because the XCTest session looked jammed and a reset of the device link didn't help: replug. */
+  needsReplug: boolean;
+}
+
+/**
+ * A restart attempt that failed because the runner didn't come up (its /status never answered, it made no session,
+ * or it ended before answering): a sign of a jammed XCTest session. Not one refused for a locked phone or signing.
+ */
+export function jammedStart(why: string): boolean {
+  if (/locked|passcode|profile|provision|signing|code ?sign|not trusted|untrusted|expired|developer mode|the phone was stopped/i.test(why)) return false;
+  return /did not answer|made no session|no session|ended before|exited|timed? ?out|no answer/i.test(why);
 }
 
 /** One self-heal: when (ms since the epoch) and why. */
@@ -148,6 +168,10 @@ export interface WdaTimeouts {
   recoverWait?: number;
   /** A call waits this long for a WDA that's starting before it answers 503 (ms; default START_WAIT_MS). */
   startWait?: number;
+  /** A killed runner gets this long to end after SIGTERM before SIGKILL (ms; default KILL_WAIT_MS). */
+  killWait?: number;
+  /** Restart attempts in a row whose runner didn't come up before the device link is reset (default JAM_AFTER). */
+  jamAfter?: number;
 }
 export const DEFAULT_TIMEOUTS: WdaTimeouts = { input: 8000, launch: 20000, probe: 3000, restart: 90000 };
 /**
@@ -178,8 +202,96 @@ export const RESTART_ATTEMPTS = 4;
 export const SESSION_WAIT_MS = 20_000;
 export const RECOVER_WAIT_MS = 20_000;
 export const START_WAIT_MS = 1000;
+/**
+ * 2026-11-18, "recovering" for good until a USB replug (iPhone-2, then iPhone-1, after hours of use): a restart sent
+ * SIGTERM to the old xcodebuild and its iproxy forwards and launched the new ones at once, without deleting the WDA
+ * session or waiting for the old runner to end. XCTest runners and forwards piled up on the phone until its XCTest
+ * session jammed, and then every further restart made it worse. Now the old runner is torn down first (its session
+ * deleted, its process tree SIGTERMed, waited for KILL_WAIT_MS, then SIGKILLed; strays for the phone killed; its
+ * ports free), restarts go one phone at a time, and after JAM_AFTER attempts in a row whose runner didn't come up
+ * the device link is reset once (src resetLink); when that doesn't help either, control is down with "needs replug".
+ */
+export const KILL_WAIT_MS = 10_000;
+export const JAM_AFTER = 2;
 /** A launched runner's WDA gets this long (by the clock) to answer /status before the runner is given up on. */
 const START_MS = 180_000;
+
+/**
+ * What the server does to the Mac's processes and the phone's device link around a runner (real mode only; tests
+ * that give their own spawn get none of it unless they hand in their own).
+ */
+export interface WdaSys {
+  /** True when these act on the real Mac (pids are real, commands run). */
+  real: boolean;
+  /** Runs a command, bounded by `timeoutMs`; never throws. */
+  run(cmd: string, args: string[], timeoutMs: number): Promise<{ ok: boolean; out: string }>;
+  /** The pids under `pid` (children, theirs, ...), deepest first. */
+  descendants(pid: number): Promise<number[]>;
+  /** Sends `sig` to a pid; false when it's gone. */
+  signal(pid: number, sig: NodeJS.Signals): boolean;
+  /** Whether a pid is still running. */
+  alive(pid: number): boolean;
+  /** The pids listening on a local TCP port, with their command lines. */
+  listeners(port: number): Promise<{ pid: number; command: string }[]>;
+}
+
+const runCmd = (cmd: string, args: string[], timeoutMs: number): Promise<{ ok: boolean; out: string }> =>
+  new Promise((resolve) => {
+    try {
+      execFile(cmd, args, { timeout: timeoutMs, maxBuffer: 8 * 1024 * 1024 }, (err, stdout) => resolve({ ok: !err, out: String(stdout ?? '') }));
+    } catch (err) {
+      resolve({ ok: false, out: (err as Error).message });
+    }
+  });
+
+export const REAL_SYS: WdaSys = {
+  real: true,
+  run: runCmd,
+  async descendants(pid) {
+    const out: number[] = [];
+    const walk = async (p: number, depth: number) => {
+      if (depth > 6) return;
+      const r = await runCmd('pgrep', ['-P', String(p)], 3000);
+      for (const c of r.out.split(/\s+/).map(Number).filter((n) => Number.isInteger(n) && n > 1)) {
+        await walk(c, depth + 1);
+        out.push(c);
+      }
+    };
+    await walk(pid, 0);
+    return out;
+  },
+  signal(pid, sig) {
+    try {
+      process.kill(pid, sig);
+      return true;
+    } catch {
+      return false;
+    }
+  },
+  alive(pid) {
+    try {
+      process.kill(pid, 0);
+      return true;
+    } catch (err) {
+      return (err as NodeJS.ErrnoException).code === 'EPERM';
+    }
+  },
+  async listeners(port) {
+    const r = await runCmd('lsof', ['-nP', `-iTCP:${port}`, '-sTCP:LISTEN', '-t'], 5000);
+    const pids = [...new Set(r.out.split(/\s+/).map(Number).filter((n) => Number.isInteger(n) && n > 1))];
+    return Promise.all(pids.map(async (pid) => ({ pid, command: (await runCmd('ps', ['-o', 'command=', '-p', String(pid)], 3000)).out.trim() })));
+  },
+};
+
+/** Tests with their own spawn: no real processes, nothing run, nothing killed but the fakes themselves. */
+export const NO_SYS: WdaSys = {
+  real: false,
+  run: async () => ({ ok: false, out: '' }),
+  descendants: async () => [],
+  signal: () => false,
+  alive: () => false,
+  listeners: async () => [],
+};
 
 /** `p`, or `onTimeout()`'s error after `ms` (`p` still runs; its end is ignored). */
 function within<T>(p: Promise<T>, ms: number, onTimeout: () => Error): Promise<T> {
@@ -275,6 +387,10 @@ export class WdaManager {
   private entries = new Map<string, Entry>();
   private ports: Record<string, number> = {};
   private health: NodeJS.Timeout;
+  private sys: WdaSys;
+  /** 2026-11-18: restarts go one phone at a time (never both phones' runners at once): the queue, and the phones in it. */
+  private restartLock: Promise<void> = Promise.resolve();
+  private lockQueue: string[] = [];
   /** Called when a phone's orientation (or its screen size, once known) changed. */
   onOrientation?: (udid: string) => void;
   /** Whether someone is watching the phone now: its health check probes the session, not just /status. */
@@ -285,7 +401,9 @@ export class WdaManager {
     private nameOf: (udid: string) => string = (u) => u,
     private spawnFn: typeof spawn = spawn, // tests: no real iproxy/xcodebuild
     private timeouts: WdaTimeouts = DEFAULT_TIMEOUTS,
+    sys?: WdaSys,
   ) {
+    this.sys = sys ?? (spawnFn === spawn ? REAL_SYS : NO_SYS);
     try {
       this.ports = JSON.parse(fs.readFileSync(PORTS_FILE, 'utf8'));
     } catch {
@@ -393,14 +511,14 @@ export class WdaManager {
    * How WDA's own link is doing, for the phone's stats (`stats.controlLink.wda`): the state as told (debounced) and
    * as it is, liveness checks missed in a row, recoveries and runner restarts so far, ms since WDA last answered.
    */
-  linkHealth(udid: string): { state: ControlState; raw: ControlState; misses: number; recoveries: number; runnerRestarts: number; answeredMsAgo: number | null; busy: number; restarting: { attempt: number; of: number; since: number } | null; controlDown: string | null } | null {
+  linkHealth(udid: string): { state: ControlState; raw: ControlState; misses: number; recoveries: number; runnerRestarts: number; answeredMsAgo: number | null; busy: number; restarting: { attempt: number; of: number; since: number } | null; controlDown: string | null; needsReplug: boolean } | null {
     const e = this.entries.get(udid);
     if (!e) return null;
     return {
       state: this.state(udid), raw: !e.wanted || e.downWhy ? 'down' : e.status === 'starting' ? 'recovering' : e.status !== 'ready' ? 'down' : e.control,
       misses: e.misses, recoveries: e.recoveries, runnerRestarts: e.runnerRestarts,
       answeredMsAgo: e.lastAnswer ? Date.now() - e.lastAnswer : null, busy: e.busy + e.inflight,
-      restarting: this.restarting(udid), controlDown: e.downWhy,
+      restarting: this.restarting(udid), controlDown: e.downWhy, needsReplug: !!e.downWhy && e.needsReplug,
     };
   }
 
@@ -413,6 +531,12 @@ export class WdaManager {
   /** Why the phone's control is down after its restarts gave up; null otherwise. */
   controlDown(udid: string): string | null {
     return this.entries.get(udid)?.downWhy ?? null;
+  }
+
+  /** The phone's control is down and only a USB replug will bring it back (a software reset didn't help). */
+  needsReplug(udid: string): boolean {
+    const e = this.entries.get(udid);
+    return !!e?.downWhy && e.needsReplug;
   }
 
   private get maxAttempts(): number {
@@ -435,7 +559,7 @@ export class WdaManager {
   }
 
   private controlDownError(e: Entry): HttpError {
-    return new HttpError(503, `control down: ${e.downWhy}`, { state: 'down' });
+    return new HttpError(503, `control down: ${e.downWhy}`, e.needsReplug ? { state: 'down', needsReplug: true } : { state: 'down' });
   }
 
   /** `control` changes here, so when it left "ready" is known (state() says a state only once it lasted). */
@@ -507,16 +631,21 @@ export class WdaManager {
       mjpeg: { ...DEFAULT_MJPEG }, agent: newAgent(), heals: 0, lastHeal: null, inflight: 0,
       busy: 0, lastAnswer: 0, misses: 0, missAt: 0, unreadyAt: 0, recoveries: 0, runnerRestarts: 0,
       flavor: 'stock', forkInfo: null, switching: false, launchError: null, liveFailed: null, forkFails: 0, readyAt: 0,
-      attempt: 0, restartSince: 0, downWhy: null, epoch: 0,
+      attempt: 0, restartSince: 0, downWhy: null, epoch: 0, launchSeq: 0, fwdPorts: [], needsReplug: false,
     };
+    const first = !this.entries.has(udid);
     e.epoch++;
     e.attempt = 0;
     e.downWhy = null;
+    e.needsReplug = false;
     e.restartP = undefined;
     // ours when it was installed on this phone and ran (src/fork.ts), else the stock one
     e.flavor = this.fork?.flavorAtStart(udid) ?? 'stock';
     e.wanted = true;
     this.entries.set(udid, e);
+    // the first start since the server started: a runner or forward left for this phone by the server before (an
+    // update's restart) is ended first, so the new one is the only one
+    if (first && this.sys.real) this.chainStop(e, () => this.reapStrays(e, [this.cfg.wdaBasePort + n, this.cfg.mjpegBasePort + n]));
     this.launch(e);
   }
 
@@ -530,20 +659,144 @@ export class WdaManager {
     e.restartP = undefined;
     e.attempt = 0;
     e.downWhy = null;
+    e.needsReplug = false;
     this.killProcs(e);
   }
 
+  /**
+   * Ends the phone's runner and forwards. The entry lets go of them at once (their exits are no failure to act on);
+   * the teardown runs in the background (reap) and the next launch waits for it, so a phone never has two runners.
+   */
   private killProcs(e: Entry): void {
     if (e.timer) clearTimeout(e.timer);
     e.timer = undefined;
-    for (const p of e.procs) p.kill('SIGTERM');
+    e.launchSeq++; // a launch waiting for an earlier teardown doesn't go ahead: whoever kills decides what's next
+    const old = { procs: e.procs, sessionId: e.sessionId, agent: e.agent, wdaPort: e.wdaPort, ports: e.fwdPorts, token: e.token };
     e.procs = [];
+    e.fwdPorts = [];
     e.runner = undefined; // killed on purpose: its exit isn't a failure to act on
     e.sessionId = undefined;
     e.sessionP = undefined;
     e.mjpegApplied = undefined;
-    e.agent.destroy(); // the forwards are gone: so are their connections
     e.agent = newAgent();
+    if (!this.sys.real && !old.procs.some((p) => p.pid)) {
+      // no real processes (tests): nothing to wait for
+      for (const p of old.procs) p.kill('SIGTERM');
+      old.agent.destroy();
+      return;
+    }
+    this.chainStop(e, () => this.reap(e, old));
+  }
+
+  /** Runs `step` after any teardown under way for the phone; the next launch waits for all of them. */
+  private chainStop(e: Entry, step: () => Promise<void>): void {
+    const prev = e.stopping ?? Promise.resolve();
+    const p: Promise<void> = prev
+      .then(step)
+      .catch((err) => this.log(e, `stopping the old runner: ${(err as Error)?.message ?? err}`))
+      .finally(() => {
+        if (e.stopping === p) e.stopping = undefined;
+      });
+    e.stopping = p;
+  }
+
+  /** A teardown under way ends (at most `ms`). */
+  private async settled(e: Entry, ms = 60_000): Promise<void> {
+    const until = Date.now() + ms;
+    while (e.stopping && Date.now() < until) await within(e.stopping, Math.max(1, until - Date.now()), () => new Error('wait')).catch(() => {});
+  }
+
+  /**
+   * The old runner torn down for good: its WDA session deleted (XCTest frees it), its xcodebuild and forwards with
+   * every process under them sent SIGTERM and waited for (`killWait`), SIGKILL for what's left; then any stray
+   * runner or forward for this phone, and the ports checked free. Every step bounded; nothing here throws.
+   */
+  private async reap(e: Entry, old: { procs: ChildProcess[]; sessionId?: string; agent: http.Agent; wdaPort: number; ports: number[]; token?: string }): Promise<void> {
+    const t0 = Date.now();
+    const live = (p: ChildProcess) => !!p.pid && p.exitCode === null && p.signalCode === null && this.sys.alive(p.pid);
+    try {
+      if (old.sessionId && old.procs.some(live)) await this.deleteSession(old.agent, old.wdaPort, old.sessionId, old.token);
+    } finally {
+      old.agent.destroy();
+    }
+    const procs = old.procs.filter(live);
+    if (procs.length) {
+      // the tree first: once xcodebuild is gone its children belong to launchd and can't be found by it any more
+      const tree = new Map<number, number[]>();
+      for (const p of procs) tree.set(p.pid!, await this.sys.descendants(p.pid!));
+      for (const p of procs) {
+        try {
+          p.kill('SIGTERM');
+        } catch {
+          /* gone */
+        }
+        for (const c of tree.get(p.pid!) ?? []) this.sys.signal(c, 'SIGTERM');
+      }
+      const all = () => [...tree].flatMap(([pid, kids]) => [pid, ...kids]).filter((pid) => this.sys.alive(pid));
+      const until = Date.now() + (this.timeouts.killWait ?? KILL_WAIT_MS);
+      while (all().length && Date.now() < until) await sleep(100);
+      const left = all();
+      if (left.length) {
+        this.log(e, `the old runner did not end within ${Math.round((this.timeouts.killWait ?? KILL_WAIT_MS) / 1000)} s of SIGTERM: SIGKILL to ${left.length} process(es)`);
+        for (const pid of left) this.sys.signal(pid, 'SIGKILL');
+        const until2 = Date.now() + 3000;
+        while (all().length && Date.now() < until2) await sleep(100);
+        if (all().length) this.log(e, `process(es) ${all().join(', ')} still there after SIGKILL`);
+      }
+    }
+    await this.reapStrays(e, old.ports);
+    this.log(e, `old runner stopped in ${((Date.now() - t0) / 1000).toFixed(1)} s`);
+  }
+
+  /** DELETE /session/:id through the old forward, at most 1.5 s, whatever it answers (best effort). */
+  private deleteSession(agent: http.Agent, port: number, sid: string, token?: string): Promise<void> {
+    return new Promise<void>((resolve) => {
+      const req = http.request(
+        { host: '127.0.0.1', port, method: 'DELETE', path: `/session/${encodeURIComponent(sid)}`, agent, timeout: 1500, headers: token ? { [TOKEN_HEADER]: token } : {} },
+        (res) => {
+          res.resume();
+          res.on('end', () => resolve());
+          res.on('error', () => resolve());
+        },
+      );
+      req.on('timeout', () => req.destroy());
+      req.on('error', () => resolve());
+      req.on('close', () => resolve());
+      req.end();
+    });
+  }
+
+  /**
+   * Any runner (xcodebuild test-without-building for this phone) or forward (iproxy -u <udid>) still there, ours or
+   * left by an earlier server: SIGTERM, a moment, SIGKILL. Then the ports: an iproxy still listening on one is ended,
+   * anything else is said in the log. Never touches a build (build-for-testing) or another phone.
+   */
+  private async reapStrays(e: Entry, ports: number[]): Promise<void> {
+    if (!this.sys.real) return;
+    const patterns = [`xcodebuild test-without-building.*id=${e.udid}`, `iproxy -u ${e.udid}`];
+    let found = false;
+    for (const pat of patterns) found = (await this.sys.run('pkill', ['-TERM', '-f', pat], 5000)).ok || found; // 0: some matched
+    if (found) {
+      this.log(e, 'stray runner or forward processes for this phone found: ended');
+      await sleep(2000);
+      for (const pat of patterns) await this.sys.run('pkill', ['-KILL', '-f', pat], 5000);
+    }
+    for (const port of ports) {
+      let ls = await this.sys.listeners(port);
+      const until = Date.now() + 3000;
+      while (ls.length && Date.now() < until) {
+        await sleep(250);
+        ls = await this.sys.listeners(port);
+      }
+      for (const l of ls) {
+        if (/\biproxy\b/.test(l.command)) {
+          this.log(e, `port ${port} still held by ${l.command.slice(0, 120)} (pid ${l.pid}): killed`);
+          this.sys.signal(l.pid, 'SIGKILL');
+        } else {
+          this.log(e, `port ${port} is held by another program (pid ${l.pid}: ${l.command.slice(0, 120)}); the new forward may fail`);
+        }
+      }
+    }
   }
 
   /** Relaunch the phone's runner now (after a re-sign: test-without-building installs the fresh build). */
@@ -556,7 +809,35 @@ export class WdaManager {
     e.restarts = 0;
     e.attempt = 0;
     e.downWhy = null;
-    this.restart(e);
+    e.needsReplug = false;
+    // one phone at a time: never both phones' runners restarting together
+    const epoch = e.epoch;
+    void this.exclusive(e, async () => {
+      if (!e.wanted || e.epoch !== epoch || e.restartP || e.switching) return;
+      this.restart(e);
+      await this.awaitUp(e, this.timeouts.restart, () => e.wanted && e.epoch === epoch);
+    }).catch(() => {});
+  }
+
+  /**
+   * Runs `fn` while no other phone's runner is being restarted (one restart at a time across the farm). Every holder
+   * is bounded (a teardown, the runner's /status and its session), so a wait ends.
+   */
+  private async exclusive<T>(e: Entry, fn: () => Promise<T>): Promise<T> {
+    const prev = this.restartLock;
+    let release!: () => void;
+    const mine = new Promise<void>((r) => (release = r));
+    this.restartLock = prev.then(() => mine);
+    const ahead = this.lockQueue.filter((u) => u !== e.udid);
+    if (ahead.length) this.restartLog(e, `waiting for ${ahead.map((u) => this.nameOf(u)).join(', ')}'s restart to finish first (one phone at a time)`);
+    this.lockQueue.push(e.udid);
+    try {
+      await prev;
+      return await fn();
+    } finally {
+      this.lockQueue.splice(this.lockQueue.indexOf(e.udid), 1);
+      release();
+    }
   }
 
   /** Kill and relaunch the WDA runner and its forwards right away. */
@@ -600,6 +881,10 @@ export class WdaManager {
     void this.beginRestart(e, why);
   }
 
+  /**
+   * Start the phone's runner: at once, or once the old one's teardown ended (it's "starting" meanwhile). Only the
+   * newest launch goes ahead, and only while nothing was killed since; never a second runner beside a live one.
+   */
   private launch(e: Entry): void {
     e.fast = 'unknown'; // a rebuilt WDA may have (or lack) the fast route
     e.fastFails = 0;
@@ -608,6 +893,22 @@ export class WdaManager {
     e.sessionId = undefined;
     e.sessionP = undefined;
     e.mjpegApplied = undefined;
+    const seq = ++e.launchSeq;
+    if (!e.stopping) return this.spawnRunner(e);
+    void (async () => {
+      while (e.stopping && e.launchSeq === seq) await e.stopping.catch(() => {});
+      if (!e.wanted || e.launchSeq !== seq) return;
+      if (e.runner || e.procs.length) return void this.log(e, 'a runner is already there: not starting a second one');
+      this.spawnRunner(e);
+    })();
+  }
+
+  private spawnRunner(e: Entry): void {
+    if (e.procs.length) {
+      // never two runners (launch() makes sure this doesn't happen): the old one is torn down first
+      this.killProcs(e);
+      return this.launch(e);
+    }
     const spawnLogged = (cmd: string, args: string[], env: NodeJS.ProcessEnv = {}) => {
       const p = this.spawnFn(cmd, args, { env: { ...process.env, ...env }, stdio: ['ignore', 'pipe', 'pipe'] });
       const errTail: string[] = [];
@@ -656,6 +957,7 @@ export class WdaManager {
     const xcode = spawnLogged('xcodebuild', plan.args, plan.env);
     e.runner = xcode;
     e.procs = fwdMjpeg ? [fwdWda, fwdMjpeg, xcode] : [fwdWda, xcode];
+    e.fwdPorts = plan.mjpeg ? [plan.wda.local, plan.mjpeg.local] : [plan.wda.local];
     this.log(e, plan.mjpeg ? `starting (wda :${plan.wda.local}, mjpeg :${plan.mjpeg.local})` : `starting our own build (wda :${plan.wda.local} on the Mac and the phone, token set, no MJPEG)`);
 
     // what xcodebuild said about a refused install or signing (a locked phone, an expired profile), for the switch's "why"
@@ -690,6 +992,7 @@ export class WdaManager {
             // WDA answering again by itself (after the restarts gave up): control is back, the count starts afresh
             if (e.downWhy) this.restartLog(e, `WDA answers again; control is back (it was down: ${e.downWhy})`);
             e.downWhy = null;
+            e.needsReplug = false;
             e.attempt = 0;
           }
           this.log(e, 'ready');
@@ -1146,14 +1449,32 @@ export class WdaManager {
     e.downWhy = null;
     e.restartSince = Date.now();
     reason = this.clean(e, reason).slice(0, 400);
+    const jamAfter = Math.max(1, this.timeouts.jamAfter ?? JAM_AFTER);
     const run = async (): Promise<void> => {
       let last = reason;
+      /** Attempts in a row whose runner didn't come up (not a locked phone or a signing problem), and the reset made. */
+      let stuck = 0;
+      let reset = false;
       while (live()) {
         if (e.attempt >= max) {
-          e.downWhy = `WebDriverAgent did not come back after ${max} restarts (last: ${last})`.slice(0, 400);
+          if (reset && stuck > 0) {
+            // XCTest stays jammed after a reset of the device link too: only a replug fixes that; said so, not "recovering"
+            e.needsReplug = true;
+            e.downWhy = `needs replug: WebDriverAgent did not come back after ${max} restarts and a reset of the device link (last: ${last}); the phone's XCTest session looks jammed: unplug its USB cable and plug it back in`.slice(0, 500);
+          } else {
+            e.downWhy = `WebDriverAgent did not come back after ${max} restarts (last: ${last})`.slice(0, 400);
+          }
           this.setControl(e, 'down');
-          this.restartLog(e, `control down after ${max} attempts in ${secs(e.restartSince)}: ${last}; it stays down until a recover, or WDA answering again`);
+          this.restartLog(e, `control down${e.needsReplug ? ' (needs replug)' : ''} after ${max} attempts in ${secs(e.restartSince)}: ${last}; it stays down until a recover, a replug, or WDA answering again`);
           return;
+        }
+        if (stuck >= jamAfter && !reset) {
+          // the runner didn't come up `jamAfter` times in a row: restarting it once more the same way only adds to the
+          // pile. The device link is reset first (one phone at a time), then the attempts go on
+          reset = true;
+          this.restartLog(e, `the runner did not come up ${stuck} times in a row: the XCTest session looks jammed; resetting the device link`);
+          await this.exclusive(e, () => this.resetLink(e, live));
+          if (!live()) return;
         }
         if (e.attempt > 0) {
           const wait = backoff[Math.min(e.attempt - 1, backoff.length - 1)] ?? 0;
@@ -1173,8 +1494,12 @@ export class WdaManager {
         const why = n === 1 ? reason : `attempt ${n - 1} failed: ${last}`;
         this.restartLog(e, `attempt ${n}/${max}: restarting WDA (${why})`);
         this.healed(e, `restarting WDA (attempt ${n}/${max}): ${why}`);
-        this.restart(e);
-        const r = await this.awaitUp(e, this.timeouts.restart, live);
+        // one phone at a time: the old runner torn down for good, then the new one up (or given up on), then the next phone
+        const r = await this.exclusive(e, async () => {
+          if (!live()) return { ok: false, why: 'the phone was stopped' };
+          this.restart(e);
+          return this.awaitUp(e, this.timeouts.restart, live);
+        });
         if (!live()) return;
         if (r.ok) {
           e.attempt = 0;
@@ -1183,6 +1508,7 @@ export class WdaManager {
           return;
         }
         last = r.why;
+        stuck = jammedStart(last) ? stuck + 1 : 0;
         this.restartLog(e, `attempt ${n}/${max} failed after ${secs(t)}: ${last}`);
       }
     };
@@ -1203,8 +1529,48 @@ export class WdaManager {
     return p;
   }
 
+  /**
+   * A software reset of the phone's device link, when its XCTest session looks jammed (the runner didn't come up
+   * several times in a row): the runner and its forwards torn down and every stray for the phone killed (reap), the
+   * WebDriverAgent runner app ended on the phone itself (devicectl: SIGTERM, then SIGKILL), the pairing re-validated
+   * over usbmuxd (idevicepair), and a moment for the phone to settle. usbmuxd itself isn't restarted (that needs root).
+   * Every step bounded and logged; nothing here throws.
+   */
+  private async resetLink(e: Entry, live: () => boolean): Promise<void> {
+    const t0 = Date.now();
+    this.killProcs(e);
+    await this.settled(e);
+    if (!live() || !this.sys.real) return void this.restartLog(e, `device link reset (runner and forwards ended) in ${((Date.now() - t0) / 1000).toFixed(1)} s`);
+    // the runner app on the phone (XCTest's side), found by its executable
+    const pids: number[] = [];
+    fs.mkdirSync('data', { recursive: true });
+    const file = path.resolve('data', `devicectl-processes-${e.udid.slice(-8)}.json`);
+    try {
+      const r = await this.sys.run('xcrun', ['devicectl', 'device', 'info', 'processes', '--device', e.udid, '--json-output', file], 30_000);
+      const list = JSON.parse(fs.readFileSync(file, 'utf8'))?.result?.runningProcesses;
+      for (const p of Array.isArray(list) ? list : []) {
+        if (/WebDriverAgentRunner/i.test(String(p?.executable ?? '')) && Number.isInteger(p?.processIdentifier)) pids.push(p.processIdentifier);
+      }
+      if (!r.ok) this.restartLog(e, "devicectl could not list the phone's processes");
+    } catch (err) {
+      this.restartLog(e, `devicectl's process list could not be read (${(err as Error).message.slice(0, 120)})`);
+    } finally {
+      fs.rmSync(file, { force: true });
+    }
+    for (const pid of pids) await this.sys.run('xcrun', ['devicectl', 'device', 'process', 'terminate', '--device', e.udid, '--pid', String(pid)], 30_000);
+    if (pids.length) {
+      await sleep(2000);
+      // SIGTERM can be ignored by a jammed runner: SIGKILL (an error when it's already gone is fine)
+      for (const pid of pids) await this.sys.run('xcrun', ['devicectl', 'device', 'process', 'signal', '--device', e.udid, '--pid', String(pid), '--signal', 'SIGKILL'], 30_000);
+    }
+    const pair = await this.sys.run('idevicepair', ['-u', e.udid, 'validate'], 20_000);
+    await sleep(3000);
+    this.restartLog(e, `device link reset in ${((Date.now() - t0) / 1000).toFixed(1)} s: runner and forwards ended, ${pids.length ? `the runner app on the phone ended (pid ${pids.join(', ')})` : 'no runner app found on the phone'}, pairing ${pair.ok ? 'valid' : 'NOT validated'}`);
+  }
+
   /** The runner just launched answers /status within `ms` and makes its session within `sessionWait`. */
   private async awaitUp(e: Entry, ms: number, live: () => boolean): Promise<{ ok: boolean; why: string }> {
+    await this.settled(e); // the old runner's teardown first: the new one's clock starts when it's launched
     const until = Date.now() + ms;
     while (live() && e.status === 'starting' && Date.now() < until) await sleep(100);
     if (!live()) return { ok: false, why: 'the phone was stopped' };
@@ -1292,6 +1658,7 @@ export class WdaManager {
       this.restartLog(e, `a recover was asked${e.downWhy ? ` (control was down: ${e.downWhy})` : ''}: the attempts start afresh`);
       const was = e.downWhy;
       e.downWhy = null;
+      e.needsReplug = false;
       e.attempt = 0;
       if (was && e.status !== 'ready' && !e.switching) return join(this.beginRestart(e, `a recover was asked while control was down (${was})`));
     }
@@ -1867,11 +2234,15 @@ export class WdaManager {
     }
   }
 
-  shutdown(): void {
+  /** Every runner and forward ended (their WDA sessions deleted first); resolves once they're gone, at most `ms`. */
+  async shutdown(ms = 8000): Promise<void> {
     clearInterval(this.health);
-    for (const e of this.entries.values()) {
+    const all = [...this.entries.values()];
+    for (const e of all) {
       e.wanted = false;
+      e.epoch++;
       this.killProcs(e);
     }
+    await Promise.all(all.map((e) => this.settled(e, ms)));
   }
 }

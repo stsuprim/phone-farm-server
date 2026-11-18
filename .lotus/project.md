@@ -15,3 +15,4 @@ src/{index,config,server,types,mock,real,wda,mjpeg,png}.ts, scripts/{init-env.mj
 - 2026-11-10: initial full implementation written.
 - 2026-11-10: README, launchd plist, build-wda.sh done; `npm run check` and `npm test` (7 checks, mock) pass. Real mode untested (needs Mac).
 - 2026-11-13: input replaced per docs/BEST_METHOD.md: CoreDevice HID live touch (native/hid/hid_input.py, iOS 27+), patched WDA fast route /wda/lotus/touch (scripts/patch-wda.mjs via build-wda.sh), old WDA as fallback; receive->injected metered (GET /phones/:udid/input); far viewers: no playout-delay 0/0, keyframe every 10 s.
+- 2026-11-18: WDA restarts torn down cleanly (session DELETE, xcodebuild tree SIGTERM→wait→SIGKILL, strays per udid pkilled, ports checked) before a relaunch; restarts serialized across phones; 2 failed runner starts in a row → one device-link reset (devicectl ends the runner app, idevicepair validate), then "needs replug" (controlDown + needsReplug) instead of looping.
