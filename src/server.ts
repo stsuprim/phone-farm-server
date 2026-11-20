@@ -38,6 +38,14 @@ export interface ServerExtras {
   controlPingMs?: number;
   /** A control socket nothing was heard from for this long is taken for dead and closed (ms; default CONTROL_DEAD_MS). */
   controlDeadMs?: number;
+  /** How often the control state of phones with an open control socket is looked at for a change to push (ms; 0 = never). */
+  controlPushMs?: number;
+  /** Tests: the WebRTC connect deadline and disconnected grace (src/rtc.ts RTC_CONNECT_MS, RTC_DISCONNECTED_MS). */
+  rtcConnectMs?: number;
+  rtcDisconnectedMs?: number;
+  /** How often a stream socket is pinged, and how long one that answered pings before may stay silent (ms; tests). */
+  streamPingMs?: number;
+  streamDeadMs?: number;
   /** Tests: the live touch's times (src/control.ts: releaseMs, quietMs, holdRepeatMs, ownerGraceMs). */
   touch?: Pick<ControlOptions, 'releaseMs' | 'quietMs' | 'holdRepeatMs' | 'ownerGraceMs'>;
 }
@@ -57,6 +65,66 @@ export const FOCUS_LOCK_MS = 1500;
  */
 export const CONTROL_PING_MS = 10_000;
 export const CONTROL_DEAD_MS = 35_000;
+/**
+ * 2026-11-21: the stream sockets (`/stream`, H.264 or MJPEG) get the same heartbeat as the control socket. One whose
+ * client answered pings before and then went silent this long (a laptop that slept, a dropped Wi-Fi) is closed, so
+ * its capture, its idle-lock hold and its watch end rather than running for nobody until TCP gives up. A client that
+ * never answers pings is left alone (old behaviour).
+ */
+export const STREAM_PING_MS = 10_000;
+export const STREAM_DEAD_MS = 35_000;
+
+/**
+ * The heartbeat of one stream socket (see STREAM_PING_MS): pings every `pingMs`; `onDead` once, when a client that
+ * answered before has been silent `deadMs`. Returns the stop.
+ */
+export function streamHeartbeat(
+  ws: { ping(): void; on(ev: 'pong' | 'ping' | 'message', cb: () => void): unknown; readyState: number },
+  pingMs: number,
+  deadMs: number,
+  onDead: (silentMs: number) => void,
+  now: () => number = Date.now,
+): () => void {
+  if (pingMs <= 0) return () => {};
+  let heard = now();
+  let answered = false;
+  let over = false;
+  ws.on('pong', () => {
+    heard = now();
+    answered = true;
+  });
+  ws.on('ping', () => {
+    heard = now();
+  });
+  ws.on('message', () => {
+    heard = now();
+  });
+  const t = setInterval(() => {
+    if (over) return;
+    const silent = now() - heard;
+    if (answered && silent >= deadMs) {
+      over = true;
+      clearInterval(t);
+      return onDead(silent);
+    }
+    if (ws.readyState === WebSocket.OPEN) {
+      try {
+        ws.ping();
+      } catch {
+        /* closing */
+      }
+    }
+  }, pingMs);
+  t.unref?.();
+  return () => {
+    over = true;
+    clearInterval(t);
+  };
+}
+
+/** While a phone's control socket is open, its control state is looked at this often and pushed when it changed. */
+export const CONTROL_PUSH_MS = 1000;
+
 /** Every this many watch ticks a watched phone's screen itself is looked at (dark with nothing said: iOS's Auto-Lock). */
 const DARK_EVERY = 4;
 
@@ -177,6 +245,8 @@ export function createServer(backend: Backend, token: string, updater?: Updater,
   const settings = extras.settings ?? new SettingsStore();
   const idle = extras.idle ?? new IdleLock(backend, () => settings.get().idleLockMinutes, { tickMs: 0 });
   const resigner = extras.resigner;
+  const streamPingMs = extras.streamPingMs ?? STREAM_PING_MS;
+  const streamDeadMs = extras.streamDeadMs ?? STREAM_DEAD_MS;
   const tokenHash = crypto.createHash('sha256').update(token).digest();
   const authorized = (candidate: string | null | undefined): boolean =>
     !!candidate && crypto.timingSafeEqual(crypto.createHash('sha256').update(candidate).digest(), tokenHash);
@@ -380,6 +450,63 @@ export function createServer(backend: Backend, token: string, updater?: Updater,
     }
   }
   info.onChange = (udid) => void pushInfo(udid);
+
+  // ---- 2026-11-21: the control state pushed, not only polled (GET /phones every 15 s) ----
+  // `{type: "control", udid, control, controlDown, needsReplug, restarting}` to a phone's control sockets whenever one
+  // of them changes (looked at every CONTROL_PUSH_MS while a socket is open), once right after each socket's hello,
+  // and the same fields in the hello itself when known. Older clients read only `control` (a string) and ignore the rest.
+  type CtlView = { control: PhoneInfo['control']; controlDown: string | null; needsReplug: boolean; restarting: PhoneInfo['restarting'] | null };
+  const ctlView = (p: PhoneInfo): CtlView => ({
+    control: p.online ? p.control : 'down',
+    controlDown: p.controlDown ?? null,
+    needsReplug: p.needsReplug ?? false,
+    restarting: p.restarting ?? null,
+  });
+  const ctlNow = new Map<string, CtlView>(); // the last seen, for hellos
+  const ctlSaid = new Map<string, string>(); // what the sockets of the phone heard last
+  let ctlPolling = false;
+  const pollControl = async (): Promise<void> => {
+    if (ctlPolling || !infoSubs.size) return;
+    ctlPolling = true;
+    try {
+      const list = await backend.list().catch(() => null);
+      if (!list) return;
+      for (const [udid, subs] of infoSubs) {
+        const p = list.find((x) => x.udid === udid);
+        if (!p) continue;
+        const v = ctlView(p);
+        ctlNow.set(udid, v);
+        const key = JSON.stringify(v);
+        if (ctlSaid.get(udid) === key) continue;
+        const first = !ctlSaid.has(udid);
+        ctlSaid.set(udid, key);
+        if (first) continue; // each socket heard it already right after its hello
+        const msg = { type: 'control', udid, ...v };
+        for (const fn of [...subs]) {
+          try {
+            fn(msg);
+          } catch {
+            /* a closed socket */
+          }
+        }
+      }
+      for (const udid of [...ctlSaid.keys()]) if (!infoSubs.has(udid)) ctlSaid.delete(udid);
+    } finally {
+      ctlPolling = false;
+    }
+  };
+  /** The state now, to one new socket (right after its hello). */
+  const sayControl = async (udid: string, reply: (m: unknown) => void): Promise<void> => {
+    const p = (await backend.list().catch(() => [])).find((x) => x.udid === udid);
+    if (!p) return;
+    const v = ctlView(p);
+    ctlNow.set(udid, v);
+    if (!ctlSaid.has(udid)) ctlSaid.set(udid, JSON.stringify(v));
+    reply({ type: 'control', udid, ...v });
+  };
+  const ctlEvery = extras.controlPushMs ?? CONTROL_PUSH_MS;
+  const ctlTimer = ctlEvery > 0 ? setInterval(() => void pollControl(), ctlEvery) : undefined;
+  ctlTimer?.unref();
   // an action may have changed the app in front (or the battery): look again shortly, for the phones on show
   control.onActed = (udid) => {
     if (infoSubs.has(udid)) info.soon(udid);
@@ -487,7 +614,13 @@ export function createServer(backend: Backend, token: string, updater?: Updater,
       const path = url.pathname.replace(/\/+$/, '') || '/';
       // public (no token): alive, and which build this is (the commit and when it started), so a client can tell
       // whether the Mac has pulled a change
-      if (req.method === 'GET' && path === '/health') return send(res, 200, { ok: true, mock: backend.mock, ...(extras.version ?? {}) });
+      // 2026-11-21: and how long it has run and its memory (a slow leak shows as rssMb climbing over days)
+      if (req.method === 'GET' && path === '/health') {
+        return send(res, 200, {
+          ok: true, mock: backend.mock, ...(extras.version ?? {}),
+          uptimeS: Math.round(process.uptime()), rssMb: Math.round(process.memoryUsage.rss() / 1048576),
+        });
+      }
       if (!authorized(bearer(req))) {
         res.setHeader('www-authenticate', 'Bearer');
         return send(res, 401, { error: 'missing or invalid bearer token' });
@@ -808,7 +941,15 @@ export function createServer(backend: Backend, token: string, updater?: Updater,
       const msg = isBinary ? null : parseObject(data);
       if (msg?.type === 'ping') ws.send(JSON.stringify({ type: 'pong', t: msg.t ?? null, server_time: Date.now() }));
     });
+    const unbeat = streamHeartbeat(ws, streamPingMs, streamDeadMs, (ms) => {
+      console.log(`[stream ${udid.slice(-8)}] nothing heard for ${(ms / 1000).toFixed(1)} s: closing the dead link`);
+      ws.terminate();
+    });
+    let over = false;
     const done = () => {
+      if (over) return;
+      over = true;
+      unbeat();
       clearInterval(retry);
       clearTimeout(helloTimer);
       mine.unsubscribe();
@@ -910,7 +1051,15 @@ export function createServer(backend: Backend, token: string, updater?: Updater,
           if (msg?.type === 'key') v.forceKey();
           else if (msg?.type === 'ping') ws.send(JSON.stringify({ type: 'pong', t: msg.t ?? null, server_time: Date.now() }));
         });
+        const unbeat = streamHeartbeat(ws, streamPingMs, streamDeadMs, (ms) => {
+          console.log(`[stream ${udid.slice(-8)}] nothing heard for ${(ms / 1000).toFixed(1)} s: closing the dead link`);
+          ws.terminate();
+        });
+        let over = false;
         const done = () => {
+          if (over) return;
+          over = true;
+          unbeat();
           clearInterval(tick);
           h.remove(v);
           unlist();
@@ -947,6 +1096,8 @@ export function createServer(backend: Backend, token: string, updater?: Updater,
       },
       // 2026-11-18: the capture gives no picture (the screen went or stayed off): woken now, and why not if it can't be
       noPicture: (force) => idle.wakeForPicture(udid, force),
+      connectMs: extras.rtcConnectMs,
+      disconnectedMs: extras.rtcDisconnectedMs,
     });
     // an open live view: keep the phone's live touch channel (HID session) open so the first tap doesn't pay for it
     const releaseInput = backend.warmInput?.(udid);
@@ -984,13 +1135,14 @@ export function createServer(backend: Backend, token: string, updater?: Updater,
       return i ? { path: 'h264' as const, transport: 'webrtc' as const, ...i } : null;
     });
     const v0 = view(udid);
-    reply({ type: 'hello', udid, profile: remote ? 'remote' : 'lan', ...v0, width: v0.screen_width, height: v0.screen_height });
+    reply({ type: 'hello', udid, profile: remote ? 'remote' : 'lan', ...v0, width: v0.screen_width, height: v0.screen_height, ...(ctlNow.get(udid) ?? {}) });
     // the phone turned: the picture's size is the WebRTC view's when one runs here, else the screen's own
     const unturn = onTurn(udid, () => reply(orientMsg(udid, rtc.frame())));
     const unwatch = watch(udid);
     // the phone is on show: health-checked every WATCH_MS, and its card's changes are pushed here as they happen
     const unattach = attach(udid);
     const uninfo = onInfo(udid, reply);
+    void sayControl(udid, reply);
     // the socket's own pings say its link is alive too (a finger of its held still stays down)
     ws.on('ping', () => {
       heard = Date.now();
@@ -1035,6 +1187,7 @@ export function createServer(backend: Backend, token: string, updater?: Updater,
 
   server.on('close', () => {
     if (watchTimer) clearInterval(watchTimer);
+    if (ctlTimer) clearInterval(ctlTimer);
   });
 
   return server;

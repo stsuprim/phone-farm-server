@@ -28,7 +28,7 @@ restarting (attempt N)", "state": "restarting"}`; after the restarts gave up, 50
 
 | Method | Path | Body / query | Result |
 |---|---|---|---|
-| GET | `/health` | - | `{ok, mock, commit, startedAt}` (no auth): alive, and which build runs (the commit's first 7 characters, when it started), so a client can tell whether the Mac has pulled a change |
+| GET | `/health` | - | `{ok, mock, commit, startedAt, uptimeS, rssMb}` (no auth): alive, and which build runs (the commit's first 7 characters, when it started), so a client can tell whether the Mac has pulled a change |
 | GET | `/phones` | - | `[{udid, name, model, ios, battery, online, ready, control, scale, point_width, point_height, width, height, orientation}]`: `battery` 0-100 or null; `model` the product type (`iPhone14,5`); `ready` = WDA running; `control` = `"ready"` (session warm), `"recovering"` (WDA starting or session being remade) or `"down"`; `orientation` how the phone is turned now (`portrait`, `landscape-left`, `landscape-right`, `portrait-upside-down`; null until WDA has said; see [Orientation and coordinates](#orientation-and-coordinates)); `scale` from WDA (`/wda/screen`); `point_width`/`point_height` the screen in points **as it's turned now** (390 x 844 upright, 844 x 390 on its side), null until known; `width`/`height` the same in pixels (points x scale); `stats` the live view numbers (see [Live view](#live-view-webrtc-h264-mjpeg)); `lan` the Mac's own base URLs on its LAN (private IPv4 only, `["http://192.168.1.20:8787", ...]`, same for every phone); `tailnet` its Tailscale ones (100.64/10), listed apart because a Tailscale address is not a local path; `info` the detail card's data as it was last gathered (see [Device info](#device-info-the-detail-card)); `focused` true for the one phone in focus (see [One live phone at a time](#one-live-phone-at-a-time)); `stats.heals` / `stats.lastHeal` WDA's self-heals (see [Staying responsive](#staying-responsive-wda-self-heal)) |
 | GET | `/phones/:udid/info` | `?fresh=1` (ask the phone now) | `{ok, udid, battery: {level, percent, charging}, temperatureC, app: {bundleId, name}, uptimeSec, model, ios, bootedAt, wda: {expiresAt, daysLeft, state}, thermal, connectedAt, at, fresh}`: the detail card, kept ~15 s; anything unknown is `null`. See [Device info](#device-info-the-detail-card) |
 | POST | `/phones/:udid/warm` | `{}` | `{ok, udid, capture: "warm"\|"off"\|"unavailable", reason?, input}`: wakes the phone for a viewer that's about to open it and says whether its capture runs; it starts none (2026-11-16). See [Capture only while a live view is open](#capture-only-while-a-live-view-is-open) |
@@ -209,6 +209,42 @@ in the phone's queue, and any call during a restart back-off killed and relaunch
 `test/restart.ts` checks it: a slow call restarts nothing, two unanswered asks then an answer is alive, three in a row
 restart once, calls meanwhile get a 503 at once, a recover joins, the attempts back off and end in "control down", and a
 recover or WDA answering again brings it back.
+
+### Long runs (2026-11-21)
+
+What keeps the server up for weeks, with phones watched from far links that sleep and drop:
+
+- **Stream sockets have a heartbeat.** `/stream` (H.264 or MJPEG over WebSocket) is pinged every 10 s like the control
+  socket; a client that answered pings and then went silent 35 s (a laptop that slept, a Wi-Fi drop with no close frame)
+  is closed, so its capture, its idle-lock hold and its watch end instead of running for nobody. A client that never
+  answers pings is left alone. Each socket's end runs once (its `close` and `error` both fire).
+- **WebRTC gives up a link that can't connect.** A peer connection not connected 20 s after its offer, or "disconnected"
+  for 15 s, ends with `rtc-error` (`the WebRTC link did not connect within 20 s` / `stayed disconnected`); the client
+  offers again. Before, such a session held the capture and the phone awake until the control socket closed.
+- **A forgotten rejection never ends the server.** `unhandledRejection` is logged (the same reason once a minute) and the
+  server carries on; an `uncaughtException` is logged and the normal shutdown runs (WDA runners and forwards ended), then
+  launchd starts a fresh one (`src/lifecycle.ts`).
+- **One shutdown, with a deadline.** SIGTERM, SIGINT, the updater and a crash share one shutdown; each step's failure is
+  logged and the rest still run; open HTTP and WebSocket connections are ended; it exits after 20 s at most even when a
+  phone never answers (the plist's `ExitTimeOut` is 30 s).
+- **`server.log` is rotated.** launchd's log is checked at start and every 10 min: over 20 MB it moves to
+  `server.log.1` (older ones to `.2`, `.3`, the oldest dropped) and is cut in place (launchd's handle appends on).
+  `LOG_FILE=/other/path` points it elsewhere; `LOG_FILE=` turns it off.
+- **launchd** (`deploy/com.lotus.phonefarm.plist`): `ThrottleInterval` 10 (a crash loop restarts at most every 10 s),
+  `ExitTimeOut` 30, and open files raised to 8192 (launchd's default is 256: sockets, pipes, iproxy forwards and
+  captures for several phones run out of it).
+- **The control state is pushed.** A control socket hears `{type: "control", udid, control, controlDown, needsReplug,
+  restarting}` right after its `hello`, and again whenever one of those changes (looked at every second while a socket
+  is open), and the `hello` carries the same fields when they're known. Before, "recovering", "control down" and "needs
+  replug" reached a client only through `GET /phones`. Older clients read only `control` (a string) as before.
+- **`GET /health`** also says `uptimeS` and `rssMb` (the process's memory: a slow leak shows as it climbing over days).
+
+`test/longrun.ts` checks it: the heartbeat (a silent viewer closed once; a never-answering one left; messages count),
+both stream codecs' dead viewers closed with no viewer or session left, an offer that never connects answered by
+`rtc-error`, the control state pushed (after the hello, in the next hello, on each change, never repeated), the safety net and the shutdown, the log's rotation with an open append handle, and a soak (`SOAK_S`, 20 s
+in `npm test`): control and stream sockets opened and dropped without a word, hundreds of cycles, after which no viewer,
+session or open link is left and the handles and heap are back where they began (90 s, 2321 cycles: heap 14.0 -> 14.5 MB
+with `--expose-gc`).
 
 ### Device info (the detail card)
 

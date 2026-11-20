@@ -21,6 +21,14 @@
   <key>ProcessType</key><string>Interactive</string>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
+  <!-- 2026-11-21: a crash is restarted after 10 s (never in a tight loop); a stop waits up to 30 s for the server to end
+       the WDA runners itself (it exits by 20 s); open files raised from launchd's 256 (sockets, pipes, iproxy forwards) -->
+  <key>ThrottleInterval</key><integer>10</integer>
+  <key>ExitTimeOut</key><integer>30</integer>
+  <key>SoftResourceLimits</key>
+  <dict><key>NumberOfFiles</key><integer>8192</integer></dict>
+  <key>HardResourceLimits</key>
+  <dict><key>NumberOfFiles</key><integer>8192</integer></dict>
   <key>StandardOutPath</key><string>/Users/YOURUSER/phone-farm-server/server.log</string>
   <key>StandardErrorPath</key><string>/Users/YOURUSER/phone-farm-server/server.log</string>
 </dict>

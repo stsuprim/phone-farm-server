@@ -277,7 +277,18 @@ export interface RtcHooks {
    * awake, else why not. `force` (an offer that never had a picture): a screen that can't be looked at counts as dark.
    */
   noPicture?: (force: boolean) => Promise<string | null>;
+  /** Tests: RTC_CONNECT_MS and RTC_DISCONNECTED_MS (ms). */
+  connectMs?: number;
+  disconnectedMs?: number;
 }
+
+/**
+ * 2026-11-21 (long runs): a peer connection that isn't connected this long after its offer is given up with an
+ * rtc-error (the client offers again), rather than holding the capture and the phone awake for nobody.
+ */
+export const RTC_CONNECT_MS = 20_000;
+/** A connection that stays "disconnected" this long (a client that slept or lost its network) is given up the same way. */
+export const RTC_DISCONNECTED_MS = 15_000;
 
 /** An offer whose capture has given no picture this long has the phone woken (and again at the second mark). */
 export const NO_PICTURE_WAKE_MS = [2500, 6500];
@@ -338,6 +349,10 @@ export class RtcSession {
   private wakeWhy: string | null = null;
   private wokeAt = 0;
   private lastFrameAt = 0;
+  // 2026-11-21: the connect deadline and the disconnected grace (RTC_CONNECT_MS, RTC_DISCONNECTED_MS)
+  private connectTimer?: NodeJS.Timeout;
+  private dropTimer?: NodeJS.Timeout;
+  private everConnected = false;
 
   constructor(
     private backend: Backend,
@@ -416,8 +431,26 @@ export class RtcSession {
     pc.onLocalCandidate((cand, mid) => {
       if (!this.closed) this.signal({ type: 'rtc-ice', candidate: cand.replace(/^a=/, ''), mid });
     });
+    const connectMs = this.hooks.connectMs ?? RTC_CONNECT_MS;
+    this.connectTimer = setTimeout(() => {
+      if (!this.everConnected) this.fail(`the WebRTC link did not connect within ${Math.round(connectMs / 1000)} s`);
+    }, connectMs);
+    this.connectTimer.unref?.();
     pc.onStateChange((state) => {
+      if (state === 'disconnected') {
+        if (!this.dropTimer) {
+          const ms = this.hooks.disconnectedMs ?? RTC_DISCONNECTED_MS;
+          this.dropTimer = setTimeout(() => this.fail(`the WebRTC link stayed disconnected for ${Math.round(ms / 1000)} s`), ms);
+          this.dropTimer.unref?.();
+        }
+      } else if (this.dropTimer) {
+        clearTimeout(this.dropTimer);
+        this.dropTimer = undefined;
+      }
       if (state === 'connected') {
+        this.everConnected = true;
+        if (this.connectTimer) clearTimeout(this.connectTimer);
+        this.connectTimer = undefined;
         const pair = pc.getSelectedCandidatePair();
         this.path = pair ? pathKind(pair.remote.address) : null; // the remote may be prflx (mDNS-hidden client)
         // the server's word on the media path and the lane it streams, so the client shows it rather than guessing
@@ -796,6 +829,7 @@ export class RtcSession {
 
   private fail(reason: string): void {
     if (this.closed) return;
+    console.log(`[rtc ${this.udid.slice(-8)}] ${reason}: session ended`);
     this.signal({ type: 'rtc-error', reason });
     this.close(reason);
   }
@@ -803,6 +837,9 @@ export class RtcSession {
   close(_why = 'closed'): void {
     if (this.closed) return;
     this.closed = true;
+    if (this.connectTimer) clearTimeout(this.connectTimer);
+    if (this.dropTimer) clearTimeout(this.dropTimer);
+    this.connectTimer = this.dropTimer = undefined;
     for (const t of this.wakeTimers) clearTimeout(t);
     this.wakeTimers = [];
     this.uninfo?.();

@@ -5,6 +5,7 @@ import { fileURLToPath } from 'node:url';
 import { loadConfig } from './config.js';
 import { ForkInstaller, forkPort, ForkTokens, readForkMeta } from './fork.js';
 import { IdleLock } from './idle.js';
+import { installGuards, makeShutdown, startLogRotation } from './lifecycle.js';
 import { MockBackend } from './mock.js';
 import { RealBackend } from './real.js';
 import { buildWdaRunner, provisionTeam, WdaResigner } from './resign.js';
@@ -35,7 +36,7 @@ if (!cfg.mock && !cfg.wdaProject) {
 }
 const real = cfg.mock ? null : new RealBackend(cfg);
 const backend = real ?? new MockBackend(cfg.mockPhones);
-const updater = cfg.mock ? undefined : createUpdater(() => shutdown());
+const updater = cfg.mock ? undefined : createUpdater(() => shutdown(0));
 
 // the server's config dir (data/, next to ports.json): settings and the WDA signing record
 const settings = new SettingsStore(path.join(cfg.dataDir, 'settings.json'));
@@ -133,16 +134,26 @@ server.listen(cfg.port, cfg.host, () => {
 // the WebRTC library (a native module) loads now rather than under the first viewer's offer
 void loadRtc();
 
-const shutdown = () => {
+// 2026-11-21: one shutdown (a signal, the updater, a crash), each step's failure logged, and an exit after 20 s even
+// when a phone never answers (launchd's ExitTimeOut is 30 s); open sockets are ended so server.close() can finish
+const shutdown = makeShutdown(async () => {
   server.close();
+  server.closeAllConnections?.();
   idle.close();
   resigner?.close();
   fork?.close();
-  void backend.close().finally(() => {
+  try {
+    await backend.close();
+  } finally {
     rtcCleanup();
-    process.exit(0);
-  });
-};
+  }
+});
+installGuards(() => shutdown(1));
+// launchd's log (deploy/com.lotus.phonefarm.plist), kept under 20 MB with three older ones; LOG_FILE= turns it off
+{
+  const logFile = process.env.LOG_FILE ?? path.join(ROOT, 'server.log');
+  if (logFile) startLogRotation(logFile);
+}
 updater?.start(cfg.autoUpdateMinutes);
-process.on('SIGINT', shutdown);
-process.on('SIGTERM', shutdown);
+process.on('SIGINT', () => shutdown(0));
+process.on('SIGTERM', () => shutdown(0));

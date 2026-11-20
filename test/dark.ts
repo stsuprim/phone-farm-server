@@ -180,7 +180,9 @@ const until = async (cond: () => boolean | Promise<boolean>, ms = 3000) => {
   let ws: WebSocket | undefined;
   try {
     const health = (await (await fetch(`http://${host}/health`)).json()) as Record<string, unknown>;
-    assert.deepEqual(health, { ok: true, mock: true, commit: 'abc1234', startedAt: '2026-11-16T00:00:00.000Z' }, 'public, with the build');
+    const { uptimeS, rssMb, ...rest } = health;
+    assert.deepEqual(rest, { ok: true, mock: true, commit: 'abc1234', startedAt: '2026-11-16T00:00:00.000Z' }, 'public, with the build');
+    assert.ok(typeof uptimeS === 'number' && uptimeS >= 0 && typeof rssMb === 'number' && rssMb > 0, 'and its uptime and memory');
     const [a, b2, c] = ((await (await fetch(`http://${host}/phones`, { headers: auth })).json()) as any[]).map((p) => p.udid as string);
 
     // someone (another Lotus) watches A; the focus moves to B: A keeps its capture and stays awake
