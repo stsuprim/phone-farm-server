@@ -100,7 +100,8 @@ const xcodes = () => spawned.filter((c) => c === 'xcodebuild').length;
   const w = await fakeWda();
   const cfg = { wdaBasePort: w.port, mjpegBasePort: w.port + 1, wdaProject: '/x', wdaDerivedData: '/y' } as unknown as import('../src/config.js').Config;
   // quick clocks: a probe waits 80 ms, WDA is down after 3 misses over 200 ms, a state is said once it lasted 250 ms
-  const m = new WdaManager(cfg, (u) => u, fakeSpawn, { input: 400, launch: 1000, probe: 80, restart: 4000, status: 80, misses: 3, missSpan: 200, debounce: 250, probes: 3, probeEvery: 100, backoff: [50, 100, 200] });
+  // (hold: a request never answered at all holds the phone's lane 150 ms more, then WDA is checked)
+  const m = new WdaManager(cfg, (u) => u, fakeSpawn, { input: 400, launch: 1000, probe: 80, restart: 4000, status: 80, misses: 3, missSpan: 200, debounce: 250, probes: 3, probeEvery: 100, backoff: [50, 100, 200], hold: 150 });
   try {
     m.start('U1');
     assert.ok(await until(() => m.state('U1') === 'ready'));
@@ -109,24 +110,32 @@ const xcodes = () => spawned.filter((c) => c === 'xcodebuild').length;
     const seen = new Set<string>();
     const watch = setInterval(() => seen.add(m.state('U1')), 5);
 
-    // 1. jitter: WDA is busy and answers its liveness check too late, twice in a row. Not a dead WDA: nothing is
-    //    recovered, the session is kept, the runner is left alone, and the state never leaves "ready"
+    // 1. jitter: WDA is busy and answers its liveness check too late. Not a dead WDA: nothing is recovered, the
+    //    session is kept, the runner is left alone, and the state never leaves "ready". 2026-11-21: a second check
+    //    while the first is still with the phone isn't even asked (one request at a time), and the late answer, when
+    //    it comes, clears the count: any answer at all, however late, means WDA is there
+    const probes = () => w.hits.filter((x) => /^GET \/session\/S\d+$/.test(x)).length;
     w.slow.probe = 200;
-    assert.equal(await m.probe('U1', 'health check'), true);
+    const asked = probes();
     assert.equal(await m.probe('U1', 'health check'), true);
     let h = m.linkHealth('U1')!;
-    assert.deepEqual([h.misses, h.recoveries, h.runnerRestarts, h.state], [2, 0, 0, 'ready']);
+    assert.deepEqual([h.misses, h.lane.inFlight], [1, 'GET /session/:id'], 'the late check still holds the lane');
+    assert.equal(await m.probe('U1', 'health check'), true);
+    assert.equal(probes() - asked, 1, 'no second check piled on top of the first');
+    assert.ok(await until(() => m.linkHealth('U1')!.misses === 0 && m.linkHealth('U1')!.lane.inFlight === null), 'the late answer came and cleared the count');
+    h = m.linkHealth('U1')!;
+    assert.deepEqual([h.recoveries, h.runnerRestarts, h.state], [0, 0, 'ready']);
     assert.deepEqual([w.made, xcodes(), m.healStats('U1').heals], [sessions, runners, 0], 'no new session, no restart, no heal');
     assert.ok(logs.some((l) => /a liveness check got no answer in time/.test(l)), 'said once in the log');
 
     // 2. any answer at all clears the count: WDA is there after all
-    w.slow.probe = 0;
-    await m.tap('U1', 10, 10);
-    assert.equal(m.linkHealth('U1')!.misses, 0);
     w.slow.probe = 200;
     assert.equal(await m.probe('U1', 'health check'), true);
-    assert.equal(await m.probe('U1', 'health check'), true);
-    assert.equal(m.linkHealth('U1')!.recoveries, 0, 'two misses, an answer, two misses: still not down');
+    assert.equal(m.linkHealth('U1')!.misses, 1);
+    w.slow.probe = 0;
+    await m.tap('U1', 10, 10); // waits its turn behind the late check, then goes
+    assert.equal(m.linkHealth('U1')!.misses, 0);
+    assert.equal(m.linkHealth('U1')!.recoveries, 0, 'late checks and an answer: never down');
 
     // 3. a check that would land behind a request already on its way isn't even asked
     w.slow.probe = 0;
@@ -146,8 +155,9 @@ const xcodes = () => spawned.filter((c) => c === 'xcodebuild').length;
     assert.equal(w.made, sessions + 1, 'a new session');
     assert.deepEqual([...seen], ['ready'], 'a session remade in a moment is never shown as the link going down');
 
-    // 5. a real drop: WDA stops answering for good. Three misses over the span, then /status asked three times,
-    //    then (and only then) the runner is restarted; meanwhile the state says "recovering"
+    // 5. a real drop: WDA stops answering for good. Its check is never answered, not even late (its hold runs out),
+    //    then /status asked three times, then (and only then) the runner is restarted; meanwhile the state says
+    //    "recovering"
     w.slow.probe = Infinity;
     w.slow.status = Infinity;
     const statusBefore = w.hits.filter((x) => x === 'GET /status').length;
@@ -172,7 +182,7 @@ const xcodes = () => spawned.filter((c) => c === 'xcodebuild').length;
     assert.ok(await until(() => m.state('U1') === 'ready' && !m.restarting('U1')));
     h = m.linkHealth('U1')!;
     assert.deepEqual([h.recoveries, h.runnerRestarts, h.misses], [1, 1, 0]);
-    assert.match(m.healStats('U1').lastHeal!.reason, /^restarting WDA \(attempt 1\/4\): health check: no answer within.*\/status asked 3 times/);
+    assert.match(m.healStats('U1').lastHeal!.reason, /^restarting WDA \(attempt 1\/4\): no answer within [\d.]+ s to GET \/session\/:id, not even late; then \/status asked 3 times/);
     clearInterval(watch);
 
     // 6. a slow answer under an action: the session that still answers is kept (it was only slow)

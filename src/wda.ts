@@ -6,6 +6,7 @@ import { Config } from './config.js';
 import { ClearStep, FieldState, fieldFrom, nextClearStep, scrubTyped } from './field.js';
 import { FIELD_FORK_VERSION, FORK_ROUTES, ForkLaunch, launchPlan, LIVE_GAPPED, LIVE_SEGMENTED, TOKEN_ENV, TOKEN_HEADER, usableLiveMode, WdaFlavor } from './fork.js';
 import { isLandscape, Orientation, orientationFromWda, uprightSize, uprightToPanel } from './orient.js';
+import { LaneBusy, LanePrio, LaneState, routeLabel, routePriority, WdaLane } from './lane.js';
 import { pickScreen } from './screens.js';
 import { Segmenter } from './segments.js';
 import { ButtonName, ControlState, HttpError, PathPoint, ScreenInfo, StreamSettings } from './types.js';
@@ -13,7 +14,8 @@ import { ButtonName, ControlState, HttpError, PathPoint, ScreenInfo, StreamSetti
 export type WdaStatus = 'starting' | 'ready' | 'failed' | 'stopped';
 
 /**
- * unreachable/session/server = WDA (or its session) is down and worth a recovery + retry;
+ * unreachable/session = WDA (or its session) is down and worth a recovery + retry; server = WDA answered with an
+ * error of its own (a 5xx: "Cannot take a screenshot within ... timeout"): it's there, it only failed that request;
  * rejected = WDA answered but refused the request; unknown = WDA doesn't have that endpoint.
  */
 type Kind = 'unreachable' | 'session' | 'server' | 'rejected' | 'unknown';
@@ -25,8 +27,13 @@ export class WdaError extends HttpError {
   constructor(public kind: Kind, message: string) {
     super(502, message);
   }
+  /**
+   * 2026-11-21: a 5xx is no longer "down". WDA's own error (an XCTest screenshot that timed out on the phone) was
+   * taken for a dead WDA: a recovery, whose session check and new session then waited behind the same stuck work,
+   * and a runner restart after it (iPhone-1: six recoveries, six restarts, "Control down"). An answer is an answer.
+   */
   get down(): boolean {
-    return this.kind === 'unreachable' || this.kind === 'session' || this.kind === 'server';
+    return this.kind === 'unreachable' || this.kind === 'session';
   }
 }
 
@@ -67,6 +74,14 @@ interface Entry {
   /** When a quiet call last had the session remade (at most one such remake every few seconds). */
   goneAt?: number;
   agent: http.Agent; // keep-alive connections to WDA (through iproxy): no new usbmux connection per touch
+  /**
+   * 2026-11-21: /status and /lotus/info on connections of their own (both answer off WDA's main queue): a liveness
+   * ask never waits for a socket behind requests the phone is slow with (6 of them filled the one agent, busy:6, and
+   * /status "never answered" while WDA was fine).
+   */
+  direct: http.Agent;
+  /** 2026-11-21: every request to this phone's WDA, one at a time (src/lane.ts). */
+  lane: WdaLane;
   /** Self-heals so far (a session remade, WDA restarted, a forward respawned), and the last one with its reason. */
   heals: number;
   lastHeal: HealRecord | null;
@@ -74,10 +89,10 @@ interface Entry {
   inflight: number;
   /** A liveness probe in progress (shared by everyone asking). */
   probeP?: Promise<boolean>;
-  /** Requests of any kind on their way to WDA now (card reads, the orientation, a lock, a screenshot: all of them). */
-  busy: number;
   /** When WDA last answered anything at all, whatever it said (Date.now()). */
   lastAnswer: number;
+  /** ...and anything that went through the lane (WDA's main queue and XCTest: not /status, which answers off it). */
+  laneAnswer: number;
   /** Liveness checks in a row that got no answer in time, and when the first of them was. */
   misses: number;
   missAt: number;
@@ -178,6 +193,13 @@ export interface WdaTimeouts {
   killWait?: number;
   /** Restart attempts in a row whose runner didn't come up before the device link is reset (default JAM_AFTER). */
   jamAfter?: number;
+  /**
+   * A request whose caller stopped waiting (no answer in its time) still holds the phone's lane this long more for
+   * the phone's late answer (ms; default HOLD_MS); with none by then it's given up and WDA is checked.
+   */
+  hold?: number;
+  /** How long a touch or a read may wait for its turn in the lane before it's dropped unsent (ms; default LANE_WAIT_MS). */
+  laneWait?: number;
 }
 export const DEFAULT_TIMEOUTS: WdaTimeouts = { input: 8000, launch: 20000, probe: 3000, restart: 90000 };
 /**
@@ -219,6 +241,21 @@ export const START_WAIT_MS = 1000;
  */
 export const KILL_WAIT_MS = 10_000;
 export const JAM_AFTER = 2;
+/**
+ * 2026-11-21, the lane (src/lane.ts): a request the Mac stopped waiting for keeps the phone's lane until the phone
+ * answers it, HOLD_MS at most (XCTest's own waits end within a minute: a still's 20 s, a main run loop's 60 s); with
+ * no answer at all by then WDA is checked (recover: /status, the session; restarted only when it's really gone). A
+ * touch or a read waits LANE_WAIT_MS at most for its turn, then it's dropped unsent with a "busy" answer; a quiet
+ * read (the orientation poll, the card, a probe) waits QUIET_WAIT_MS behind another quiet one, and never behind
+ * anything else (it's skipped).
+ */
+export const HOLD_MS = 60_000;
+export const LANE_WAIT_MS = 8000;
+export const QUIET_WAIT_MS = 2000;
+/** A check whether WDA is dead waits this long at most for the request of ours still with the phone to be over. */
+const DRAIN_MS = 15_000;
+/** An orientation asked no older than this is wanted now (a read that waits its turn); older asks are polls (quiet). */
+const FRESH_ORIENT_MS = 500;
 /** A launched runner's WDA gets this long (by the clock) to answer /status before the runner is given up on. */
 const START_MS = 180_000;
 
@@ -316,8 +353,100 @@ function within<T>(p: Promise<T>, ms: number, onTimeout: () => Error): Promise<T
   });
 }
 
-const newAgent = () => new http.Agent({ keepAlive: true, maxSockets: 6 });
+const newAgent = (maxSockets = 6) => new http.Agent({ keepAlive: true, maxSockets });
 type HttpErr = Error & { code?: string };
+type Resp = { status: number; text: string };
+
+/** How a request goes: its turn in the lane (default by its route), how long it may wait, or straight past the lane. */
+interface Via {
+  prio?: LanePrio;
+  maxWait?: number;
+  /** /status, /lotus/info: off WDA's main queue, on connections of their own, never in the lane. */
+  bypass?: boolean;
+  /** false: no wait for a late answer (the request is dropped at its timeout and frees the lane at once). */
+  hold?: boolean;
+}
+
+/**
+ * One HTTP exchange with WDA. `result`: the answer, or a TIMEOUT error after `timeout` (or the error it failed with);
+ * `ended`: once the exchange is really over. After a timeout the request is kept open `holdMs` more for the phone's
+ * late answer (it still runs there; `onAnswer` is told when it comes, as for any answer); with none by then it's
+ * destroyed and `onStuck` is told. A request that failed on a reused keep-alive connection the other side had already closed is sent once
+ * more on a fresh one (unless `resend` is false: typing), so a stale socket never looks like WDA being down.
+ */
+export function exchange(o: {
+  port: number; method: string; path: string; body?: string; headers: Record<string, string | number>; agent: http.Agent;
+  timeout: number; holdMs: number; resend: boolean; onAnswer: () => void; onStuck?: (ms: number) => void;
+}): { result: Promise<Resp>; ended: Promise<void> } {
+  let tellOk!: (r: Resp) => void;
+  let tellErr!: (e: Error) => void;
+  const result = new Promise<Resp>((a, b) => {
+    tellOk = a;
+    tellErr = b;
+  });
+  let endNow!: () => void;
+  const ended = new Promise<void>((a) => (endNow = a));
+  const t0 = Date.now();
+  let told = false;
+  let over = false;
+  let live: http.ClientRequest | null = null;
+  let hold: NodeJS.Timeout | undefined;
+  const tell = (v: Resp | Error) => {
+    if (told) return;
+    told = true;
+    clearTimeout(timer);
+    if (v instanceof Error) tellErr(v);
+    else tellOk(v);
+  };
+  const end = () => {
+    if (over) return;
+    over = true;
+    clearTimeout(timer);
+    if (hold) clearTimeout(hold);
+    endNow();
+  };
+  const timer = setTimeout(() => {
+    const err = Object.assign(new Error('timeout'), { code: 'TIMEOUT' });
+    tell(err);
+    if (o.holdMs <= 0 || !live) return void live?.destroy(err);
+    // the phone still works on it: the lane stays taken until it answers (or this cap)
+    hold = setTimeout(() => {
+      o.onStuck?.(Date.now() - t0);
+      live?.destroy(Object.assign(new Error('given up'), { code: 'ABANDONED' }));
+    }, o.holdMs);
+    hold.unref?.();
+  }, o.timeout);
+  const send = (retried: boolean) => {
+    const req = http.request({ host: '127.0.0.1', port: o.port, path: o.path, method: o.method, agent: o.agent, headers: o.headers }, (res) => {
+      const chunks: Buffer[] = [];
+      res.on('data', (c: Buffer) => chunks.push(c));
+      res.on('end', () => {
+        if (live !== req) return;
+        o.onAnswer(); // any answer at all, whatever it says and however late: WDA is there
+        tell({ status: res.statusCode ?? 0, text: Buffer.concat(chunks).toString('utf8') });
+        end();
+      });
+      res.on('error', (err) => fail(err as HttpErr));
+    });
+    live = req;
+    const fail = (err: HttpErr) => {
+      if (live !== req || over) return;
+      const stale = !told && !retried && o.resend && req.reusedSocket && (err.code === 'ECONNRESET' || err.code === 'EPIPE' || /socket hang up/i.test(err.message));
+      if (stale) return send(true);
+      tell(err);
+      end();
+    };
+    req.on('error', fail);
+    req.on('close', () => {
+      // closed without an answer or an error (it never should): over, the lane is free
+      if (live === req && !over) fail(Object.assign(new Error('socket hang up'), { code: 'ECONNRESET' }));
+    });
+    req.on('socket', (s) => s.setNoDelay(true));
+    req.end(o.body);
+  };
+  send(false);
+  return { result, ended };
+}
 
 const PORTS_FILE = path.join('data', 'ports.json');
 const HEALTH_MS = 10000;
@@ -524,13 +653,14 @@ export class WdaManager {
    * How WDA's own link is doing, for the phone's stats (`stats.controlLink.wda`): the state as told (debounced) and
    * as it is, liveness checks missed in a row, recoveries and runner restarts so far, ms since WDA last answered.
    */
-  linkHealth(udid: string): { state: ControlState; raw: ControlState; misses: number; recoveries: number; runnerRestarts: number; answeredMsAgo: number | null; busy: number; restarting: { attempt: number; of: number; since: number } | null; controlDown: string | null; needsReplug: boolean } | null {
+  linkHealth(udid: string): { state: ControlState; raw: ControlState; misses: number; recoveries: number; runnerRestarts: number; answeredMsAgo: number | null; busy: number; lane: LaneState; restarting: { attempt: number; of: number; since: number } | null; controlDown: string | null; needsReplug: boolean } | null {
     const e = this.entries.get(udid);
     if (!e) return null;
     return {
       state: this.state(udid), raw: !e.wanted || e.downWhy ? 'down' : e.status === 'starting' ? 'recovering' : e.status !== 'ready' ? 'down' : e.control,
       misses: e.misses, recoveries: e.recoveries, runnerRestarts: e.runnerRestarts,
-      answeredMsAgo: e.lastAnswer ? Date.now() - e.lastAnswer : null, busy: e.busy + e.inflight,
+      // 2026-11-21: requests on their way to WDA or waiting their turn (never more than one on its way: src/lane.ts)
+      answeredMsAgo: e.lastAnswer ? Date.now() - e.lastAnswer : null, busy: e.lane.load, lane: e.lane.state(),
       restarting: this.restarting(udid), controlDown: e.downWhy, needsReplug: !!e.downWhy && e.needsReplug,
     };
   }
@@ -662,8 +792,8 @@ export class WdaManager {
     e ??= {
       udid, wdaPort: this.cfg.wdaBasePort + n, mjpegPort: this.cfg.mjpegBasePort + n, status: 'starting', control: 'recovering',
       wanted: true, procs: [], restarts: 0, checking: false, lastOk: 0, orientation: null, orientAt: 0, tapRoute: 0, fast: 'unknown', fastFails: 0,
-      mjpeg: { ...DEFAULT_MJPEG }, agent: newAgent(), heals: 0, lastHeal: null, inflight: 0,
-      busy: 0, lastAnswer: 0, misses: 0, missAt: 0, unreadyAt: 0, recoveries: 0, runnerRestarts: 0,
+      mjpeg: { ...DEFAULT_MJPEG }, agent: newAgent(), direct: newAgent(2), lane: new WdaLane(() => this.nameOf(udid)), heals: 0, lastHeal: null, inflight: 0,
+      lastAnswer: 0, laneAnswer: 0, misses: 0, missAt: 0, unreadyAt: 0, recoveries: 0, runnerRestarts: 0,
       flavor: 'stock', forkInfo: null, switching: false, launchError: null, liveFailed: null, forkFails: 0, readyAt: 0,
       attempt: 0, restartSince: 0, downWhy: null, epoch: 0, launchSeq: 0, fwdPorts: [], needsReplug: false,
     };
@@ -713,6 +843,11 @@ export class WdaManager {
     e.sessionP = undefined;
     e.mjpegApplied = undefined;
     e.agent = newAgent();
+    e.direct.destroy();
+    e.direct = newAgent(2);
+    // 2026-11-21: nothing that waited its turn for the old runner goes to the new one (each hears why at once); the
+    // request on its way ends with the old runner's connections (its agent is destroyed below)
+    e.lane.flush(e.wanted ? new HttpError(503, `The phone's control link is restarting`, { state: 'restarting' }) : new HttpError(503, `The phone's control link is not running`, { state: 'down' }));
     if (!this.sys.real && !old.procs.some((p) => p.pid)) {
       // no real processes (tests): nothing to wait for
       for (const p of old.procs) p.kill('SIGTERM');
@@ -981,6 +1116,8 @@ export class WdaManager {
           if (slot === 0) {
             e.agent.destroy(); // its connections went with it
             e.agent = newAgent();
+            e.direct.destroy();
+            e.direct = newAgent(2);
           }
           e.procs[slot] = forward(slot, local, remote);
         }, 500).unref?.();
@@ -1049,66 +1186,58 @@ export class WdaManager {
 
   // ---- WDA HTTP client ----
   /**
-   * One HTTP request to WDA over the entry's keep-alive agent (Nagle off). A request that fails on a reused idle
-   * connection the other side had already closed is retried once on a fresh one, so a stale socket never looks
-   * like WDA being down (which would trigger a session recovery).
+   * One HTTP request to WDA (Nagle off, keep-alive), in the phone's lane (src/lane.ts): one at a time, a touch before
+   * waiting reads, a read that waited too long dropped unsent (a LaneBusy, 503), a quiet read skipped while anything
+   * else is on its way. Its `timeout` counts from when it's sent, not while it waits its turn. A request whose caller
+   * stopped waiting keeps the lane until the phone answers it (HOLD_MS at most, then WDA is checked). /status and
+   * /lotus/info (`bypass`) go straight on connections of their own.
    */
-  private async request(e: Entry, method: string, p: string, body: string | undefined, timeout: number, resend = true): Promise<{ status: number; text: string }> {
-    e.busy++;
-    try {
-      // `resend: false` (typing): never sent a second time, even on a stale socket (WDA may have typed it already)
-      const r = await this.requestOnce(e, method, p, body, timeout, !resend);
-      // any answer at all, whatever it says: WDA is there
-      e.lastAnswer = Date.now();
-      e.misses = 0;
-      return r;
-    } finally {
-      e.busy--;
+  private request(e: Entry, method: string, p: string, body: string | undefined, timeout: number, resend = true, via: Via = {}): Promise<Resp> {
+    const headers: Record<string, string | number> = {};
+    if (body !== undefined) {
+      headers['content-type'] = 'application/json';
+      headers['content-length'] = Buffer.byteLength(body);
     }
-  }
-
-  private requestOnce(e: Entry, method: string, p: string, body: string | undefined, timeout: number, retried: boolean): Promise<{ status: number; text: string }> {
-    return new Promise((resolve, reject) => {
-      let settled = false;
-      const headers: Record<string, string | number> = {};
-      if (body !== undefined) {
-        headers['content-type'] = 'application/json';
-        headers['content-length'] = Buffer.byteLength(body);
-      }
-      // our build answers nothing without its token (never logged: this header is the only place it goes)
-      if (e.token) headers[TOKEN_HEADER] = e.token;
-      const req = http.request({ host: '127.0.0.1', port: e.wdaPort, path: p, method, agent: e.agent, headers }, (res) => {
-        const chunks: Buffer[] = [];
-        res.on('data', (c: Buffer) => chunks.push(c));
-        res.on('end', () => {
-          if (settled) return;
-          settled = true;
-          clearTimeout(timer);
-          resolve({ status: res.statusCode ?? 0, text: Buffer.concat(chunks).toString('utf8') });
-        });
-        res.on('error', fail);
+    // our build answers nothing without its token (never logged: this header is the only place it goes)
+    if (e.token) headers[TOKEN_HEADER] = e.token;
+    const label = routeLabel(method, p);
+    const go = (agent: http.Agent, holdMs: number) =>
+      exchange({
+        port: e.wdaPort, method, path: p, body, headers, agent, timeout, holdMs,
+        // `resend: false` (typing): never sent a second time, even on a stale socket (WDA may have typed it already)
+        resend,
+        onAnswer: () => {
+          e.lastAnswer = Date.now();
+          if (!via.bypass) e.laneAnswer = e.lastAnswer;
+          e.misses = 0;
+        },
+        onStuck: (ms) => this.stuck(e, label, ms),
       });
-      const timer = setTimeout(() => req.destroy(Object.assign(new Error('timeout'), { code: 'TIMEOUT' })), timeout);
-      function fail(err: HttpErr) {
-        if (settled) return;
-        settled = true;
-        clearTimeout(timer);
-        const stale = req.reusedSocket && (err.code === 'ECONNRESET' || err.code === 'EPIPE' || /socket hang up/i.test(err.message));
-        if (stale && !retried) resolve(thisRef.requestOnce(e, method, p, body, timeout, true));
-        else reject(err);
-      }
-      const thisRef = this;
-      req.on('error', fail);
-      req.on('socket', (s) => s.setNoDelay(true));
-      req.end(body);
-    });
+    if (via.bypass) return go(e.direct, 0).result;
+    const prio = via.prio ?? routePriority(method, p);
+    const wait = via.maxWait ?? (prio === 'quiet' ? QUIET_WAIT_MS : this.timeouts.laneWait ?? LANE_WAIT_MS);
+    const holdMs = via.hold === false ? 0 : this.timeouts.hold ?? HOLD_MS;
+    const agent = e.agent;
+    return e.lane.run(prio, label, wait, () => go(agent, holdMs), prio === 'quiet' ? label : undefined);
   }
 
-  private async raw(e: Entry, method: string, p: string, body?: unknown, timeout = 30000, resend = true): Promise<any> {
+  /**
+   * A request the phone never answered, not even late (its hold ran out): XCTest may be stuck. WDA is checked (and
+   * restarted only when /status goes unanswered, or no session can be made while nothing else is asked of it).
+   */
+  private stuck(e: Entry, label: string, ms: number): void {
+    if (!e.wanted || e.status !== 'ready' || e.restartP || e.downWhy) return;
+    const why = `no answer within ${(ms / 1000).toFixed(1)} s to ${label}, not even late`;
+    this.log(e, `${why}: checking WebDriverAgent`);
+    void this.recover(e, why).catch(() => {});
+  }
+
+  private async raw(e: Entry, method: string, p: string, body?: unknown, timeout = 30000, resend = true, via: Via = {}): Promise<any> {
     let res: { status: number; text: string; ok?: boolean };
     try {
-      res = await this.request(e, method, p, body === undefined ? undefined : JSON.stringify(body), timeout, resend);
+      res = await this.request(e, method, p, body === undefined ? undefined : JSON.stringify(body), timeout, resend, via);
     } catch (err) {
+      if (err instanceof LaneBusy) throw err; // never sent: the phone was busy (its own clear 503)
       const x = err as HttpErr;
       const why = x.code === 'TIMEOUT' ? `no answer within ${Math.round(timeout / 1000)}s` : `unreachable (${x.code ?? x.message})`;
       const werr = new WdaError('unreachable', why);
@@ -1136,9 +1265,10 @@ export class WdaManager {
     throw new WdaError(kind, msg);
   }
 
+  /** GET /status, past the lane on a connection of its own (WDA answers it off its main queue, however busy that is). */
   private async ping(e: Entry, timeout: number): Promise<{ ok: boolean; sessionId?: string; why?: string }> {
     try {
-      const r = await this.request(e, 'GET', '/status', undefined, timeout);
+      const r = await this.request(e, 'GET', '/status', undefined, timeout, true, { bypass: true });
       let j: any = {};
       try {
         j = JSON.parse(r.text);
@@ -1161,7 +1291,7 @@ export class WdaManager {
     if (e.flavor !== 'fork') return null;
     for (let n = 0; n < 2; n++) {
       try {
-        const v = (await this.raw(e, 'GET', FORK_ROUTES.info, undefined, 4000))?.value;
+        const v = (await this.raw(e, 'GET', FORK_ROUTES.info, undefined, 4000, true, { bypass: true }))?.value;
         const lotus = Number(v?.lotus);
         return Number.isInteger(lotus) && lotus >= 1 ? { lotus, ...(typeof v.upstream === 'string' ? { upstream: v.upstream } : {}) } : null;
       } catch (err) {
@@ -1181,7 +1311,8 @@ export class WdaManager {
   }
 
   private async createSession(e: Entry): Promise<string> {
-    const j = await this.raw(e, 'POST', '/session', { capabilities: { alwaysMatch: CAPS }, desiredCapabilities: CAPS }, 15000);
+    // (no hold for a late answer: a session that isn't made in time is asked again, never waited for behind itself)
+    const j = await this.raw(e, 'POST', '/session', { capabilities: { alwaysMatch: CAPS }, desiredCapabilities: CAPS }, 15000, true, { hold: false });
     const id = j.sessionId ?? j.value?.sessionId;
     if (!id) throw new WdaError('server', 'WDA did not return a session id');
     e.sessionId = id;
@@ -1247,9 +1378,9 @@ export class WdaManager {
     if (JSON.stringify([e.screen, e.orientation]) !== before) this.onOrientation?.(e.udid);
   }
 
-  private async readOrientation(e: Entry, sid: string): Promise<Orientation | null> {
+  private async readOrientation(e: Entry, sid: string, via: Via = {}): Promise<Orientation | null> {
     try {
-      return orientationFromWda((await this.raw(e, 'GET', `/session/${sid}/orientation`, undefined, 4000))?.value);
+      return orientationFromWda((await this.raw(e, 'GET', `/session/${sid}/orientation`, undefined, 4000, true, via))?.value);
     } catch (err) {
       this.sessionGone(e, sid, err);
       return null;
@@ -1302,7 +1433,9 @@ export class WdaManager {
     if (e.orientP) return e.orientP;
     if (e.status !== 'ready' || !e.sessionId || e.recovering || Date.now() - e.orientAt < maxAgeMs) return Promise.resolve(e.orientation);
     const sid = e.sessionId;
-    e.orientP = this.readOrientation(e, sid)
+    // 2026-11-21: a poll (every 3 s while watched, with every list): quiet, skipped while the phone is busy. Asked
+    // for a fresh one (the picture changed shape, a UI read, GET /orientation) it waits its turn like any read.
+    e.orientP = this.readOrientation(e, sid, { prio: maxAgeMs <= FRESH_ORIENT_MS ? 'read' : 'quiet' })
       .then((o) => {
         e.orientAt = Date.now();
         if (o && o !== e.orientation) {
@@ -1361,7 +1494,16 @@ export class WdaManager {
     if (err instanceof WdaError) {
       if (err.named) return err;
       const name = this.nameOf(e.udid);
-      const out = new WdaError(err.kind, err.down ? `WDA session for ${name} is down: ${err.message}` : `WDA refused the request on ${name}: ${err.message}`);
+      // 2026-11-21: said as it is, per phone: slow is not down (nothing is restarted for it), and WDA's own error is its own
+      const said = err.timeout
+        ? `${name} did not answer in time (${err.message}): its WebDriverAgent is busy or stuck, nothing was restarted, and the request may still happen on the phone`
+        : err.down
+          ? `WDA session for ${name} is down: ${err.message}`
+          : err.kind === 'server'
+            ? `WebDriverAgent on ${name} could not do it: ${err.message}`
+            : `WDA refused the request on ${name}: ${err.message}`;
+      const out = new WdaError(err.kind, said);
+      out.timeout = err.timeout;
       out.named = true;
       return out;
     }
@@ -1411,6 +1553,14 @@ export class WdaManager {
     const every = this.timeouts.probeEvery ?? PROBE_EVERY_MS;
     const ms = this.timeouts.status ?? STATUS_MS;
     const fails: string[] = [];
+    // 2026-11-21: never while a request of ours is still with the phone: it's busy, not dead. The lane drains first
+    // (that request is answered, fails, or is given up at its hold); any answer meanwhile means WDA is there.
+    const asked = Date.now();
+    if (!e.lane.idle) {
+      const drained = await e.lane.drained(Math.min(this.timeouts.hold ?? HOLD_MS, DRAIN_MS));
+      if (e.lastAnswer >= asked) return null;
+      if (!drained) return 'moot'; // still busy with a request of ours: checked again when that one is over (stuck)
+    }
     const t0 = Date.now();
     for (let i = 0; i < n; i++) {
       if (!e.wanted || e.status !== 'ready' || e.restartP) return 'moot';
@@ -1445,7 +1595,8 @@ export class WdaManager {
       e.recoveries++;
       e.misses = 0;
       this.healed(e, `recovering: ${why}`);
-      const dead = await this.confirmDead(e);
+      // WDA said itself that the session is gone: it's there (2026-11-21: no /status asks first, a new session at once)
+      const dead = sessionGone ? null : await this.confirmDead(e);
       if (dead !== null && dead !== 'moot') {
         void this.beginRestart(e, `${why}; then ${dead}`);
         throw this.restartingError(e);
@@ -1459,8 +1610,11 @@ export class WdaManager {
         let gone = sessionGone;
         if (!gone) {
           try {
-            await this.raw(e, 'GET', `/session/${sid}`, undefined, this.timeouts.probe * 2);
+            // (no hold: a check that isn't answered in time is an answer of its own here)
+            await this.raw(e, 'GET', `/session/${sid}`, undefined, this.timeouts.probe * 2, true, { hold: false });
           } catch (err) {
+            // never sent: the phone was busy with other requests of ours the whole time, so it's there; the session stays
+            if (err instanceof LaneBusy) throw err;
             gone = !(err instanceof WdaError) || err.down || err.kind === 'session' || (await this.sessionExpired(e, sid));
           }
         }
@@ -1470,18 +1624,27 @@ export class WdaManager {
         }
       }
       const wait = this.timeouts.sessionWait ?? SESSION_WAIT_MS;
-      const made = () => within(this.session(e), wait, () => new WdaError('unreachable', `no session within ${Math.round(wait / 1000)} s`));
+      // made once WDA gave its id (the screen's size and the settings read after it may take longer: never "no session")
+      const made = () => within(this.session(e), wait, () => new WdaError('unreachable', `no session within ${Math.round(wait / 1000)} s`)).then(
+        () => {},
+        (err) => {
+          if (!e.sessionId) throw err;
+        },
+      );
+      const tMade = Date.now();
       try {
         await made();
       } catch (err) {
+        if (err instanceof LaneBusy) throw err;
         // /status answers but no session: asked once more a moment later; still none (XCTest hung under it): only a
-        // fresh runner fixes that
+        // fresh runner fixes that, and only when nothing at all came back from WDA meanwhile (an answer to anything
+        // else of ours means it's only slow)
         await sleep(Math.min(1000, this.timeouts.probeEvery ?? PROBE_EVERY_MS));
         try {
           await made();
         } catch (err2) {
-          if (!(err2 instanceof WdaError) || !err2.down || !e.wanted || e.status !== 'ready') throw err2;
-          void this.beginRestart(e, `${why}; then /status answered but no session could be made, twice (${(err as Error).message}; ${err2.message})`);
+          if (!(err2 instanceof WdaError) || !err2.down || !e.wanted || e.status !== 'ready' || e.laneAnswer >= tMade) throw err2;
+          void this.beginRestart(e, `${why}; then /status answered but no session could be made, twice, and nothing else was answered either (${(err as Error).message}; ${err2.message})`);
           throw this.restartingError(e);
         }
       }
@@ -1645,6 +1808,8 @@ export class WdaManager {
       await within(this.session(e), wait, () => new Error(`none within ${Math.round(wait / 1000)} s`));
       return { ok: true, why: '' };
     } catch (err) {
+      // made once WDA gave its id (the screen's size and the settings read after it are not the session)
+      if (e.sessionId) return { ok: true, why: '' };
       return { ok: false, why: `WDA answers but made no session (${(err as Error).message})` };
     }
   }
@@ -1675,11 +1840,9 @@ export class WdaManager {
     } catch (err) {
       if (!(err instanceof WdaError) || !err.down) throw this.named(e, err);
       // 2026-11-18: no answer in time may only be a slow WDA (or a long action still playing): never asked again (it
-      // may yet happen on the phone) and never a restart by itself; WDA is checked in the background
-      if (err.timeout) {
-        void this.recover(e, err.message).catch(() => {});
-        throw this.named(e, err);
-      }
+      // may yet happen on the phone) and never a restart by itself. 2026-11-21: not even a check: that request still
+      // holds the phone's lane until the phone answers it, and only one that's never answered has WDA checked (stuck)
+      if (err.timeout) throw this.named(e, err);
       try {
         await this.recover(e, err.message, err.kind === 'session');
       } catch (err2) {
@@ -1691,7 +1854,7 @@ export class WdaManager {
         e.lastOk = Date.now();
         return r;
       } catch (err3) {
-        if (err3 instanceof WdaError && err3.down) void this.recover(e, err3.message).catch(() => {});
+        if (err3 instanceof WdaError && err3.down && !err3.timeout) void this.recover(e, err3.message).catch(() => {});
         throw this.named(e, err3);
       }
     }
@@ -1730,9 +1893,16 @@ export class WdaManager {
     if (e.status === 'failed') return join(this.beginRestart(e, 'a recover was asked while the runner was not running'));
     if (e.status === 'starting') return this.state(udid); // on its way up already
     try {
-      await this.recover(e, 'requested by the client');
+      // 2026-11-21: answered within `recoverWait` (a check that waits for the phone to finish an earlier request
+      // goes on by itself); the phone busy with requests of ours is there, not down
+      const checking = this.recover(e, 'requested by the client');
+      await within(checking, wait, () => new Error('wait')).catch((err) => {
+        if ((err as Error)?.message === 'wait') return void checking.catch(() => {});
+        throw err;
+      });
     } catch (err) {
       if (e.restartP) return join(e.restartP);
+      if (err instanceof LaneBusy) return this.state(udid);
       if (err instanceof HttpError && !(err instanceof WdaError)) throw err;
       throw this.named(e, err);
     }
@@ -1769,7 +1939,8 @@ export class WdaManager {
     if (session && !e.sessionId) return null;
     if (e.inflight > 0) return null; // WDA is busy with an action: a card's read never piles on top of it
     try {
-      return (await this.raw(e, 'GET', session ? `/session/${e.sessionId}${p}` : p, undefined, timeout))?.value ?? null;
+      // quiet: skipped while anything else is on its way to the phone (src/lane.ts)
+      return (await this.raw(e, 'GET', session ? `/session/${e.sessionId}${p}` : p, undefined, timeout, true, { prio: 'quiet' }))?.value ?? null;
     } catch {
       return null;
     }
@@ -1780,11 +1951,12 @@ export class WdaManager {
    * recovered, and any failure (a timeout, WDA's own "Timed out while waiting until the screen gets locked") comes back
    * as a plain rejection, so it never marks the session or the phone down.
    */
-  async callSoft(udid: string, method: string, p: string, body?: unknown, timeout = 3000): Promise<any> {
+  async callSoft(udid: string, method: string, p: string, body?: unknown, timeout = 3000, quiet = false): Promise<any> {
     const e = this.entries.get(udid);
     if (!e || !e.wanted || e.status !== 'ready' || e.recovering) throw new WdaError('rejected', `WebDriverAgent on ${this.nameOf(udid)} isn't ready`);
     try {
-      return await this.raw(e, method, p, body, timeout);
+      // `quiet` (the watch's own looks): skipped while anything else is on its way to the phone
+      return await this.raw(e, method, p, body, timeout, true, quiet ? { prio: 'quiet' } : {});
     } catch (err) {
       if (err instanceof WdaError && err.kind === 'unknown') throw err; // an older WDA: the caller tries the session route
       throw new WdaError('rejected', (err as Error)?.message ?? String(err));
@@ -1857,10 +2029,10 @@ export class WdaManager {
     if (e.status === 'starting') await this.waitReady(e, this.timeouts.startWait ?? START_WAIT_MS);
     if (e.recovering) await e.recovering.catch(() => {});
     if (e.status !== 'ready' || e.restartP || e.downWhy) return false;
-    // something is on its way to WDA (a long gesture, a big /source, a screenshot, a lock, a card's read): WDA
-    // works one thing at a time, so a probe now would only wait behind it and look like a hang; that request finds
-    // out for itself.
-    if (e.inflight > 0 || e.busy > 0) return true;
+    // something is on its way to WDA (a long gesture, a big /source, a screenshot, a lock, a card's read), or waits
+    // its turn: WDA works one thing at a time, so a probe now would only wait behind it and look like a hang; that
+    // request finds out for itself (2026-11-21: the lane says so for every request, not just actions)
+    if (e.inflight > 0 || !e.lane.idle) return true;
     const sid = e.sessionId;
     try {
       if (!sid) {
@@ -1868,7 +2040,7 @@ export class WdaManager {
       } else {
         e.inflight++;
         try {
-          await this.raw(e, 'GET', `/session/${sid}`, undefined, this.timeouts.probe);
+          await this.raw(e, 'GET', `/session/${sid}`, undefined, this.timeouts.probe, true, { prio: 'quiet' });
         } finally {
           e.inflight--;
         }
@@ -1877,6 +2049,7 @@ export class WdaManager {
       this.setControl(e, 'ready');
       return true;
     } catch (err) {
+      if (err instanceof LaneBusy) return true; // something else got there first: busy, not down
       if (!(err instanceof WdaError)) throw err;
       // no answer in time, once: WDA may only be busy. It counts as down after several in a row (missed())
       if (err.down && !this.missed(e, err)) return true;
@@ -1906,9 +2079,12 @@ export class WdaManager {
     }
   }
 
-  /** What's on screen: WDA's accessibility tree as JSON (src/ui.ts flattens it). */
+  /**
+   * What's on screen: WDA's accessibility tree as JSON (src/ui.ts flattens it). 2026-11-21: 20 s (was 25 s), so with
+   * its wait for a turn in the lane a read is still answered inside a client's 30 s.
+   */
   async source(udid: string): Promise<unknown> {
-    return (await this.read(udid, '/source?format=json', 25000))?.value ?? null;
+    return (await this.read(udid, '/source?format=json', 20000))?.value ?? null;
   }
 
   /** The foreground app's bundle id, or null. */
@@ -1970,7 +2146,7 @@ export class WdaManager {
     } catch (err) {
       // never the text in a log or an answer (XCTest names its event after the first letters)
       const safe = err instanceof WdaError ? Object.assign(new WdaError(err.kind, scrubTyped(err.message, text)), { timeout: err.timeout }) : err;
-      if (safe instanceof WdaError && safe.down) void this.recover(e, safe.message, safe.kind === 'session').catch(() => {});
+      if (safe instanceof WdaError && safe.down && !safe.timeout) void this.recover(e, safe.message, safe.kind === 'session').catch(() => {});
       throw this.named(e, safe);
     } finally {
       e.inflight--;
@@ -2081,8 +2257,9 @@ export class WdaManager {
         this.log(e, 'this WDA build has no fast touch route (rebuild it with scripts/build-wda.sh); using the XCTest route');
         return false;
       }
-      if (err instanceof WdaError && !err.down) {
+      if (err instanceof WdaError && !err.down && err.kind !== 'server') {
         // the route refused it: this touch goes the old way; after 3 in a row, every touch does until WDA restarts
+        // (a 5xx is WDA failing it, "too many touches waiting": said as it is, never played a second way)
         if (++e.fastFails >= 3) e.fast = 'no';
         this.log(e, `fast touch route refused a touch (${err.message})${e.fast === 'no' ? '; using the XCTest route from now on' : ''}`);
         return false;
@@ -2154,7 +2331,7 @@ export class WdaManager {
     for (const e of this.entries.values()) {
       if (!e.wanted || e.status !== 'ready' || e.recovering || e.restartP || e.downWhy || e.checking) continue;
       if (e.sessionId && Date.now() - Math.max(e.lastOk, e.lastAnswer) < HEALTH_MS - 1000) continue; // it answered lately
-      if (e.inflight > 0 || e.busy > 0) continue; // busy with something: that request finds out for itself
+      if (e.inflight > 0 || !e.lane.idle) continue; // busy with something: that request finds out for itself
       e.checking = true;
       if (this.watched?.(e.udid)) {
         // someone is looking at this phone: ask the session itself, not just /status
@@ -2181,6 +2358,7 @@ export class WdaManager {
           try {
             await this.session(e);
           } catch (err) {
+            if (err instanceof LaneBusy) return; // the phone is busy with something of ours: asked again next time
             await this.recover(e, `health check: ${(err as Error).message}`).catch(() => {});
             return;
           }
@@ -2289,10 +2467,16 @@ export class WdaManager {
   }
 
   /** One still as a JPEG from our build (GET /lotus/shot), `scale` and `quality` 1-100; never recovers anything. */
-  async shot(udid: string, scale: number, quality: number, timeout = 8000): Promise<Buffer> {
+  async shot(udid: string, scale: number, quality: number, timeout = 8000, quiet = false): Promise<Buffer> {
     const e = this.entries.get(udid);
     if (!e || !e.wanted || e.status !== 'ready' || !e.forkInfo) throw new WdaError('rejected', `our WebDriverAgent build isn't up on ${this.nameOf(udid)}`);
-    const v = (await this.raw(e, 'GET', `${FORK_ROUTES.shot}?scale=${Math.round(scale)}&quality=${Math.round(quality)}`, undefined, timeout))?.value;
+    let v: any;
+    try {
+      // `quiet` (the watch's look at a dark screen): skipped while anything else is on its way to the phone
+      v = (await this.raw(e, 'GET', `${FORK_ROUTES.shot}?scale=${Math.round(scale)}&quality=${Math.round(quality)}`, undefined, timeout, true, quiet ? { prio: 'quiet' } : {}))?.value;
+    } catch (err) {
+      throw this.named(e, err);
+    }
     if (typeof v?.jpeg !== 'string' || !v.jpeg) throw new WdaError('rejected', 'the phone gave no still');
     return Buffer.from(v.jpeg, 'base64');
   }

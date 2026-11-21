@@ -113,7 +113,7 @@ const fast503 = async (p: Promise<unknown>, re: RegExp, state: string): Promise<
   // quick clocks: /status gets 100 ms, asked 3 times 150 ms apart; a restarted runner gets 1.5 s; back-off 80/160/240 ms
   const m = new WdaManager(cfg, (u) => u, fakeSpawn, {
     input: 300, launch: 1000, probe: 150, restart: 1500, status: 100, probes: 3, probeEvery: 150,
-    backoff: [80, 160, 240], attempts: 4, sessionWait: 500, recoverWait: 5000,
+    backoff: [80, 160, 240], attempts: 4, sessionWait: 500, recoverWait: 5000, hold: 200,
   });
   process.env.WDA_FAST = '0'; // the XCTest tap route only: one request per tap
   try {
@@ -140,8 +140,9 @@ const fast503 = async (p: Promise<unknown>, re: RegExp, state: string): Promise<
     assert.ok(!logs.some((l) => l.startsWith('[wda-restart]')), 'no restart logged');
     ok('a slow or failed call never restarts WDA; /status unanswered twice, then answered, is alive');
 
-    // 3. WDA hangs for good: 3 unanswered asks of /status in a row, then (and only then) a restart. Meanwhile every
-    //    call is answered at once with a 503 that says the attempt; a recover asked meanwhile joins the same restart
+    // 3. WDA hangs for good: the tap is never answered, not even late (its hold in the lane runs out), then 3
+    //    unanswered asks of /status in a row, then (and only then) a restart. Meanwhile every call is answered at once
+    //    with a 503 that says the attempt; a recover asked meanwhile joins the same restart
     w.hang = true;
     let revive = 0;
     // the new runner's WDA takes a moment (its first /status says not yet), then answers
@@ -152,7 +153,7 @@ const fast503 = async (p: Promise<unknown>, re: RegExp, state: string): Promise<
       setTimeout(() => void (w.refuse = false), 300);
     };
     const statusBefore = w.hits.filter((h) => h === 'GET /status').length;
-    const tapping = m.tap('U1', 10, 10); // times out: only a background check
+    const tapping = m.tap('U1', 10, 10); // times out; never answered at all: then checked
     await assert.rejects(tapping, (err: HttpError) => err.status === 502);
     assert.ok(await until(() => m.restarting('U1') !== null), 'a restart began');
     assert.equal(w.hits.filter((h) => h === 'GET /status').length - statusBefore, 3, '/status asked three times first');

@@ -236,6 +236,27 @@ export function streamSettings(q: URLSearchParams, remote = false): StreamSettin
 export { ackExtra };
 
 const flag = (v: string | null | undefined) => /^(1|true|yes)$/i.test(v ?? '');
+/** GET /ui is answered within this (a client waits 30 s), with why when the phone couldn't be read in time. */
+export const UI_BUDGET_MS = 25_000;
+/** `p`, or a 504 saying `why` after `ms` (`p` goes on; its end is ignored). */
+function inTime<T>(p: Promise<T>, ms: number, why: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const t = setTimeout(() => {
+      p.catch(() => {});
+      reject(new HttpError(504, why));
+    }, ms);
+    p.then(
+      (v) => {
+        clearTimeout(t);
+        resolve(v);
+      },
+      (err) => {
+        clearTimeout(t);
+        reject(err);
+      },
+    );
+  });
+}
 /** How often a watched phone is asked how it's turned (ms). The picture's own size change asks at once. */
 const ORIENT_POLL_MS = 3000;
 /** An MJPEG hello waits this long at most for the first frame (so it can say `connectMs`), then goes without it. */
@@ -594,7 +615,8 @@ export function createServer(backend: Backend, token: string, updater?: Updater,
           await control
             .check(udid, async () => {
               if (backend.heal && !(await backend.heal(udid, 'watch'))) return;
-              if (backend.isLocked) idle.note(udid, await backend.isLocked(udid, quick).catch(() => null));
+              // 2026-11-21: quiet: only while nothing else of ours is on its way to the phone (never piled on top)
+              if (backend.isLocked) idle.note(udid, await backend.isLocked(udid, quick, true).catch(() => null));
             })
             .catch(() => {});
           info.peek(p); // the card gathers again when it's ~15 s old: a change is pushed (info.onChange)
@@ -760,7 +782,10 @@ export function createServer(backend: Backend, token: string, updater?: Updater,
         if (req.method !== 'GET') throw new HttpError(405, 'use GET');
         const q = url.searchParams;
         const max = q.has('max') && Number.isFinite(Number(q.get('max'))) ? Number(q.get('max')) : undefined;
-        return send(res, 200, { ok: true, ...(await agent.ui(udid, { all: flag(q.get('all')), max, fresh: flag(q.get('fresh')), settle: flag(q.get('settle')) })) });
+        // 2026-11-21: answered inside a client's 30 s whatever the phone is doing (Lotus said "can't be reached")
+        const reading = agent.ui(udid, { all: flag(q.get('all')), max, fresh: flag(q.get('fresh')), settle: flag(q.get('settle')) });
+        const name = (await backend.list().catch(() => [])).find((p) => p.udid === udid)?.name ?? udid;
+        return send(res, 200, { ok: true, ...(await inTime(reading, UI_BUDGET_MS, `${name}'s screen could not be read within ${UI_BUDGET_MS / 1000} s: its WebDriverAgent is busy or stuck (nothing was restarted); try again in a moment`)) });
       }
       if (action === 'apps') {
         if (req.method !== 'GET') throw new HttpError(405, 'use GET');

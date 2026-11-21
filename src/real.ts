@@ -71,6 +71,7 @@ function helperCaps(): string[] {
   }
 }
 import { FAST_TAP_HOLD_MS, WdaError, WdaManager } from './wda.js';
+import { LaneBusy } from './lane.js';
 import type { WdaFlavor } from './fork.js';
 
 /** Our build's quick still (GET /lotus/shot): the size and quality the stock WDA's MJPEG frames had (percent). */
@@ -96,6 +97,14 @@ const LOCK_TIMEOUT_MS = 3000;
 const DARK_SHOT_MS = 5000;
 /** A wake waits this long at most for the phone's WDA to come up (a restart under way) before it says it can't. */
 const WAKE_WDA_WAIT_MS = 15_000;
+/**
+ * 2026-11-21: a still (GET /screenshot) is answered within this, whatever the phone is doing: Lotus waits 20 s and
+ * said "The phone server can't be reached" for a still that took longer (an 8 s still, a 5 s one, a 30 s PNG behind
+ * them, all waiting on the same busy phone). A still that can't come in time says why instead.
+ */
+export const STILL_BUDGET_MS = 15_000;
+/** The live view's capture gave a changed frame this recently: the screen is on (no screenshot asked to know). */
+export const MOVING_MS = 1000;
 
 
 export class RealBackend implements Backend {
@@ -504,17 +513,20 @@ export class RealBackend implements Backend {
    * The phone's stills (src/stills.ts): WDA's own screenshots, never the USB capture's frames. `soft`: the PNG is
    * asked without ever recovering WDA (the server's own looks at the screen).
    */
-  private stills(udid: string, soft = false): StillSource {
+  private stills(udid: string, soft = false, quiet = false): StillSource {
     return {
       // a stock WDA: a frame of its MJPEG server. Our build has none: its quick JPEG still (GET /lotus/shot), at
       // the size and quality the MJPEG frames had, takes that place; before it's up, the PNG says.
       mjpeg: this.wda.mjpegAvailable(udid)
         ? (maxAgeMs, waitMs) => this.source(udid).grab(maxAgeMs, waitMs)
         : this.wda.forkInfo(udid)
-          ? (_maxAgeMs, waitMs) => this.wda.shot(udid, FORK_STILL.scale, FORK_STILL.quality, Math.max(3000, waitMs)).catch(() => null)
+          ? (_maxAgeMs, waitMs) => this.wda.shot(udid, FORK_STILL.scale, FORK_STILL.quality, Math.max(3000, waitMs), quiet).catch(() => null)
           : null,
       png: async (timeoutMs) => {
-        const j = soft ? await this.wda.callSoft(udid, 'GET', '/screenshot', undefined, timeoutMs ?? DARK_SHOT_MS) : await this.wda.callNoSession(udid, 'GET', '/screenshot', undefined, timeoutMs);
+        // 2026-11-21: never without a bound (it was 30 s), so a still is answered inside a client's wait
+        const j = soft
+          ? await this.wda.callSoft(udid, 'GET', '/screenshot', undefined, timeoutMs ?? DARK_SHOT_MS, quiet)
+          : await this.wda.callNoSession(udid, 'GET', '/screenshot', undefined, timeoutMs ?? STILL_BUDGET_MS - 3000);
         if (typeof j?.value !== 'string') throw new HttpError(502, 'WDA gave no screenshot');
         return Buffer.from(j.value, 'base64');
       },
@@ -522,9 +534,42 @@ export class RealBackend implements Backend {
     };
   }
 
-  /** One still: WDA's screenshot (JPEG from its MJPEG server when it has one, else its PNG). Never the live capture. */
+  /**
+   * 2026-11-21: the live view's capture (only while one is open: it's never started for this) gave a changed frame
+   * within MOVING_MS, so the phone's screen is on and moving. Lets the checks for a dark screen skip WDA's screenshot.
+   */
+  private screenMoving(udid: string): boolean {
+    const now = Date.now();
+    return this.phoneSources(udid).some((s) => s.running && s.movedAt > 0 && now - s.movedAt < MOVING_MS);
+  }
+
+  /**
+   * One still: WDA's screenshot (JPEG from its MJPEG server when it has one, else its PNG). Never the live capture.
+   * 2026-11-21: answered within STILL_BUDGET_MS, and a still the phone was too busy for (or gave no answer in time)
+   * is said so at once, never followed by a slower one behind it on the same busy phone.
+   */
   async screenshot(udid: string, format: ImageFormat, size?: { maxSide?: number; quality?: number }): Promise<Image> {
-    this.known(udid);
+    const p = this.known(udid);
+    const work = this.takeStill(udid, format, size);
+    return new Promise<Image>((resolve, reject) => {
+      const t = setTimeout(() => {
+        work.catch(() => {});
+        reject(new HttpError(504, `${p.name} gave no still within ${STILL_BUDGET_MS / 1000} s: its WebDriverAgent is busy or stuck (nothing was restarted); try again in a moment`));
+      }, STILL_BUDGET_MS);
+      work.then(
+        (img) => {
+          clearTimeout(t);
+          resolve(img);
+        },
+        (err) => {
+          clearTimeout(t);
+          reject(err);
+        },
+      );
+    });
+  }
+
+  private async takeStill(udid: string, format: ImageFormat, size?: { maxSide?: number; quality?: number }): Promise<Image> {
     // 2026-11-17: a smaller read on our build: the phone scales its JPEG itself (GET /lotus/shot), so a long side
     // of 800 px at quality 60 comes in a fraction of the PNG's time and bytes
     if (format === 'jpeg' && size?.maxSide && this.wda.forkInfo(udid)) {
@@ -533,7 +578,11 @@ export class RealBackend implements Backend {
       const scale = long > 0 ? Math.min(100, Math.max(10, Math.ceil((size.maxSide / long) * 100))) : FORK_STILL.scale;
       const quality = Math.min(100, Math.max(10, Math.round(size.quality ?? 60)));
       const t0 = performance.now();
-      const jpeg = await this.wda.shot(udid, scale, quality, 8000).catch(() => null);
+      const jpeg = await this.wda.shot(udid, scale, quality, 8000).catch((err) => {
+        // busy (never sent) or no answer in time: a PNG behind it would only wait on the same busy phone
+        if (err instanceof LaneBusy || (err instanceof WdaError && err.timeout)) throw err;
+        return null;
+      });
       if (jpeg && frameAgrees(imageSize(jpeg), this.wda.orientation(udid))) {
         if (process.env.INPUT_LOG !== '0') console.log(`[timing] ${udid.slice(-8)} still: ${scale} % at q${quality}, ${jpeg.length} bytes in ${Math.round(performance.now() - t0)} ms`);
         return { data: jpeg, contentType: 'image/jpeg' };
@@ -874,8 +923,8 @@ export class RealBackend implements Backend {
   }
 
   /** WDA's own word on the lock (SpringBoard's lock state: always false on a phone without a passcode); null when it doesn't say. */
-  private wdaLocked(udid: string, timeout = 5000): Promise<boolean | null> {
-    return this.wda.callSoft(udid, 'GET', '/wda/locked', undefined, timeout).then(
+  private wdaLocked(udid: string, timeout = 5000, quiet = false): Promise<boolean | null> {
+    return this.wda.callSoft(udid, 'GET', '/wda/locked', undefined, timeout, quiet).then(
       (j) => (typeof j?.value === 'boolean' ? j.value : null),
       (err) =>
         err instanceof WdaError && err.kind === 'unknown'
@@ -888,9 +937,11 @@ export class RealBackend implements Backend {
    * Whether the screen is dark (off), from a screenshot (src/dark.ts); null when it can't be told. A frame WDA's MJPEG
    * gives within a moment settles a screen that plainly shows something without the PNG.
    */
-  private async dark(udid: string): Promise<boolean | null> {
+  private async dark(udid: string, quiet = false): Promise<boolean | null> {
     if (!this.phones.get(udid)?.online || this.wda.status(udid) !== 'ready') return null;
-    const s = this.stills(udid, true);
+    // 2026-11-21: the live view shows the screen changing right now: it's on, no screenshot needed to know
+    if (this.screenMoving(udid)) return false;
+    const s = this.stills(udid, true, quiet);
     try {
       const f = s.mjpeg ? await s.mjpeg(300, 900) : null;
       if (f && jpegMaybeBlack(f) === false) return false;
@@ -935,14 +986,15 @@ export class RealBackend implements Backend {
    * says that with its screen off. `quick`: no look at the screen, so only "locked" (true) or can't tell (null).
    * null when it can't tell.
    */
-  async isLocked(udid: string, quick = false): Promise<boolean | null> {
+  async isLocked(udid: string, quick = false, quiet = false): Promise<boolean | null> {
     const p = this.phones.get(udid);
     if (!p?.online || this.wda.status(udid) !== 'ready') return null;
-    const locked = await this.wdaLocked(udid);
+    // 2026-11-21, `quiet` (the watch's own look): skipped while the phone is busy with anything else (null: can't tell)
+    const locked = await this.wdaLocked(udid, 5000, quiet);
     if (locked === true) return true;
     // "not locked" alone says nothing of the screen: without a look it can't be told
     if (quick) return null;
-    const dark = await this.dark(udid);
+    const dark = await this.dark(udid, quiet);
     return dark === true ? true : locked;
   }
 

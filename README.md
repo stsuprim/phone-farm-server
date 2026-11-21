@@ -188,7 +188,7 @@ in the phone's queue, and any call during a restart back-off killed and relaunch
   `PROBE_EVERY_MS` (4 s) apart, 2.5 s each (about 12-15 s), with no other request of WDA's answered meanwhile (any
   answer at all means it's there). Or when its runner (xcodebuild) ended, or `/status` answers but no session can be
   made twice. A single failed or slow call, or a timeout on a long action, never restarts anything by itself: the call
-  fails, isn't sent again, and WDA is checked in the background.
+  fails and isn't sent again (2026-11-21: and nothing is checked for it; see "One request at a time per phone").
 - **Fast answers during a restart.** While a phone's restart is under way, every call that needs its WDA answers at
   once with 503 `{"error": "The phone's control link is restarting (attempt N)", "state": "restarting"}` (the HTTP
   routes `ui`, `apps`, `tap-element` and `act` check before anything is queued; everything else when it reaches WDA).
@@ -209,6 +209,52 @@ in the phone's queue, and any call during a restart back-off killed and relaunch
 `test/restart.ts` checks it: a slow call restarts nothing, two unanswered asks then an answer is alive, three in a row
 restart once, calls meanwhile get a 503 at once, a recover joins, the attempts back off and end in "control down", and a
 recover or WDA answering again brings it back.
+
+### One request at a time per phone (2026-11-21, the root cause)
+
+The owner: "phone1 loaded for a while and did some few touches and it crashed now... the more we fix the more it
+breaks". iPhone-1 showed `busy: 6`, nothing answered for 20 s, the owner's touch failed ("no answer within 5s"), then
+`recovering: ... Cannot take a screenshot within 20000 ms timeout`, six recoveries and six runner restarts, "Control down".
+
+**Why.** WebDriverAgent does one thing at a time: its routes run on the phone's main queue, and XCTest's testmanagerd
+takes a still only once the accessibility read before it is done. The server asked it whatever it wanted whenever it
+wanted, all at once: the orientation every 3 s per watcher and with every list, the card's reads, the watch's lock and
+dark checks, the settle's stills, Lotus's reads, the owner's touches, the health checks. One slow still held everything
+behind it; every request behind it ran out of time on the Mac yet still ran on the phone later (piling up more); the
+one keep-alive agent's 6 sockets filled with them, so `/status` waited for a socket and "never answered"; and the
+still's own 500 was taken for a dead WDA, whose recovery dropped the session and made a new one behind the same stuck
+work: "no session could be made, twice", a runner restart, again and again. Restarting XCTest runners over and over is
+what jams it for good. The earlier fixes tuned thresholds and added checks (more requests), never the concurrency.
+
+**Now** (`src/lane.ts`, `src/wda.ts`):
+
+- **A lane per phone.** Every request to its WDA goes through it, at most one on its way at a time. A touch, key,
+  typing, launch, lock or lift goes before reads that wait; a request waits `LANE_WAIT_MS` (8 s) at most for its turn,
+  then it's dropped unsent with 503 `{"error": "iPhone-1 is busy: its WebDriverAgent is still working on an earlier
+  request (GET /lotus/shot, 9.2 s so far), so POST /lotus/gesture was not sent; try again in a moment", "state":
+  "busy"}`. Background reads (the orientation poll, the card, a probe, the watch's lock look) are skipped at once while
+  anything else is on its way. A request's own timeout counts from when it's sent, not while it waits its turn.
+- **A late answer is waited for.** A request whose caller already heard "no answer" keeps the lane until the phone
+  answers it (`HOLD_MS`, 60 s at most), so nothing piles up behind it on the phone; its late answer counts as an answer
+  (the miss count is cleared). `stats.controlLink.wda.lane` says what's on its way, since when, and how many wait.
+- **Slow is not dead.** A timeout never recovers or restarts anything, and a 5xx (XCTest's "Cannot take a screenshot")
+  is WDA answering: it's said as it is (`WebDriverAgent on iPhone-1 could not do it: ...`). Only a request never
+  answered at all, not even late (its hold ran out), has WDA checked; a restart still needs `/status` unanswered 4
+  times (asked once the lane is free, on connections of its own, so it's never stuck behind requests the phone is slow
+  with), or no session at all twice while nothing else of ours was answered either.
+- **Answers in time, per phone.** `GET /screenshot` answers within 15 s and `GET /ui` within 25 s whatever the phone
+  is doing (Lotus waits 20 s and 30 s, and said "The phone server can't be reached" when they took longer); a still
+  the phone is too busy for is said so at once, never followed by a slower one behind it. Timeouts say `iPhone-1 did not
+  answer in time (...): its WebDriverAgent is busy or stuck, nothing was restarted, and the request may still happen
+  on the phone`. A `POST /recover` answers within 20 s.
+- **Fewer stills.** While a live view's capture shows the screen changing (a changed frame within 1 s), the screen is
+  on: the dark checks skip WDA's screenshot (the capture is never started or kept for this).
+
+`test/lane.ts` checks it: the lane alone (one at a time, a touch first, a late answer holding it, a read dropped after
+waiting too long, background reads skipped, a restart answering what waits), the exchange's hold, and a fake WDA: the
+server's many callers reach it one at a time, a slow still and a still's 500 recover and restart nothing, a touch that
+would wait too long is dropped with a clear "busy", a request never answered has WDA checked (restarted only when it's
+really gone), and `/status` goes past the lane.
 
 ### Long runs (2026-11-21)
 
@@ -971,7 +1017,7 @@ After `git pull`/code changes run `npm run build` and `launchctl kickstart -k gu
 
 `npm run check` type-checks. `npm test` runs `test/h264.ts` (helper framing, config-before-key, latest-only drop to keyframe,
 helper restarts, offer/RTCP parsing, WebRTC's keyframe unit, RTP clock and pacer queue), `test/input.ts` (live touch straight to the phone and its fallbacks, the HID sidecar's
-protocol, the WDA patch, latency metering, acks' `via`/`ms`), `test/orient.ts` (upright -> device mapping in all four orientations, units, the capture check, orientation in the list, hellos and on change), `test/touch.ts` (order, coalescing, acks, auto-release, wake first, fallbacks with a reason), `test/ui.ts` (UI tree flattening, the element finder, apps by name, `/ui`, `/tap-element`, `/type`, `/key`, `/launch`, `/act`, reports and verify), `test/info.ts` (the detail card: the battery / IORegistry / WDA parsers, the ~15 s cache, `GET /info`, `info` in the list, WDA's quiet read), `test/connect.ts` (a capture warmed ahead and kept warm, a keyframe at once on join, `connectMs` and `first-frame`, `POST /warm`), `test/reliability.ts` (an expired WDA session remade on a 4xx, never a stale UI tree, the settle wait and ids from a changed screen, a playing gesture holding the next action, HID inputs that time out or break off, HID reconnect), `test/heal.ts` (a fake WDA that expires its session, hangs or dies and an iproxy that exits, all healed and counted; a hung action's 504, bursts spaced, the probe before the first action after idle, wake-on-touch; units; `POST /focus`, `focused`, `percent` and `info` pushed), `test/restart.ts` (WDA restarted only when it's really dead: a slow call restarts nothing, three unanswered asks of `/status` do; a 503 at once during a restart; a recover joins it; 4 attempts backed off, then "control down"; a recover or WDA answering brings it back), `test/rtc.ts` (WebRTC in mock mode with a node-datachannel client: signaling, ICE,
+protocol, the WDA patch, latency metering, acks' `via`/`ms`), `test/orient.ts` (upright -> device mapping in all four orientations, units, the capture check, orientation in the list, hellos and on change), `test/touch.ts` (order, coalescing, acks, auto-release, wake first, fallbacks with a reason), `test/ui.ts` (UI tree flattening, the element finder, apps by name, `/ui`, `/tap-element`, `/type`, `/key`, `/launch`, `/act`, reports and verify), `test/info.ts` (the detail card: the battery / IORegistry / WDA parsers, the ~15 s cache, `GET /info`, `info` in the list, WDA's quiet read), `test/connect.ts` (a capture warmed ahead and kept warm, a keyframe at once on join, `connectMs` and `first-frame`, `POST /warm`), `test/reliability.ts` (an expired WDA session remade on a 4xx, never a stale UI tree, the settle wait and ids from a changed screen, a playing gesture holding the next action, HID inputs that time out or break off, HID reconnect), `test/heal.ts` (a fake WDA that expires its session, hangs or dies and an iproxy that exits, all healed and counted; a hung action's 504, bursts spaced, the probe before the first action after idle, wake-on-touch; units; `POST /focus`, `focused`, `percent` and `info` pushed), `test/restart.ts` (WDA restarted only when it's really dead: a slow call restarts nothing, three unanswered asks of `/status` do; a 503 at once during a restart; a recover joins it; 4 attempts backed off, then "control down"; a recover or WDA answering brings it back), `test/lane.ts` (one request at a time per phone: a touch first, a late answer holding the lane, stale reads dropped, background reads skipped, a slow still or a still's 500 never recovering or restarting anything, `/status` past the lane), `test/rtc.ts` (WebRTC in mock mode with a node-datachannel client: signaling, ICE,
 RTP, PLI -> IDR, SPS/PPS with every keyframe, `rtc-key`, the RTP clock, data channels and acks, stats, rtc-error), `test/audio.ts` (the sound: the helper's audio records, `audio on/off`, the held capture, the Opus track beside the picture, a session without sound, the volume raised and put back, a crash's raise put right) and `test/smoke.ts` (a mock server: auth, every endpoint, MJPEG,
 H.264 WebSocket, the MJPEG fallback, ping/pong). Mock mode's H.264 is a real, decodable stream (a tiny built-in encoder:
 Constrained Baseline 208x448, I_PCM keyframes and skip-coded deltas), so clients can test decoding against it.

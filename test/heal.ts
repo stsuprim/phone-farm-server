@@ -101,7 +101,8 @@ const fakeSpawn = ((cmd: string, args: string[]) => {
   const w = await fakeWda();
   const cfg = { wdaBasePort: w.port, mjpegBasePort: w.port + 1, wdaProject: '/x', wdaDerivedData: '/y' } as unknown as import('../src/config.js').Config;
   // quick clocks: WDA is dead after /status went unanswered 3 times, 60 ms apart; restarts back off 50/100/200 ms
-  const m = new WdaManager(cfg, (u) => u, fakeSpawn, { input: 300, launch: 1000, probe: 300, restart: 5000, status: 200, probes: 3, probeEvery: 60, backoff: [50, 100, 200] });
+  // (hold: a request never answered at all holds the phone's lane 300 ms more, then WDA is checked)
+  const m = new WdaManager(cfg, (u) => u, fakeSpawn, { input: 300, launch: 1000, probe: 300, restart: 5000, status: 200, probes: 3, probeEvery: 60, backoff: [50, 100, 200], hold: 300 });
   try {
     m.start('U1');
     assert.ok(await until(() => m.state('U1') === 'ready'), 'ready');
@@ -118,14 +119,16 @@ const fakeSpawn = ((cmd: string, args: string[]) => {
     await m.tap('U1', 10, 10);
 
     // 2. XCTest hangs under a tap: no answer within the input timeout -> the caller hears so quickly instead of
-    //    waiting 30 s; never asked again (it may still happen), WDA only checked (it answers: nothing restarted);
+    //    waiting 30 s; never asked again (it may still happen). 2026-11-21: a slow answer checks nothing; only a tap
+    //    never answered at all (its hold in the lane ran out) has WDA checked (it answers: nothing restarted);
     //    once WDA answers again the next tap goes through
     w.hang = true;
     const t0 = Date.now();
     await assert.rejects(m.tap('U1', 10, 10), (err: HttpError) => err.status === 502 && /no answer within/.test(err.message));
     assert.ok(Date.now() - t0 < 3000, `a hung tap is given up on quickly (${Date.now() - t0} ms)`);
-    assert.ok(m.healStats('U1').heals >= 2);
-    assert.match(m.healStats('U1').lastHeal!.reason, /recovering: no answer within/);
+    assert.equal(m.healStats('U1').heals, 1, 'a timeout alone checks nothing');
+    assert.ok(await until(() => m.healStats('U1').heals >= 2), 'checked once the tap was never answered');
+    assert.match(m.healStats('U1').lastHeal!.reason, /^recovering: no answer within [\d.]+ s to POST \/session\/:id\/wda\/tap, not even late$/);
     w.hang = false;
     await until(() => m.state('U1') === 'ready');
     await m.tap('U1', 10, 10);

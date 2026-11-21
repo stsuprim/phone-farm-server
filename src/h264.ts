@@ -322,6 +322,12 @@ export class H264Source {
   private openTimeoutMs: number;
   private log: (m: string) => void;
   private infoSubs = new Set<(info: H264Info) => void>();
+  /**
+   * 2026-11-21: when the capture last gave a frame that differs from the one before (a delta: a still screen gives
+   * none, and a keyframe may be the last picture encoded again), Date.now(); 0 = never. While it's recent the screen
+   * is on, so the server needn't ask WebDriverAgent for a screenshot to know.
+   */
+  movedAt = 0;
 
   constructor(private label: string, private startFn: StartProducer, private want: H264Settings, opts: SourceOptions = {}) {
     this.idleMs = opts.idleMs ?? 10_000;
@@ -563,6 +569,7 @@ export class H264Source {
         return;
       case KIND.DELTA:
         this.deltasSinceKey++;
+        this.movedAt = Date.now();
         this.meter.tick();
         this.fanOut(r);
         return;
@@ -588,6 +595,7 @@ export class H264Source {
 
   private onExit(reason: string): void {
     this.producer = undefined;
+    this.movedAt = 0;
     this.info = this.config = this.key = undefined;
     this.lastError = reason;
     this.failures++;
