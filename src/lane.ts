@@ -65,10 +65,15 @@ export class WdaLane {
   private current: { label: string; prio: LanePrio; since: number; abandoned: boolean } | null = null;
   private drains = new Set<() => void>();
   private now: () => number;
+  private explain?: (label: string) => string | null;
 
-  /** `name()`: the phone's name, for the messages. */
-  constructor(private name: () => string, opts: { now?: () => number } = {}) {
+  /**
+   * `name()`: the phone's name, for the messages. `explain(label)`: why the request on its way is slow, when that's
+   * known (2026-11-21: "the app in front isn't answering accessibility reads"), said in the "busy" answer.
+   */
+  constructor(private name: () => string, opts: { now?: () => number; explain?: (label: string) => string | null } = {}) {
     this.now = opts.now ?? Date.now;
+    this.explain = opts.explain;
   }
 
   /** Nothing on its way and nothing waiting. */
@@ -150,10 +155,11 @@ export class WdaLane {
     const c = this.current;
     const on = c ? `${c.label}, ${((this.now() - c.since) / 1000).toFixed(1)} s so far${c.abandoned ? ', still waiting for the phone to answer it' : ''}` : 'requests ahead of it';
     const ahead = this.queue.length;
+    const why = c ? this.explain?.(c.label) ?? null : null;
     return new LaneBusy(
       skipped
         ? `${this.name()} is busy (${on}): ${label} skipped`
-        : `${this.name()} is busy: its WebDriverAgent is still working on an earlier request (${on}${ahead > 1 ? `; ${ahead - 1} more waiting` : ''}), so ${label} was not sent; try again in a moment`,
+        : `${this.name()} is busy: its WebDriverAgent is still working on an earlier request (${on}${ahead > 1 ? `; ${ahead - 1} more waiting` : ''}${why ? `; ${why}` : ''}), so ${label} was not sent; try again in a moment`,
       { inFlight: c?.label ?? null, skipped },
     );
   }

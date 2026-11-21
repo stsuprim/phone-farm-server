@@ -447,4 +447,5 @@ const xcodes = () => spawned.filter((c) => c === 'xcodebuild').length;
 }
 
 console.log(`\nall ${passed} lane checks passed`);
-process.exit(0);
+// 2026-11-21 (2): the app in front that doesn't answer accessibility (test/stall.ts, run from here: it ends the run)
+await import('./stall.js');
