@@ -72,6 +72,7 @@ function helperCaps(): string[] {
 }
 import { FAST_TAP_HOLD_MS, WdaError, WdaManager } from './wda.js';
 import { LaneBusy } from './lane.js';
+import { OFFLINE_AFTER_MS, Presence } from './presence.js';
 import type { WdaFlavor } from './fork.js';
 
 /** Our build's quick still (GET /lotus/shot): the size and quality the stock WDA's MJPEG frames had (percent). */
@@ -83,13 +84,8 @@ function run(cmd: string, args: string[], timeout = 10000): Promise<string> {
   });
 }
 
-async function info(udid: string, args: string[]): Promise<string> {
-  try {
-    return await run('ideviceinfo', ['-u', udid, ...args]);
-  } catch {
-    return '';
-  }
-}
+/** How the backend runs a command and gets its output (tests give their own). */
+export type RunCmd = (cmd: string, args: string[], timeout?: number) => Promise<string>;
 
 /** The lock's own wait (2026-11-16): short; the state is asked afterwards. */
 const LOCK_TIMEOUT_MS = 3000;
@@ -124,11 +120,17 @@ export class RealBackend implements Backend {
   private playFails = new Map<string, { at: number; error: string }>(); // a queued HID gesture that failed while playing
   private audioHubs = new Map<string, AudioHub>(); // each phone's sound (src/audio.ts)
   private volume: VolumeGuard; // the phone's media volume while its sound is on the Mac
+  /** Which phones are plugged in: one poll that misses a phone never counts as an unplug (src/presence.ts). */
+  private presence = new Presence();
+  private runCmd: RunCmd;
   /** Set by the server: a phone's orientation or upright size changed. */
   onOrientation?: (udid: string) => void;
 
-  constructor(private cfg: Config) {
-    this.wda = new WdaManager(cfg, (udid) => this.phones.get(udid)?.name ?? udid);
+  /** `opts` (tests): the command runner, a WdaManager and a Presence of their own, and no polling timer. */
+  constructor(private cfg: Config, opts: { run?: RunCmd; wda?: WdaManager; presence?: Presence; timer?: boolean } = {}) {
+    this.runCmd = opts.run ?? run;
+    if (opts.presence) this.presence = opts.presence;
+    this.wda = opts.wda ?? new WdaManager(cfg, (udid) => this.phones.get(udid)?.name ?? udid);
     const silent = cfg.phoneSilent !== false;
     this.volume = new VolumeGuard({
       percent: cfg.audio === false || silent ? 0 : cfg.audioPhoneVolume ?? 0,
@@ -154,50 +156,89 @@ export class RealBackend implements Backend {
     };
     void this.poll();
     this.timer = setInterval(() => void this.poll(), cfg.pollMs);
+    if (opts.timer === false) clearInterval(this.timer);
   }
 
+  private info(udid: string, args: string[]): Promise<string> {
+    return this.runCmd('ideviceinfo', ['-u', udid, ...args]).catch(() => '');
+  }
+
+  /**
+   * Which phones are plugged in (src/presence.ts). 2026-11-21: a phone missing from one `idevice_id -l` is only
+   * missing (its USB screen capture starting makes it re-enumerate; a usbmux hiccup): nothing is torn down and WDA
+   * waits for it rather than restarting. Only one missed for OFFLINE_AFTER_MS (several polls in a row) is unplugged:
+   * then its WDA stops and its live view, HID and app list go. A phone that's known is updated in place, never
+   * replaced (its name, model and iOS stay; the battery is read again).
+   */
   private async poll(): Promise<void> {
     if (this.polling) return;
     this.polling = true;
     try {
       let ids: string[] = [];
       try {
-        ids = (await run('idevice_id', ['-l'])).split(/\s+/).filter(Boolean);
+        ids = (await this.runCmd('idevice_id', ['-l'])).split(/\s+/).filter(Boolean);
       } catch (err) {
+        // the list itself failed (a timeout while usbmuxd or CoreDevice is busy): nobody is missed for it
         console.error('idevice_id failed (is libimobiledevice installed?):', (err as Error).message);
         return;
       }
+      const change = this.presence.update(ids);
       for (const udid of ids) {
         const prev = this.phones.get(udid);
         const [name, model, ios, batt] = await Promise.all([
-          prev?.name && prev.name !== udid ? prev.name : info(udid, ['-k', 'DeviceName']),
-          prev?.model ? prev.model : info(udid, ['-k', 'ProductType']),
-          prev?.ios ? prev.ios : info(udid, ['-k', 'ProductVersion']),
-          info(udid, ['-q', 'com.apple.mobile.battery', '-k', 'BatteryCurrentCapacity']),
+          prev?.name && prev.name !== udid ? prev.name : this.info(udid, ['-k', 'DeviceName']),
+          prev?.model ? prev.model : this.info(udid, ['-k', 'ProductType']),
+          prev?.ios ? prev.ios : this.info(udid, ['-k', 'ProductVersion']),
+          this.info(udid, ['-q', 'com.apple.mobile.battery', '-k', 'BatteryCurrentCapacity']),
         ]);
-        if (!prev?.online) this.seen.set(udid, Date.now());
+        // it may have gone (or come) while ideviceinfo was asked: the newest word on it counts
+        if (!this.presence.has(udid)) continue;
         const paired = !!name; // empty output = not trusted/paired yet
         const b = Number.parseInt(batt, 10);
-        this.phones.set(udid, {
-          udid, name: name || udid, model, ios,
-          battery: Number.isFinite(b) ? b : null, online: true, ready: false,
-          control: 'down', scale: null, point_width: null, point_height: null, width: null, height: null,
-        });
+        const battery = Number.isFinite(b) ? b : prev?.battery ?? null;
+        if (prev) {
+          if (!prev.online) this.seen.set(udid, Date.now());
+          if (name) prev.name = name;
+          else if (!prev.name) prev.name = udid;
+          if (model) prev.model = model;
+          if (ios) prev.ios = ios;
+          prev.battery = battery;
+          prev.online = true;
+        } else {
+          this.seen.set(udid, Date.now());
+          this.phones.set(udid, {
+            udid, name: name || udid, model, ios,
+            battery, online: true, ready: false,
+            control: 'down', scale: null, point_width: null, point_height: null, width: null, height: null,
+          });
+        }
+        this.wda.setPresent(udid, true);
+        // start() does nothing for a phone whose WDA is wanted already (one that was only missing a moment)
         if (paired && this.cfg.autostartWda) this.wda.start(udid);
       }
-      for (const [udid, p] of this.phones) {
-        if (!ids.includes(udid)) {
-          p.online = false;
-          this.wda.stop(udid);
-          this.closeH264(udid, 'phone unplugged');
-          this.hid.get(udid)?.close();
-          this.hid.delete(udid);
-          this.appCache.delete(udid);
-        }
+      for (const udid of change.back) console.log(`[usb ${udid.slice(-8)}] back after a moment off the USB list: nothing was torn down`);
+      for (const udid of change.missing) {
+        if (!this.phones.get(udid)?.online) continue;
+        console.log(`[usb ${udid.slice(-8)}] not in idevice_id's list this time (a re-enumeration or a usbmux blip?): kept as it is; it counts as unplugged only after ${OFFLINE_AFTER_MS / 1000} s`);
+        this.wda.setPresent(udid, false);
       }
+      for (const udid of change.gone) this.unplugged(udid);
     } finally {
       this.polling = false;
     }
+  }
+
+  /** The phone was missed long enough to count as unplugged: its WDA, live view, HID and app list go. */
+  private unplugged(udid: string): void {
+    const p = this.phones.get(udid);
+    if (!p?.online) return;
+    console.log(`[usb ${udid.slice(-8)}] unplugged (missing from idevice_id for ${OFFLINE_AFTER_MS / 1000} s or more)`);
+    p.online = false;
+    this.wda.stop(udid);
+    this.closeH264(udid, 'phone unplugged');
+    this.hid.get(udid)?.close();
+    this.hid.delete(udid);
+    this.appCache.delete(udid);
   }
 
   async list(): Promise<PhoneInfo[]> {
@@ -723,7 +764,9 @@ export class RealBackend implements Backend {
       hid: problem ? 'unsupported' : h?.state ?? 'off',
       hid_reason: problem ?? h?.reason ?? null,
       wda_fast: this.wda.fastStatus(udid),
-      wda: this.wda.forkInfo(udid) ? 'fork' : 'stock',
+      // 2026-11-21: the build this phone runs (or is being started with), as the control app's status says it; it
+      // said "stock" for our build whenever WDA wasn't up at that moment (forkInfo is only known once it answers)
+      wda: this.wda.flavor(udid),
       wda_live: this.wda.liveWhy(udid) === null ? 'ready' : 'off',
       wda_live_reason: this.wda.liveWhy(udid),
     };

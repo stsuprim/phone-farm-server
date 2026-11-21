@@ -154,6 +154,10 @@ interface Entry {
   appInfo?: unknown;
   /** Where the screen's size came from: once it's the screen's own (/wda/screen), it's kept and never asked again. */
   screenFrom?: 'screen' | 'window' | 'model' | 'previous';
+  /** 2026-11-21: this runner holds the farm's xcodebuild start turn (cleared once it's up, ended or killed). */
+  spawnTurn?: () => void;
+  /** The runner ended while the phone was off the USB list for a moment: started again once it's back (setPresent). */
+  awaitingUsb?: string;
 }
 
 /**
@@ -222,6 +226,10 @@ export interface WdaTimeouts {
   stallMax?: number;
   /** No background read of the app in front this long after a touch (ms; default INPUT_QUIET_MS). */
   inputQuiet?: number;
+  /** A starting runner keeps the other phones' xcodebuild starts waiting this long at most (ms; default SPAWN_HOLD_MS, never above `restart`). */
+  spawnHold?: number;
+  /** A restart attempt waits this long at most for a phone that's off the USB list for a moment (ms; default USB_WAIT_MS). */
+  usbWait?: number;
 }
 export const DEFAULT_TIMEOUTS: WdaTimeouts = { input: 8000, launch: 20000, probe: 3000, restart: 90000 };
 /**
@@ -263,6 +271,21 @@ export const START_WAIT_MS = 1000;
  */
 export const KILL_WAIT_MS = 10_000;
 export const JAM_AFTER = 2;
+/**
+ * 2026-11-21 (iPhone-1's runner died with "xcodebuild exited (65): ... CoreDeviceCLISupport.DiagnoseError" the
+ * moment the owner switched the Phones page to iPhone-2): restarts already went one phone at a time, but a runner's
+ * first start (a phone found by the poll, or found again after a blip) and a relaunch after xcodebuild exited went
+ * straight on, beside another phone's xcodebuild in the middle of its own start (installing, launching the runner
+ * through CoreDevice). Now every xcodebuild start on the farm takes its turn: the next one waits until this one's
+ * WDA answers, its xcodebuild ends, or SPAWN_HOLD_MS (never longer than a restart is given).
+ */
+export const SPAWN_HOLD_MS = 30_000;
+/**
+ * A phone off the USB list for a moment (src/presence.ts: its screen capture starting re-enumerates it) isn't dead:
+ * no recover restarts it meanwhile, and a restart attempt waits up to USB_WAIT_MS for it to be back before it launches
+ * a runner (one launched at a phone that isn't there fails at once and only uses up an attempt).
+ */
+export const USB_WAIT_MS = 20_000;
 /**
  * 2026-11-21, the lane (src/lane.ts): a request the Mac stopped waiting for keeps the phone's lane until the phone
  * answers it, HOLD_MS at most (XCTest's own waits end within a minute: a still's 20 s, a main run loop's 60 s); with
@@ -598,6 +621,11 @@ export class WdaManager {
   /** 2026-11-18: restarts go one phone at a time (never both phones' runners at once): the queue, and the phones in it. */
   private restartLock: Promise<void> = Promise.resolve();
   private lockQueue: string[] = [];
+  /** 2026-11-21: the runner whose xcodebuild is starting now (one at a time across the farm), and the ones waiting. */
+  private spawnHeld: Entry | null = null;
+  private spawnQueue: { e: Entry; go: () => void }[] = [];
+  /** Phones off the USB list right now (since when), but not unplugged (src/presence.ts). */
+  private absent = new Map<string, number>();
   /** Called when a phone's orientation (or its screen size, once known) changed. */
   onOrientation?: (udid: string) => void;
   /** Whether someone is watching the phone now: its health check probes the session, not just /status. */
@@ -858,6 +886,69 @@ export class WdaManager {
     return e.mjpegPort;
   }
 
+  /**
+   * 2026-11-21: the poll's word on the phone's USB presence (src/real.ts). `false`: it's off the list for a moment
+   * (a re-enumeration, a usbmux blip), not unplugged: nothing is restarted for it meanwhile. `true` again: a runner that
+   * ended while it was away is started again now.
+   */
+  setPresent(udid: string, present: boolean): void {
+    if (!present) {
+      if (!this.absent.has(udid)) this.absent.set(udid, Date.now());
+      return;
+    }
+    const since = this.absent.get(udid);
+    if (since === undefined) return;
+    this.absent.delete(udid);
+    const e = this.entries.get(udid);
+    if (!e?.wanted) return;
+    const why = e.awaitingUsb;
+    e.awaitingUsb = undefined;
+    if (why && e.status === 'failed' && !e.restartP && !e.downWhy && !e.switching) {
+      void this.beginRestart(e, `${why}; the phone is back on USB after ${((Date.now() - since) / 1000).toFixed(1)} s`);
+    }
+  }
+
+  /** The phone is off the USB list for a moment (not unplugged). */
+  offUsb(udid: string): boolean {
+    return this.absent.has(udid);
+  }
+
+  /** Waits (at most `ms`) while the phone is off the USB list; true when it's there. */
+  private async onUsb(e: Entry, ms: number, live: () => boolean): Promise<boolean> {
+    if (!this.absent.has(e.udid)) return true;
+    this.restartLog(e, `the phone is off the USB list for a moment: waiting up to ${Math.round(ms / 1000)} s for it before launching a runner`);
+    const until = Date.now() + ms;
+    while (this.absent.has(e.udid) && live() && Date.now() < until) await sleep(100);
+    return !this.absent.has(e.udid);
+  }
+
+  /**
+   * The runner's turn to start its xcodebuild (one at a time across the farm): at once when nobody else's is starting,
+   * else once theirs is up, ended or held SPAWN_HOLD_MS. Resolves when it's this one's turn.
+   */
+  private takeSpawn(e: Entry): Promise<void> {
+    if (this.spawnHeld === null || this.spawnHeld === e) {
+      this.spawnHeld = e;
+      return Promise.resolve();
+    }
+    this.log(e, `waiting for ${this.nameOf(this.spawnHeld.udid)}'s WebDriverAgent to finish starting first (one xcodebuild start at a time)`);
+    return new Promise<void>((go) => this.spawnQueue.push({ e, go }));
+  }
+
+  /** This runner's start is over (up, ended, killed or held long enough): the next one in line goes. */
+  private releaseSpawn(e: Entry): void {
+    const turn = e.spawnTurn;
+    e.spawnTurn = undefined;
+    turn?.();
+    if (this.spawnHeld !== e) return;
+    this.spawnHeld = null;
+    const next = this.spawnQueue.shift();
+    if (next) {
+      this.spawnHeld = next.e;
+      next.go();
+    }
+  }
+
   start(udid: string): void {
     let e = this.entries.get(udid);
     if (e?.wanted) return;
@@ -908,6 +999,7 @@ export class WdaManager {
   private killProcs(e: Entry): void {
     if (e.timer) clearTimeout(e.timer);
     e.timer = undefined;
+    if (e.spawnTurn) this.releaseSpawn(e); // its start is over: the next phone's xcodebuild may start
     e.launchSeq++; // a launch waiting for an earlier teardown doesn't go ahead: whoever kills decides what's next
     const old = { procs: e.procs, sessionId: e.sessionId, agent: e.agent, wdaPort: e.wdaPort, ports: e.fwdPorts, token: e.token };
     e.procs = [];
@@ -1121,6 +1213,12 @@ export class WdaManager {
     // stays down until a recover; otherwise a restart begins (one at a time, backed off, capped).
     if (e.restartP) return void this.log(e, why);
     if (e.downWhy) return void this.log(e, `${why}; control stays down until a recover`);
+    // 2026-11-21: the phone is off the USB list for a moment (its capture starting re-enumerates it): a runner
+    // launched now would fail at once and use up an attempt. It's started again as soon as the phone is back.
+    if (this.absent.has(e.udid)) {
+      e.awaitingUsb = why;
+      return void this.log(e, `${why}; the phone is off the USB list for a moment: started again once it's back`);
+    }
     void this.beginRestart(e, why);
   }
 
@@ -1139,11 +1237,21 @@ export class WdaManager {
     e.sessionP = undefined;
     e.mjpegApplied = undefined;
     const seq = ++e.launchSeq;
-    if (!e.stopping) return this.spawnRunner(e);
+    // one xcodebuild start at a time across the farm (SPAWN_HOLD_MS): at once when nothing else is starting
+    if (!e.stopping && (this.spawnHeld === null || this.spawnHeld === e) && !this.spawnQueue.length) {
+      this.spawnHeld = e;
+      return this.spawnRunner(e);
+    }
     void (async () => {
       while (e.stopping && e.launchSeq === seq) await e.stopping.catch(() => {});
       if (!e.wanted || e.launchSeq !== seq) return;
-      if (e.runner || e.procs.length) return void this.log(e, 'a runner is already there: not starting a second one');
+      await this.takeSpawn(e);
+      if (!e.wanted || e.launchSeq !== seq || e.runner || e.procs.length) {
+        if (e.wanted && e.launchSeq === seq) this.log(e, 'a runner is already there: not starting a second one');
+        // this turn was never used: the next one in line goes (a newer launch of this phone takes it again)
+        if (this.spawnHeld === e && !e.spawnTurn) this.releaseSpawn(e);
+        return;
+      }
       this.spawnRunner(e);
     })();
   }
@@ -1203,6 +1311,17 @@ export class WdaManager {
     // the environment holds our build's token: it's handed to xcodebuild and never logged
     const xcode = spawnLogged('xcodebuild', plan.args, plan.env);
     e.runner = xcode;
+    // this runner holds the farm's xcodebuild start turn until it's up, it ends, it's killed, or SPAWN_HOLD_MS
+    {
+      const hold = Math.max(0, Math.min(this.timeouts.spawnHold ?? SPAWN_HOLD_MS, this.timeouts.restart));
+      const done = () => clearTimeout(timer);
+      const timer = setTimeout(() => {
+        if (e.spawnTurn === done) this.releaseSpawn(e);
+      }, hold);
+      timer.unref?.();
+      this.spawnHeld = e;
+      e.spawnTurn = done;
+    }
     e.procs = fwdMjpeg ? [fwdWda, fwdMjpeg, xcode] : [fwdWda, xcode];
     e.fwdPorts = plan.mjpeg ? [plan.wda.local, plan.mjpeg.local] : [plan.wda.local];
     this.log(e, plan.mjpeg ? `starting (wda :${plan.wda.local}, mjpeg :${plan.mjpeg.local})` : `starting our own build (wda :${plan.wda.local} on the Mac and the phone, token set, no MJPEG)`);
@@ -1217,6 +1336,7 @@ export class WdaManager {
     xcode.stderr?.on('data', keep);
     xcode.on('exit', (code) => {
       if (e.runner !== xcode) return; // superseded
+      if (e.spawnTurn) this.releaseSpawn(e);
       this.relaunchLater(e, `xcodebuild exited (${code})${tail.length ? `: ${tail.join(' | ')}` : ''}`);
     });
 
@@ -1233,6 +1353,7 @@ export class WdaManager {
           if (e.forkInfo) this.log(e, `our own build answers (v${e.forkInfo.lotus}${e.forkInfo.upstream ? `, ${e.forkInfo.upstream}` : ''})`);
           e.readyAt = Date.now();
           e.status = 'ready';
+          if (e.spawnTurn) this.releaseSpawn(e); // up: the next phone's xcodebuild may start
           e.restarts = 0;
           e.lastOk = Date.now();
           if (!e.restartP) {
@@ -1750,7 +1871,8 @@ export class WdaManager {
     }
     const t0 = Date.now();
     for (let i = 0; i < n; i++) {
-      if (!e.wanted || e.status !== 'ready' || e.restartP) return 'moot';
+      // off the USB list for a moment: unreachable, not dead (checked again once it's back)
+      if (!e.wanted || e.status !== 'ready' || e.restartP || this.absent.has(e.udid)) return 'moot';
       const at = Date.now();
       const r = await this.ping(e, ms);
       if (r.ok || e.lastAnswer >= at) return null;
@@ -1761,6 +1883,7 @@ export class WdaManager {
         if (e.lastAnswer >= at) return null; // something else got an answer meanwhile: WDA is there
       }
     }
+    if (this.absent.has(e.udid)) return 'moot';
     const counts = new Map<string, number>();
     for (const f of fails) counts.set(f, (counts.get(f) ?? 0) + 1);
     const how = [...counts].map(([f, c]) => (c > 1 ? `${f} x${c}` : f)).join(', ');
@@ -1779,6 +1902,8 @@ export class WdaManager {
     if (e.recovering) return e.recovering;
     const run = (async () => {
       if (e.status !== 'ready') throw this.downError(e, `WebDriverAgent is ${e.status === 'starting' ? 'still starting' : e.status}`);
+      // 2026-11-21: off the USB list for a moment (re-enumerating): unreachable is expected, nothing is restarted
+      if (this.absent.has(e.udid)) throw this.downError(e, `the phone is reconnecting over USB (${why})`);
       e.recoveries++;
       e.misses = 0;
       this.healed(e, `recovering: ${why}`);
@@ -1908,6 +2033,9 @@ export class WdaManager {
           }
           if (!live()) return;
         }
+        // a phone off the USB list for a moment: its runner is launched once it's back (not counted against it)
+        if (!(await this.onUsb(e, this.timeouts.usbWait ?? USB_WAIT_MS, live))) this.restartLog(e, 'the phone is still off the USB list: trying anyway');
+        if (!live()) return;
         e.attempt++;
         const n = e.attempt;
         const t = Date.now();
@@ -2220,6 +2348,8 @@ export class WdaManager {
   private async probeNow(e: Entry, reason: string): Promise<boolean> {
     // a restart under way, or control down after the restarts: nothing to probe, and nobody is kept waiting
     if (e.restartP || e.downWhy) return false;
+    // 2026-11-21: off the USB list for a moment (re-enumerating): nothing to probe or heal until it's back
+    if (this.absent.has(e.udid)) return false;
     if (e.status === 'failed' && e.timer) {
       clearTimeout(e.timer);
       e.timer = undefined;
@@ -2535,7 +2665,7 @@ export class WdaManager {
   /** Every ~10 s per phone: /status; recover before the owner notices. Skipped right after a successful action. */
   private healthCheck(): void {
     for (const e of this.entries.values()) {
-      if (!e.wanted || e.status !== 'ready' || e.recovering || e.restartP || e.downWhy || e.checking) continue;
+      if (!e.wanted || e.status !== 'ready' || e.recovering || e.restartP || e.downWhy || e.checking || this.absent.has(e.udid)) continue;
       if (e.sessionId && Date.now() - Math.max(e.lastOk, e.lastAnswer) < HEALTH_MS - 1000) continue; // it answered lately
       if (e.inflight > 0 || !e.lane.idle) continue; // busy with something: that request finds out for itself
       e.checking = true;

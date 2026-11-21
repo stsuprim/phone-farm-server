@@ -157,6 +157,11 @@ interface RunOptions {
   must?: boolean;
   /** Not activity and never wakes (a lock). */
   silent?: boolean;
+  /**
+   * 2026-11-21: one that takes too long is answered with its error, and the phone is NOT healed for it (a lock: the
+   * focus puts the phone that was left to sleep, and a slow lock there must never set off a restart of its WDA).
+   */
+  noHeal?: boolean;
   /** Why a slower route took it, for the meter and the ack. */
   reason?: string;
   /** How long it may take before it counts as hung (ms; default the action timeout; Infinity: no limit). */
@@ -468,7 +473,7 @@ export class Control {
         return this.run(udid, 'key-lock', tRecv, async () => {
           await power.lock(udid);
           return { via: 'wda' as InputVia };
-        }, { silent: true });
+        }, { silent: true, noHeal: true });
       }
       default: {
         const press = this.backend.pressButton?.bind(this.backend);
@@ -644,6 +649,7 @@ export class Control {
         let r = await within(inner, limit, () => {
           hung = inner.catch(() => {});
           const why = `${type} on the phone got no answer within ${Math.round(limit / 1000)} s`;
+          if (opts.noHeal) return new HttpError(504, `${why}; nothing was restarted for it`);
           void this.onHeal?.(udid, why)?.catch(() => {});
           return new HttpError(504, `${why}: the phone is being checked and healed; it may still happen, so look at the screen before trying again`);
         });
