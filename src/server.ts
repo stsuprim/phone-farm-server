@@ -257,8 +257,6 @@ function inTime<T>(p: Promise<T>, ms: number, why: string): Promise<T> {
     );
   });
 }
-/** How often a watched phone is asked how it's turned (ms). The picture's own size change asks at once. */
-const ORIENT_POLL_MS = 3000;
 /** An MJPEG hello waits this long at most for the first frame (so it can say `connectMs`), then goes without it. */
 const MJPEG_HELLO_WAIT_MS = 1500;
 
@@ -329,26 +327,20 @@ export function createServer(backend: Backend, token: string, updater?: Updater,
     }
     void pushInfo(udid);
   };
-  // a phone someone is watching is asked how it's turned every few seconds
-  const watched = new Map<string, { n: number; timer: NodeJS.Timeout }>();
+  // 2026-11-22: a phone someone is watching is no longer asked how it's turned every few seconds (WDA answers that by
+  // reading the app in front through accessibility, which a video feed leaves hanging on WDA's one main thread): the
+  // live picture's own shape says it (src/real.ts captureInfo -> wda.noteFrame). Kept as the viewers' count.
+  const watched = new Map<string, { n: number }>();
   const watch = (udid: string): (() => void) => {
     let w = watched.get(udid);
-    if (!w) {
-      const timer = setInterval(() => void backend.refreshOrientation?.(udid, ORIENT_POLL_MS - 500).catch(() => {}), ORIENT_POLL_MS);
-      timer.unref();
-      watched.set(udid, (w = { n: 0, timer }));
-      void backend.refreshOrientation?.(udid, 1000).catch(() => {});
-    }
+    if (!w) watched.set(udid, (w = { n: 0 }));
     const mine = w;
     mine.n++;
     let done = false;
     return () => {
       if (done) return;
       done = true;
-      if (--mine.n <= 0) {
-        clearInterval(mine.timer);
-        if (watched.get(udid) === mine) watched.delete(udid);
-      }
+      if (--mine.n <= 0 && watched.get(udid) === mine) watched.delete(udid);
     };
   };
 
@@ -653,8 +645,7 @@ export function createServer(backend: Backend, token: string, updater?: Updater,
         const lan = lanUrls(port);
         const tailnet = lanUrls(port, 'tailnet');
         const list = await backend.list();
-        // keep each phone's orientation roughly fresh for whoever lists them (not awaited: the list never waits on a phone)
-        for (const p of list) if (p.online && p.ready) void backend.refreshOrientation?.(p.udid, 10_000).catch(() => {});
+        // (2026-11-22: no orientation ask with the list: it's what's known, kept current by the live picture's shape)
         return send(res, 200, list.map((p) => phoneView(p, lan, tailnet)));
       }
       if (path === '/api/status' || path === '/status') {

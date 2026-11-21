@@ -2,11 +2,15 @@
 // (one static flag on the phone) 10 s and 43 s, and the owner's swipes came back "busy" and "no answer within 5s".
 // WDA runs every route but /status and the stills on the phone's one main queue, and the routes that read the APP IN
 // FRONT through accessibility (orientation, window, /wda/screen, the app's name, the tree) wait on that app, which a
-// video feed leaves unanswered for tens of seconds. The server kept sending such reads in the background (the
-// orientation poll every 3 s, the card, three with every new session, a recovery that remade a busy session), so the
-// phone never came free. Played here on a fake WDA with ONE serial queue (a request the Mac gave up on still runs on
-// it), whose app-bound routes take long while "TikTok" plays: one stuck read at most, never a stream of them; touches
-// go; a recovery keeps a busy session; the screen size is read once; WDA gets accessibilityDeadline.
+// video feed leaves unanswered for tens of seconds.
+//
+// 2026-11-22: pausing those reads wasn't enough (the card's /wda/activeAppInfo still went out each time its pause or
+// its 10-s quiet window ran out, and it hung WDA's main thread until iOS killed the runner). The server now never reads
+// the app in front on its own. Played here on a fake WDA with ONE serial queue (a request the Mac gave up on still
+// runs on it): a session, the card, the orientation, a recovery ask nothing of the app; only Lotus's own reads
+// (explicit) do, each bounded, one at a time, refused while the app doesn't answer, the owner's touches going beside
+// them; a stuck read never has WDA checked or restarted; a refused connection is said at once ("reconnecting") and a
+// dead WDA restarted in seconds, with what xcodebuild said last kept.
 process.env.INPUT_LOG = '0';
 process.env.WDA_FAST = '0'; // the XCTest tap route: one request per tap
 import assert from 'node:assert/strict';
@@ -14,12 +18,12 @@ import { ChildProcess } from 'node:child_process';
 import { EventEmitter } from 'node:events';
 import fs from 'node:fs';
 import http from 'node:http';
-import { AddressInfo } from 'node:net';
+import { AddressInfo, Socket } from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 import { PassThrough } from 'node:stream';
 import { HttpError } from '../src/types.js';
-import { ACCESSIBILITY_DEADLINE_S, appBound, INPUT_QUIET_MS, STALL_MAX_MS, STALL_MS, WdaManager } from '../src/wda.js';
+import { ACCESSIBILITY_DEADLINE_S, APP_READ_MS, appBound, INPUT_QUIET_MS, STALL_MAX_MS, STALL_MS, WdaManager } from '../src/wda.js';
 
 let passed = 0;
 const say = console.log;
@@ -35,6 +39,7 @@ const until = async (cond: () => boolean, ms = 4000) => {
 };
 
 assert.deepEqual([ACCESSIBILITY_DEADLINE_S, STALL_MS, STALL_MAX_MS, INPUT_QUIET_MS], [4, 60_000, 300_000, 10_000]);
+assert.deepEqual(APP_READ_MS, { tree: 12_000, app: 3000, orientation: 3000, element: 6000, size: 3000 });
 
 // ---- which routes read the app in front (from WDA's own handlers: FBElementCommands, FBOrientationCommands,
 // FBCustomCommands; /wda/locked is a static flag, /lotus/gesture is built at absolute coordinates) ----
@@ -43,7 +48,7 @@ assert.deepEqual([ACCESSIBILITY_DEADLINE_S, STALL_MS, STALL_MAX_MS, INPUT_QUIET_
     ['GET', '/session/S1/orientation'], ['GET', '/orientation'], ['GET', '/session/S1/window/size'], ['GET', '/wda/screen'],
     ['GET', '/session/S1/wda/screen'], ['GET', '/wda/activeAppInfo'], ['GET', '/source?format=json'], ['GET', '/session/S1/source'],
     ['GET', '/session/S1/element/active'], ['GET', '/session/S1/element/E1/attribute/value'], ['POST', '/session/S1/element/E1/clear'],
-    ['POST', '/lotus/field'], ['GET', '/session/S1/rotation'],
+    ['POST', '/lotus/field'], ['GET', '/session/S1/rotation'], ['GET', '/wda/apps/list'],
   ];
   const no: [string, string][] = [
     ['GET', '/status'], ['GET', '/session/S1'], ['GET', '/wda/locked'], ['GET', '/wda/batteryInfo'], ['GET', '/session/S1/wda/batteryInfo'],
@@ -59,16 +64,29 @@ assert.deepEqual([ACCESSIBILITY_DEADLINE_S, STALL_MS, STALL_MAX_MS, INPUT_QUIET_
 // ---- a fake WDA with one main queue ----
 type Fake = {
   port: number; current: string; made: number; hits: string[]; bodies: { path: string; body: any }[];
-  /** "TikTok" plays: an app-bound read takes `appMs` on the queue; `deadline`: WDA's deadline cuts it short with a 500. */
-  tiktok: boolean; appMs: number; deadline: boolean; probeMs: number; close(): void;
+  /** "TikTok" plays: a read of the app in front takes `appMs` on the queue (Infinity: never answered); `deadline`: WDA's deadline cuts it short with a 500. */
+  tiktok: boolean; appMs: number; deadline: boolean; probeMs: number; up: boolean; down(): void; reopen(): Promise<void>; close(): void;
 };
-const APP_RE = /^\/(session\/[^/]+\/)?(orientation|window\/size|wda\/screen|wda\/activeAppInfo|source)/;
 const fakeWda = async (): Promise<Fake> => {
+  const sockets = new Set<Socket>();
   const w: Fake = {
-    port: 0, current: '', made: 0, hits: [], bodies: [], tiktok: false, appMs: 900, deadline: false, probeMs: 0,
-    close: () => {
-      server.closeAllConnections();
+    port: 0, current: '', made: 0, hits: [], bodies: [], tiktok: false, appMs: 900, deadline: false, probeMs: 0, up: true,
+    // the runner's process gone: its port closed, every connection refused
+    down: () => {
+      w.up = false;
       server.close();
+      for (const s of sockets) s.destroy();
+    },
+    reopen: async () => {
+      if (w.up) return;
+      w.current = '';
+      await new Promise<void>((r) => server.listen(w.port, '127.0.0.1', r));
+      w.up = true;
+    },
+    close: () => {
+      w.up = false;
+      server.close();
+      for (const s of sockets) s.destroy();
     },
   };
   let queue: Promise<void> = Promise.resolve(); // WDA's main queue: one route at a time, whoever stopped waiting
@@ -88,23 +106,27 @@ const fakeWda = async (): Promise<Fake> => {
       // /status answers off the main queue
       if (p === '/status') return send(200, { value: { ready: true }, sessionId: w.current || null });
       const work = (ms: number, status: number, v: unknown) => {
-        queue = queue.then(() => new Promise<void>((done) => setTimeout(() => {
-          send(status, v);
-          done();
-        }, ms)));
+        queue = queue.then(() => new Promise<void>((done) => {
+          if (!Number.isFinite(ms)) return; // never answered: the queue stays stuck (until the test lets it go)
+          setTimeout(() => {
+            send(status, v);
+            done();
+          }, ms);
+        }));
       };
       if (p === '/session' && req.method === 'POST') {
         w.current = `S${++w.made}`;
         return work(0, 200, { sessionId: w.current, value: { sessionId: w.current } });
       }
-      if (APP_RE.test(p.split('?')[0]!) && w.tiktok) {
+      if (appBound(req.method ?? 'GET', p) && w.tiktok) {
         if (w.deadline) return work(20, 500, { value: { error: 'unknown error', message: 'The application with process identifier 812 did not confirm its main run loop is responsive within 4.0 second(s) and is likely in an unresponsive state.' } });
-        return work(w.appMs, 200, { value: p.includes('orientation') ? 'PORTRAIT' : p.includes('activeAppInfo') ? { bundleId: 'com.zhiliaoapp.musically', name: 'TikTok' } : p.includes('screen') ? { scale: 3, screenSize: { width: 428, height: 926 } } : { width: 428, height: 926 } });
+        return work(w.appMs, 200, { value: p.includes('orientation') ? 'PORTRAIT' : p.includes('activeAppInfo') ? { bundleId: 'com.zhiliaoapp.musically', name: 'TikTok' } : p.includes('screen') ? { scale: 3, screenSize: { width: 428, height: 926 } } : { type: 'Application' } });
       }
       if (p === '/wda/screen') return work(2, 200, { value: { scale: 3, screenSize: { width: 428, height: 926 } } });
-      if (p === '/wda/activeAppInfo') return work(2, 200, { value: { bundleId: 'com.zhiliaoapp.musically', name: 'TikTok' } });
+      if (p === '/wda/activeAppInfo') return work(2, 200, { value: { bundleId: 'com.apple.springboard', name: 'Home Screen' } });
       if (p.startsWith('/source')) return work(2, 200, { value: { type: 'Application' } });
       if (p === '/wda/locked') return work(1, 200, { value: false });
+      if (p === '/wda/homescreen') return work(1, 200, { value: null });
       const m = /^\/session\/([^/]+)(\/.*)?$/.exec(p);
       if (!m) return work(1, 404, { value: { error: 'unknown command', message: p } });
       if (m[1] !== w.current) return work(1, 404, { value: { error: 'invalid session id', message: 'Session does not exist' } });
@@ -116,13 +138,26 @@ const fakeWda = async (): Promise<Fake> => {
       work(1, 404, { value: { error: 'unknown command', message: p } });
     });
   });
+  server.on('connection', (s) => {
+    sockets.add(s);
+    s.on('close', () => sockets.delete(s));
+  });
   await new Promise<void>((r) => server.listen(0, '127.0.0.1', r));
   w.port = (server.address() as AddressInfo).port;
   return w;
 };
-const fakeSpawn = (() => {
+let w!: Fake;
+const xcodes: (ChildProcess & EventEmitter)[] = [];
+const fakeSpawn = ((cmd: string) => {
   const p = new EventEmitter() as ChildProcess & EventEmitter;
-  Object.assign(p, { stdout: new PassThrough(), stderr: new PassThrough(), kill: () => true });
+  const out = new PassThrough();
+  Object.assign(p, { stdout: out, stderr: new PassThrough(), kill: () => true });
+  if (cmd === 'xcodebuild') {
+    xcodes.push(p);
+    // XCTest's account of the runner it ran, as xcodebuild prints it
+    setTimeout(() => out.write('Test Suite \'All tests\' started\nt =     0.00s Start Test\n'), 5).unref();
+    if (w && !w.up) setTimeout(() => void w.reopen(), 100).unref(); // a new runner: WDA answers again
+  }
   return p;
 }) as unknown as typeof import('node:child_process').spawn;
 
@@ -132,133 +167,200 @@ const fakeSpawn = (() => {
   const origLog = console.log;
   const logs: string[] = [];
   console.log = (...a: unknown[]) => void logs.push(a.join(' '));
-  const w = await fakeWda();
+  w = await fakeWda();
   const cfg = { wdaBasePort: w.port, mjpegBasePort: w.port + 1, wdaProject: '/x', wdaDerivedData: '/y' } as unknown as import('../src/config.js').Config;
-  // quick clocks: an orientation or size read gets 200 ms, an app that doesn't answer pauses background reads 3 s
-  // (doubling up to 8 s), none for 300 ms after a touch; a touch waits 500 ms at most for its turn
+  // quick clocks: an explicit read of the app gets 200 ms; an app that doesn't answer pauses reads of it 3 s (doubling
+  // up to 8 s); a request never answered holds the lane 1.5 s; /status 100 ms, asked 3 times 400 ms apart
   const m = new WdaManager(cfg, () => 'iPhone-1', fakeSpawn, {
-    input: 300, launch: 1000, probe: 150, restart: 3000, status: 100, probes: 3, probeEvery: 100, backoff: [50, 100, 200],
-    sessionWait: 1000, recoverWait: 3000, hold: 3000, laneWait: 500, orient: 200, appRead: 200, stall: 3000, stallMax: 8000, inputQuiet: 300,
+    input: 300, launch: 1000, probe: 150, restart: 3000, status: 100, probes: 3, probeEvery: 400, backoff: [50, 100, 200],
+    sessionWait: 1000, recoverWait: 3000, hold: 1500, laneWait: 500, orient: 200, appRead: 200, stall: 3000, stallMax: 8000, inputQuiet: 300,
   });
   m.modelOf = () => 'iPhone14,8';
-  const appHits = () => w.hits.filter((h) => APP_RE.test(h.split(' ')[1]!.split('?')[0]!)).length;
+  const appHits = () => w.hits.filter((h) => appBound(h.split(' ')[0]!, h.split(' ')[1]!)).length;
   try {
     m.start('U1');
     assert.ok(await until(() => m.state('U1') === 'ready' && m.screen('U1') !== null), 'ready');
 
-    // 1. WDA is told to bound a read of an app that doesn't answer: in the session's capabilities and its settings
+    // 1. WDA is told to bound a read of an app that doesn't answer: in the session's capabilities and its settings;
+    //    and making the session asked nothing of the app in front: the size is the model's, the phone upright
     const caps = w.bodies.find((b) => b.path === '/session')!.body;
     assert.equal(caps.capabilities.alwaysMatch.accessibilityDeadline, ACCESSIBILITY_DEADLINE_S);
     assert.equal(caps.desiredCapabilities.accessibilityDeadline, ACCESSIBILITY_DEADLINE_S);
     const settings = w.bodies.filter((b) => b.path.endsWith('/appium/settings')).pop()!.body.settings;
     assert.equal(settings.accessibilityDeadline, ACCESSIBILITY_DEADLINE_S);
     assert.deepEqual([settings.waitForIdleTimeout, settings.animationCoolOffTimeout], [0, 0]);
-    // the screen's own size, read once; the app's window never asked (the screen answered)
+    assert.equal(appHits(), 0, 'no read of the app in front with a new session');
     assert.deepEqual(m.screen('U1'), { width: 428, height: 926, scale: 3 });
-    assert.equal(w.hits.filter((h) => h === 'GET /wda/screen').length, 1);
-    assert.equal(w.hits.filter((h) => h.endsWith('/window/size')).length, 0, 'no window/size: the screen said its size');
-    ok('WDA gets accessibilityDeadline (capability and setting); the screen size comes from the screen, once');
+    assert.equal(m.orientation('U1'), 'portrait');
+    ok('WDA gets accessibilityDeadline (capability and setting); a session reads nothing of the app in front (the size is the model\'s)');
 
-    // 2. TikTok's feed plays. The card caught its name before; the orientation poll asks once, gets no answer in time,
-    //    and from then on no background read of the app is sent at all (it used to be one every 3 s, each holding the
-    //    phone up to a minute). A touch that comes while that one read is still on the phone hears why it's busy
-    assert.equal(((await m.peek('U1', '/wda/activeAppInfo')) as any)?.bundleId, 'com.zhiliaoapp.musically');
-    await sleep(650); // no touch lately, and the orientation older than the poll's 600 ms
+    // 2. TikTok's feed plays. The card, the list's orientation, a live picture, all of them, all the time: not one
+    //    read of the app reaches the phone (they get what's known), and every touch goes
     w.tiktok = true;
-    const before = appHits();
-    assert.equal(await m.refreshOrientation('U1', 600), 'portrait', 'what was known');
-    assert.equal(appHits() - before, 1);
-    const stall = m.linkHealth('U1')!.appStall;
-    assert.ok(stall && /no answer to GET \/session\/:id\/orientation within 0\.2 s/.test(stall.why ?? ''), JSON.stringify(stall));
-    assert.ok(logs.some((l) => /the app in front isn't answering accessibility reads .*no background reads of it for 3 s/.test(l)));
-    await assert.rejects(
-      m.tap('U1', 10, 10),
-      (err: HttpError) => err.status === 503 && /^iPhone-1 is busy: its WebDriverAgent is still working on an earlier request \(GET \/session\/:id\/orientation, [\d.]+ s so far, still waiting for the phone to answer it; it is reading the app in front, which isn't answering accessibility reads right now/.test(err.message),
-    );
-    assert.ok(await until(() => m.linkHealth('U1')!.lane.inFlight === null, 2000), 'the stuck read ends on the phone');
-
-    // ...then a busy minute of polls, the card, fresh asks (a changed picture, a UI read) and the owner's swipes: the
-    // phone gets the swipes, and not one more read of the app
-    const polled = appHits();
     let taps = 0;
     const failed: string[] = [];
     const t0 = Date.now();
     while (Date.now() - t0 < 1000) {
-      void m.refreshOrientation('U1', 600);
-      void m.refreshOrientation('U1', 0);
-      assert.equal(((await m.peek('U1', '/wda/activeAppInfo')) as any)?.bundleId, 'com.zhiliaoapp.musically', 'the card keeps the app it knew');
-      assert.equal(await m.activeApp('U1'), null, 'an agent is told "unknown", never a guess');
+      assert.equal(await m.peek('U1', '/wda/activeAppInfo'), null, 'nothing known of the app: null, never asked');
+      assert.equal(await m.refreshOrientation('U1', 0), 'portrait');
+      assert.equal(await m.refreshOrientation('U1', 600), 'portrait');
       await m.tap('U1', 20, 20).then(() => taps++, (err: Error) => failed.push(err.message));
-      await sleep(60);
+      await sleep(40);
     }
     assert.deepEqual(failed, [], 'every touch went');
     assert.ok(taps >= 8, `${taps} touches`);
-    assert.equal(appHits(), polled, 'no read of the app in front while it does not answer');
-    assert.equal(m.orientation('U1'), 'portrait');
-    ok('an app that does not answer accessibility: one stuck read at most (a touch meanwhile hears why); then no background read of it, and every touch goes');
+    assert.equal(appHits(), 0, 'not one read of the app in front');
+    // the picture says how it's turned: wide is landscape (the side last known, else landscape-left), tall portrait
+    const turns: string[] = [];
+    m.onOrientation = (u) => turns.push(m.orientation(u)!);
+    m.noteFrame('U1', 1388, 642);
+    assert.equal(m.orientation('U1'), 'landscape-left');
+    assert.deepEqual(m.screen('U1'), { width: 926, height: 428, scale: 3 }, 'the size turned with it');
+    m.noteFrame('U1', 642, 1388);
+    assert.deepEqual(turns, ['landscape-left', 'portrait']);
+    assert.equal(m.linkHealth('U1')!.orientationFrom, 'picture');
+    assert.equal(appHits(), 0);
+    assert.equal(m.linkHealth('U1')!.appReads.sent, 0);
+    ok('an app that never answers accessibility: the card, polls and the picture ask nothing of it; every touch goes');
 
-    // 3. a recovery asked while the phone's queue is busy: its check of the session isn't answered in time, which is
-    //    a busy phone, not a session that's gone (/status names ours): the session is kept, no new one (it used to be
-    //    remade, with three more reads of the app behind the same stuck work)
+    // 3. Lotus reads the screen itself (phones_read): its read of the tree goes, bounded; the owner's touch meanwhile
+    //    is sent at once beside it (it used to wait its turn behind it in the lane and be dropped "busy"; on the phone
+    //    it then runs as soon as WDA's main thread is free); the read isn't answered in time: the app doesn't answer
+    //    accessibility, so its other reads (the app's name, the orientation) are refused at once, unsent, with why
+    w.appMs = 700;
+    const hits0 = appHits();
+    const reading = m.source('U1').then(() => 'answered', (err: Error) => err.message);
+    await sleep(30);
+    const sentBefore = w.hits.filter((h) => h.endsWith('/wda/tap')).length;
+    const touched = m.tap('U1', 30, 30).catch((err: Error) => err.message);
+    assert.ok(await until(() => w.hits.filter((h) => h.endsWith('/wda/tap')).length === sentBefore + 1, 150), 'the touch reached the phone at once, beside the read');
+    assert.equal(m.linkHealth('U1')!.lane.beside, 'POST /session/:id/wda/tap');
+    await touched;
+    assert.match(await reading, /did not answer in time/);
+    assert.equal(appHits(), hits0 + 1, 'one read sent');
+    const stall = m.linkHealth('U1')!.appStall;
+    assert.ok(stall && /no answer to GET \/source within 0\.2 s/.test(stall.why ?? ''), JSON.stringify(stall));
+    assert.equal(await m.activeApp('U1'), null, 'the app\'s name: unknown, never a guess');
+    assert.equal(await m.refreshOrientation('U1', 0, true), 'portrait', 'the orientation: as known');
+    await assert.rejects(m.source('U1'), (err: HttpError) => err.status === 503 && /^iPhone-1 can't read the app in front right now: the app in front isn't answering accessibility reads/.test(err.message));
+    assert.equal(appHits(), hits0 + 1, 'nothing more sent while it does not answer');
+    assert.equal(m.linkHealth('U1')!.appReads.sent, 1);
+    ok("Lotus's own read goes, bounded; the owner's touch goes beside it; while the app doesn't answer, its reads are refused unsent");
+
+    // 4. a read the phone never answers at all (held past its hold): WDA is not checked, nothing restarted (/status
+    //    answers: WDA is fine, the app in front isn't), and the touches went all along
+    const runners = xcodes.length;
     const sessions = w.made;
-    w.probeMs = 600;
-    assert.equal(await m.recoverNow('U1'), 'ready');
-    assert.equal(w.made, sessions, 'the busy session was kept');
-    w.probeMs = 0;
-    await sleep(700); // (the check the Mac gave up on still runs on the phone's queue)
-    ok('a recovery keeps a session that is only busy (/status still names it)');
+    (m as any).entries.get('U1').stallUntil = 0; // its pause is over: Lotus reads again
+    w.appMs = Infinity;
+    await assert.rejects(m.activeApp('U1').then((v) => (v === null ? Promise.reject(new Error('null')) : v)));
+    const t1 = Date.now();
+    await m.tap('U1', 40, 40).catch(() => {}); // (the fake's one queue is stuck: this touch waits on the phone)
+    assert.ok(await until(() => m.linkHealth('U1')!.appReads.stuck === 1, 4000), 'the read was given up on after its hold');
+    assert.ok(logs.some((l) => /not even late: the app in front doesn't answer accessibility; nothing is checked or restarted for it/.test(l)));
+    assert.deepEqual([xcodes.length, w.made, m.linkHealth('U1')!.recoveries, m.state('U1')], [runners, sessions, 0, 'ready'], 'no check, no restart, the session kept');
+    assert.ok(Date.now() - t1 < 4000);
+    ok('a read of the app in front never answered: nothing is checked or restarted for it (WDA answers /status)');
+  } finally {
+    console.log = origLog;
+    await m.shutdown(500);
+    w.close();
+    process.chdir(prevCwd);
+  }
+}
 
-    // 4. Home (another app in front): the stall was TikTok's; the app is asked again
+// ---- a fresh phone for the rest (the stuck queue above stays stuck: that's the phone's own business) ----
+{
+  const prevCwd = process.cwd();
+  process.chdir(fs.mkdtempSync(path.join(os.tmpdir(), 'pf-stall2-')));
+  const origLog = console.log;
+  const logs: string[] = [];
+  console.log = (...a: unknown[]) => void logs.push(a.join(' '));
+  w = await fakeWda();
+  xcodes.length = 0;
+  const cfg = { wdaBasePort: w.port, mjpegBasePort: w.port + 1, wdaProject: '/x', wdaDerivedData: '/y' } as unknown as import('../src/config.js').Config;
+  const m = new WdaManager(cfg, () => 'iPhone-1', fakeSpawn, {
+    input: 300, launch: 1000, probe: 150, restart: 3000, status: 100, probes: 3, probeEvery: 400, backoff: [50, 100, 200],
+    sessionWait: 1000, recoverWait: 3000, hold: 1500, laneWait: 500, orient: 200, appRead: 200, stall: 3000, stallMax: 8000, inputQuiet: 300,
+  });
+  m.modelOf = () => 'iPhone14,8';
+  try {
+    m.start('U1');
+    assert.ok(await until(() => m.state('U1') === 'ready'), 'ready');
+
+    // 5. TikTok stalls a read; Home: another app in front, the stall was TikTok's; Lotus's next read goes and says the
+    //    Home Screen; the card knows it was Home (from the press itself), and that a touch came after it
+    w.tiktok = true;
+    w.appMs = 600;
+    assert.equal(await m.activeApp('U1'), null);
+    assert.ok(m.linkHealth('U1')!.appStall, 'stalled');
+    await until(() => !(m as any).entries.get('U1').appInFlight, 2000);
+    w.tiktok = false;
     await m.pressButton('U1', 'home');
     assert.equal(m.linkHealth('U1')!.appStall, null, 'Home clears it');
-    w.tiktok = false;
-    await sleep(350);
-    const n = appHits();
-    assert.equal(await m.refreshOrientation('U1', 0), 'portrait');
-    assert.equal(appHits(), n + 1, 'asked again once the app changed');
-    ok('Home or a launch: the stall was the old app\'s, the new one is asked');
+    assert.deepEqual([m.knownApp('U1')?.from, (m.knownApp('U1')?.info as any)?.bundleId, m.knownApp('U1')?.changedSince], ['home', 'com.apple.springboard', false]);
+    await m.tap('U1', 5, 5);
+    assert.equal(m.knownApp('U1')?.changedSince, true, 'a touch since: it may have changed');
+    assert.equal(await m.activeApp('U1'), 'com.apple.springboard', "Lotus's read goes again");
+    assert.equal(m.knownApp('U1')?.from, 'read');
+    ok("Home clears the stall; the card knows Home from the press itself; Lotus's next read goes");
 
-    // 5. WDA's deadline cuts a read short (a 500 naming an unresponsive app): the same pause; it doubles while it
+    // 6. WDA's deadline cuts a read short (a 500 naming an unresponsive app): the same pause; it doubles while it
     //    keeps happening, and the first quick answer ends it
     w.tiktok = true;
     w.deadline = true;
-    await sleep(350);
-    assert.equal(await m.refreshOrientation('U1', 0), 'portrait');
+    assert.equal(await m.activeApp('U1'), null);
     let s = m.linkHealth('U1')!.appStall!;
-    assert.ok(s && /4 s deadline cut GET \/session\/:id\/orientation short/.test(s.why ?? ''), JSON.stringify(s));
+    assert.ok(s && /4 s deadline cut GET \/wda\/activeAppInfo short/.test(s.why ?? ''), JSON.stringify(s));
     assert.ok(s.until - Date.now() <= 3000);
     (m as any).entries.get('U1').stallUntil = 0; // its pause is over: asked again, and still no answer
-    assert.equal(await m.refreshOrientation('U1', 0), 'portrait');
+    assert.equal(await m.activeApp('U1'), null);
     s = m.linkHealth('U1')!.appStall!;
     assert.ok(s && s.until - Date.now() > 3000 && s.until - Date.now() <= 6000, 'the pause doubled');
     (m as any).entries.get('U1').stallUntil = 0;
     w.tiktok = false;
     w.deadline = false;
-    assert.equal(await m.refreshOrientation('U1', 0), 'portrait');
+    assert.equal(await m.activeApp('U1'), 'com.apple.springboard');
     assert.equal(m.linkHealth('U1')!.appStall, null, 'answered quickly: cleared');
     assert.ok(logs.some((l) => /the app in front answers accessibility reads again/.test(l)));
-    ok('WDA\'s own deadline (a 500) pauses the background reads too; the pause doubles, a quick answer ends it');
+    ok("WDA's own deadline (a 500) pauses Lotus's reads too; the pause doubles, a quick answer ends it");
 
-    // 6. right after a touch the phone is being used: the poll waits (a fresh ask still goes)
-    await sleep(650); // the orientation is older than the poll's 600 ms
-    await m.tap('U1', 5, 5);
-    const k = appHits();
-    assert.equal(await m.refreshOrientation('U1', 600), 'portrait');
-    assert.equal(appHits(), k, 'no poll right after a touch');
-    await sleep(650);
-    await m.refreshOrientation('U1', 600);
-    assert.equal(appHits(), k + 1, 'polled again once the phone was left alone');
-    ok('no background read of the app in front right after a touch');
+    // 7. a recovery asked while the phone's queue is busy: its check of the session isn't answered in time, which is
+    //    a busy phone, not a session that's gone (/status names ours): the session is kept, nothing of the app read
+    const sessions = w.made;
+    const reads = w.hits.filter((h) => appBound(h.split(' ')[0]!, h.split(' ')[1]!)).length;
+    w.probeMs = 600;
+    assert.equal(await m.recoverNow('U1'), 'ready');
+    assert.equal(w.made, sessions, 'the busy session was kept');
+    assert.equal(w.hits.filter((h) => appBound(h.split(' ')[0]!, h.split(' ')[1]!)).length, reads, 'and nothing of the app read');
+    w.probeMs = 0;
+    await sleep(700);
+    ok('a recovery keeps a session that is only busy, and reads nothing of the app in front');
 
-    // 7. a new session on the same phone: the size it read is kept (not asked again); the orientation is asked
-    const screens = w.hits.filter((h) => h === 'GET /wda/screen').length;
-    w.current = 'someone-else';
-    assert.equal(await m.probe('U1', 'watch'), true);
-    assert.equal(w.made, sessions + 1, 'a new session');
-    assert.equal(w.hits.filter((h) => h === 'GET /wda/screen').length, screens, 'the size is kept');
-    assert.ok(w.hits.some((h) => h === `GET /session/S${w.made}/orientation`));
-    assert.deepEqual(m.screen('U1'), { width: 428, height: 926, scale: 3 });
-    ok('the screen size is read once per phone and kept across sessions');
+    // 8. WDA's process gone (its port closed: every connection refused or reset, iPhone-1's ECONNRESET). The touch that
+    //    hits it hears "reconnecting" at once, the touches after it too (never queued behind the check and failed 10 s
+    //    later); /status is asked 3 times ~1 s apart, then the runner is restarted; touches during the restart hear
+    //    "restarting" at once; what xcodebuild said last is kept with how the runner ended
+    const runners = xcodes.length;
+    w.down();
+    const t2 = Date.now();
+    await assert.rejects(m.tap('U1', 10, 10), (err: HttpError) => err.status === 503 && (err.extra?.state === 'recovering' || err.extra?.state === 'restarting'));
+    assert.ok(Date.now() - t2 < 2500, `the failed touch was answered at once (${Date.now() - t2} ms)`);
+    const t3 = Date.now();
+    await assert.rejects(m.tap('U1', 10, 10), (err: HttpError) => err.status === 503 && /control link is (reconnecting|restarting)/.test(err.message));
+    assert.ok(Date.now() - t3 < 100, `the next touch too (${Date.now() - t3} ms), never queued behind the check`);
+    assert.ok(await until(() => xcodes.length > runners, 5000), 'the dead runner restarted');
+    assert.ok(Date.now() - t2 < 4000, `restarted ${Date.now() - t2} ms after WDA went (it took 12 s of /status asks)`);
+    assert.ok(await until(() => m.state('U1') === 'ready', 5000), 'and ready again');
+    await m.tap('U1', 10, 10);
+    const end = m.linkHealth('U1')!.lastRunnerEnd!;
+    assert.ok(end && /unreachable \((ECONNREFUSED|ECONNRESET)\); then \/status asked 3 times/.test(end.why), JSON.stringify(end));
+    assert.ok(end.xcodebuild.some((l) => /Start Test/.test(l)), 'what xcodebuild said last is kept');
+    assert.ok(logs.some((l) => /\[wda-restart\] U1 the runner ended or was given up on/.test(l)));
+    ok('WDA gone: every touch hears "reconnecting"/"restarting" at once, the runner is restarted in seconds, its last words kept');
+  } catch (err) {
+    origLog(logs.slice(-40).join('\n'));
+    throw err;
   } finally {
     console.log = origLog;
     await m.shutdown(500);

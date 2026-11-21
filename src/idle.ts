@@ -30,6 +30,8 @@ interface Entry extends PowerState {
 export const AWAKE_FOR_MS = 25_000;
 /** An input waits this long at most to hear whether the phone is locked. */
 const LOCKED_ASK_MS = 4000;
+/** A wake for a live view that has no picture waits this long at most for the phone's control link to come up. */
+export const PICTURE_WAKE_WAIT_MS = 150_000;
 
 export interface IdleOptions {
   now?: () => number;
@@ -211,6 +213,12 @@ export class IdleLock {
    */
   async wakeForPicture(udid: string, force = true): Promise<string | null> {
     if (!this.supported) return 'this server cannot wake phones';
+    // 2026-11-22 (iPhone-2 stuck on "connecting" after a replug): a phone just plugged in is locked, and its USB
+    // screen capture shows nothing until it's unlocked once; the unlock needs its control link, which takes a minute
+    // or two to start after a replug. The wake gave up after 15 s ("restarting, so its screen can't be woken yet"),
+    // and nothing woke it when the link came up. Now it waits for the link (outside the phone's lock/wake turn, so
+    // nothing else waits behind it) and wakes the phone as soon as it can; the viewer's next try gets the picture.
+    if (this.backend.whenControlReady) await this.backend.whenControlReady(udid, PICTURE_WAKE_WAIT_MS).catch(() => false);
     try {
       const st = await this.wake(udid, false, force);
       if (st.locked) return st.error ?? 'the phone stayed locked (a passcode is set: enter it on the phone once, or remove it)';

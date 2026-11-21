@@ -101,6 +101,9 @@ export class PhonecapHost {
   // a capture held open after its last lane (the phone's volume going back down while the sound is still on the Mac)
   private holds = 0;
   private closing?: NodeJS.Timeout;
+  /** 2026-11-22: when the capture last started and ended (ms since the epoch; null: never), for the record of how a WDA runner ended. */
+  startedAt: number | null = null;
+  stoppedAt: number | null = null;
 
   constructor(
     private bin: string,
@@ -224,6 +227,7 @@ export class PhonecapHost {
     const sound = !!this.sink && Date.now() >= this.noAudioUntil;
     const p = this.spawnFn(this.bin, [...this.args, ...helperArgs(want), ...(sound ? ['--audio'] : [])]);
     this.proc = p;
+    this.startedAt = Date.now();
     this.withAudio = sound;
     this.gotPicture = false;
     if (this.rotation) this.write(`rotate ${this.rotation}`);
@@ -270,6 +274,7 @@ export class PhonecapHost {
   private died(p: ChildProcess, why: string): void {
     if (this.proc !== p) return;
     this.proc = undefined;
+    this.stoppedAt = Date.now();
     if (this.closing) (clearTimeout(this.closing), (this.closing = undefined));
     // a capture that dies before any picture with sound on, twice in a row: the next ones go without sound for a while
     if (this.withAudio && !this.gotPicture) {
@@ -300,6 +305,7 @@ export class PhonecapHost {
     const p = this.proc;
     this.proc = undefined;
     if (!p) return;
+    this.stoppedAt = Date.now();
     this.sink?.ended();
     if (p.stdin?.writable) p.stdin.write('quit\n');
     p.kill('SIGTERM');

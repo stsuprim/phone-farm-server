@@ -377,15 +377,19 @@ function fakeSidecar(answer: (m: Record<string, unknown>, out: PassThrough) => v
     assert.equal(m.fastStatus('U1'), 'no');
     assert.equal(count('/session/S1/wda/tap'), 5);
 
-    // the phone turns: WDA is asked, the screen is upright (wide), and the old route takes the touch (it turns it itself)
+    // the phone turns: Lotus's own read asks WDA (2026-11-22: nobody else does), the screen is upright (wide), and the
+    // old route takes the touch (it turns it itself)
     mode = 'patched';
     (m as any).entries.get('U1').fast = 'unknown';
     assert.deepEqual([m.orientation('U1'), m.screen('U1')], ['portrait', { width: 390, height: 844, scale: 3 }]);
     const turns: string[] = [];
     m.onOrientation = (u) => turns.push(`${u} ${m.orientation(u)}`);
     orient = 'LANDSCAPE';
-    assert.equal(await m.refreshOrientation('U1', 60_000), 'portrait', 'asked a moment ago: not again yet');
-    assert.equal(await m.refreshOrientation('U1', 0), 'landscape-left');
+    assert.equal(await m.refreshOrientation('U1', 0), 'portrait', "not asked: only Lotus's own explicit read asks the phone");
+    assert.equal(count('/session/S1/orientation'), 0, 'the app in front was never asked how it is turned');
+    assert.equal(await m.refreshOrientation('U1', 0, true), 'landscape-left');
+    assert.equal(await m.refreshOrientation('U1', 60_000, true), 'landscape-left', 'asked a moment ago: not again yet');
+    assert.equal(count('/session/S1/orientation'), 1);
     assert.deepEqual(m.screen('U1'), { width: 844, height: 390, scale: 3 });
     assert.deepEqual(turns, ['U1 landscape-left']);
     const before = count('/wda/lotus/touch');
@@ -397,9 +401,9 @@ function fakeSidecar(answer: (m: Record<string, unknown>, out: PassThrough) => v
     assert.deepEqual(hits.filter((h) => h.path === '/wda/lotus/touch').pop()!.body, { points: [[389, 1, 0]], hold: 50, orientation: 1 });
     delete process.env.WDA_FAST_LANDSCAPE;
     orient = 'UIA_DEVICE_ORIENTATION_LANDSCAPERIGHT';
-    assert.equal(await m.refreshOrientation('U1', 0), 'landscape-right');
+    assert.equal(await m.refreshOrientation('U1', 0, true), 'landscape-right');
     orient = 'PORTRAIT';
-    assert.equal(await m.refreshOrientation('U1', 0), 'portrait');
+    assert.equal(await m.refreshOrientation('U1', 0, true), 'portrait');
     assert.deepEqual(m.screen('U1'), { width: 390, height: 844, scale: 3 });
     assert.equal(turns.length, 3);
     assert.equal(hits.filter((h) => h.path.endsWith('/appium/settings')).pop()!.body.settings.mjpegFixOrientation, true, 'MJPEG frames are turned upright by WDA');

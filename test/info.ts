@@ -277,6 +277,7 @@ const KEYS = ['battery', 'temperatureC', 'app', 'uptimeSec', 'model', 'ios', 'bo
       if (p.endsWith('/appium/settings')) return json(200, { value: {} });
       if (p === '/wda/activeAppInfo') return json(200, { value: { bundleId: 'com.burbn.instagram', name: 'Instagram', pid: 77 } });
       if (p === '/wda/device/info') return json(200, { value: { thermalState: 2, name: 'iPhone' } });
+      if (p === '/wda/homescreen') return json(200, { value: null });
       if (p === '/session/S1/wda/batteryInfo') return json(200, { value: { level: 0.42, state: 2 } });
       json(404, { value: { error: 'unknown command', message: p } });
     });
@@ -298,14 +299,25 @@ const KEYS = ['battery', 'temperatureC', 'app', 'uptimeSec', 'model', 'ios', 'bo
     m.start('U1');
     for (let i = 0; i < 40 && m.state('U1') !== 'ready'; i++) await sleep(50);
     assert.equal(m.state('U1'), 'ready');
+    // 2026-11-22: the card never asks the app in front (an accessibility read): it says what's known, and nothing
+    // is known before Lotus's own read; after it, that app; after a Home press, the Home Screen
+    assert.equal(await m.peek('U1', '/wda/activeAppInfo'), null, 'nothing known yet: null, and the phone not asked');
+    assert.equal(hits.filter((h) => h === 'GET /wda/activeAppInfo').length, 0, 'the card never reads the app in front');
+    assert.equal(await m.activeApp('U1'), 'com.burbn.instagram', "Lotus's own read asks");
+    assert.equal(hits.filter((h) => h === 'GET /wda/activeAppInfo').length, 1);
     assert.deepEqual(parseActiveApp(await m.peek('U1', '/wda/activeAppInfo')), { bundleId: 'com.burbn.instagram', name: 'Instagram' });
+    assert.equal(hits.filter((h) => h === 'GET /wda/activeAppInfo').length, 1, 'the card says what Lotus read, without asking again');
+    assert.deepEqual(m.knownApp('U1')?.from, 'read');
     assert.equal(parseDeviceInfo(await m.peek('U1', '/wda/device/info'), Date.now()).thermal, 'serious');
     assert.deepEqual(parseWdaBattery(await m.peek('U1', '/wda/batteryInfo', 2500, true)), { level: 0.42, charging: true, temperatureC: null });
     assert.equal(await m.peek('U1', '/wda/nothing'), null, 'an endpoint this WDA lacks: null');
+    await m.callNoSession('U1', 'POST', '/wda/homescreen', {});
+    assert.deepEqual([m.knownApp('U1')?.from, (m.knownApp('U1')?.info as any)?.bundleId], ['home', 'com.apple.springboard']);
+    assert.deepEqual(parseActiveApp(await m.peek('U1', '/wda/activeAppInfo')), { bundleId: 'com.apple.springboard', name: 'Home Screen' });
     // WDA answering 500: null, and no recovery (a card's read must never restart the runner or remake the session)
     up = false;
     const sessions = hits.filter((h) => h === 'POST /session').length;
-    assert.equal(await m.peek('U1', '/wda/activeAppInfo'), null);
+    assert.equal(await m.peek('U1', '/wda/device/info'), null);
     await sleep(30);
     assert.equal(m.state('U1'), 'ready');
     assert.equal(hits.filter((h) => h === 'POST /session').length, sessions, 'no new session');
@@ -317,7 +329,7 @@ const KEYS = ['battery', 'temperatureC', 'app', 'uptimeSec', 'model', 'ios', 'bo
     wda.close();
     process.chdir(prevCwd);
   }
-  ok('WDA quiet read: the app in front, the thermal state and the battery when WDA is up; null (never a recovery) otherwise');
+  ok('WDA quiet read: the thermal state and the battery when WDA is up; the app in front as last known (never asked); null (never a recovery) otherwise');
 }
 
 console.log(`\nall ${passed} info checks passed`);

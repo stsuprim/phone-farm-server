@@ -61,8 +61,12 @@ export interface DeviceInfo {
   battery: { level: number | null; percent?: number | null; charging: boolean | null };
   /** The battery's temperature in degrees Celsius (IORegistry AppleSmartBattery Temperature / 100). */
   temperatureC: number | null;
-  /** The app in front. */
-  app: { bundleId: string | null; name: string | null };
+  /**
+   * The app in front. 2026-11-22: as last known, never asked for the card (an accessibility read of that app): when
+   * (`asOf`), how (`from`: Lotus's own read, the server's launch, a Home press), and `maybeChanged` when the phone had
+   * input since.
+   */
+  app: { bundleId: string | null; name: string | null; asOf?: number; from?: 'read' | 'launch' | 'home'; maybeChanged?: boolean };
   /** Seconds since the phone booted, and when that was (ms since the epoch); null when the phone doesn't say. */
   uptimeSec: number | null;
   /** The product type ("iPhone14,5") and the iOS version ("18.1"). */
@@ -251,8 +255,13 @@ export interface Backend {
   screen(udid: string): ScreenInfo | null;
   /** How the phone is turned now (cached); null when not known. */
   orientation?(udid: string): Orientation | null;
-  /** Ask the phone how it's turned unless that was asked within `maxAgeMs`; resolves to what's known then. */
-  refreshOrientation?(udid: string, maxAgeMs?: number): Promise<Orientation | null>;
+  /**
+   * How the phone is turned. 2026-11-22: the phone is asked only for Lotus's own read of the screen (`explicit`,
+   * unless asked within `maxAgeMs`); anyone else gets what's known (the live picture's shape keeps it current).
+   */
+  refreshOrientation?(udid: string, maxAgeMs?: number, explicit?: boolean): Promise<Orientation | null>;
+  /** 2026-11-22: waits (at most `ms`) for the phone's control link to take requests; false when it didn't or is down. */
+  whenControlReady?(udid: string, ms: number): Promise<boolean>;
   /** Set by the server: called when a phone's orientation or upright size changed. */
   onOrientation?: (udid: string) => void;
   /**

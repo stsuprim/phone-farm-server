@@ -239,6 +239,7 @@ const fakeSpawn = ((cmd: string, args: string[], opts: { env?: NodeJS.ProcessEnv
 
     // the switch to our build: a new runner from our project, its own port, the token in its environment
     const before = spawned.length;
+    const ourFrom = ours.hits.length;
     const sw = await m.switchFlavor('U1', 'fork', 8000);
     assert.deepEqual(sw, { ok: true });
     assert.equal(m.flavor('U1'), 'fork');
@@ -248,8 +249,8 @@ const fakeSpawn = ((cmd: string, args: string[], opts: { env?: NodeJS.ProcessEnv
     assert.ok(x1.args.includes(path.join('/repo/wda', 'WebDriverAgent.xcodeproj')) && x1.args.includes('/fork/build'));
     assert.deepEqual(spawned.slice(before).filter((s) => s.cmd === 'iproxy').map((s) => s.args[2]), [`${ours.port}:${ours.port}`], 'one forward, to its own port: nothing to 9100');
     assert.ok(ours.hits.filter((h) => h.path !== '/status' || h.token).length > 0);
-    const mine = ours.hits.slice(-6);
-    assert.ok(mine.every((h) => h.token === TOKEN), 'every request to our build carries the token');
+    const mine = ours.hits.slice(ourFrom);
+    assert.ok(mine.length > 0 && mine.every((h) => h.token === TOKEN), 'every request to our build carries the token');
     assert.equal(m.mjpegAvailable('U1'), false);
     assert.throws(() => m.mjpegPort('U1'), /no MJPEG/);
 

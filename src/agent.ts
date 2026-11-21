@@ -289,7 +289,8 @@ export class Agent {
       Promise.all([
         source(udid),
         this.app(udid),
-        this.backend.refreshOrientation?.(udid, 500).catch(() => null), // the tree's rectangles are upright: so must the screen be
+        // the tree's rectangles are upright: so must the screen be (2026-11-22: Lotus's own read, so the phone may be asked)
+        this.backend.refreshOrientation?.(udid, 500, true).catch(() => null),
       ]);
     let [tree, app] = await read();
     // the phone had input while the tree was being read (a big screen takes a second): the tree may show either side
@@ -681,8 +682,12 @@ export class Agent {
     } catch (err) {
       if (!(err instanceof HttpError)) console.error(err);
       const error = err instanceof HttpError ? err.message : 'internal error';
+      // 2026-11-22: and the control link's state when that's why (restarting, recovering, busy, down): a client
+      // shows it as the phone's state, never as a failed touch of the owner's
+      const state = err instanceof HttpError && typeof err.extra?.state === 'string' ? { state: err.extra.state } : {};
       // touches without an id still hear about a failed gesture
-      return touchAck(msg, t0, undefined, error) ?? { type: 'ack', id, ok: false, error };
+      const t = touchAck(msg, t0, undefined, error);
+      return t ? { ...t, ...state } : { type: 'ack', id, ok: false, error, ...state };
     }
   }
 }

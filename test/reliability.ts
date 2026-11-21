@@ -140,16 +140,19 @@ const quiet = async <T>(fn: () => Promise<T>): Promise<T> => {
     assert.equal(w.made, sessions, 'the session was still ours: not remade');
     assert.equal(w.hits.filter((h) => h.path.endsWith('/wda/apps/launch')).length, 1, 'a refusal is not asked twice');
 
-    // a quiet read (the orientation poll) told its session is gone: a new one is made right then, not at the next
-    // action or health check, and the phone's turn is known again
+    // a quiet session call (Lotus's own orientation read) told its session is gone: a new one is made right then,
+    // not at the next action or health check (2026-11-22: and it reads nothing of the app in front: the next read of
+    // Lotus's knows the phone's turn again)
     w.stale = 'named';
     w.current = 'gone-4';
     w.orient = 'LANDSCAPE';
-    assert.equal(await m.refreshOrientation('U1', 0), 'portrait', 'what was known, for now');
+    assert.equal(await m.refreshOrientation('U1', 0, true), 'portrait', 'what was known, for now');
     for (let i = 0; i < 40 && w.made === sessions; i++) await sleep(10);
     assert.equal(w.made, sessions + 1, 'a new session, in the background');
-    for (let i = 0; i < 40 && m.orientation('U1') !== 'landscape-left'; i++) await sleep(10);
-    assert.equal(m.orientation('U1'), 'landscape-left', 'the new session read the screen again');
+    const orients = w.hits.filter((h) => h.path.endsWith('/orientation')).length;
+    await sleep(50);
+    assert.equal(w.hits.filter((h) => h.path.endsWith('/orientation')).length, orients, 'the new session asked nothing of the app in front');
+    assert.equal(await m.refreshOrientation('U1', 0, true), 'landscape-left', "Lotus's next read");
     assert.equal(m.state('U1'), 'ready');
   } finally {
     m.shutdown();

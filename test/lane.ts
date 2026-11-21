@@ -78,7 +78,7 @@ assert.deepEqual([HOLD_MS, LANE_WAIT_MS, QUIET_WAIT_MS], [60_000, 8000, 2000]);
   const p3 = lane.run('read', 'GET /wda/locked', 5000, r3.make);
   const pt = lane.run('input', 'POST /lotus/gesture', 5000, t1.make);
   assert.deepEqual(log, ['start read1'], 'only one on its way');
-  assert.deepEqual(lane.state(), { inFlight: 'GET /source', since: lane.state().since, abandoned: false, waiting: 3 });
+  assert.deepEqual(lane.state(), { inFlight: 'GET /source', since: lane.state().since, abandoned: false, waiting: 3, beside: null });
   r1.answer();
   assert.equal(await p1, 'read1');
   await sleep(0);
@@ -94,6 +94,47 @@ assert.deepEqual([HOLD_MS, LANE_WAIT_MS, QUIET_WAIT_MS], [60_000, 8000, 2000]);
   assert.deepEqual(log, ['start read1', 'start tap', 'start read2', 'start read3']);
   assert.equal(lane.idle, true);
   ok('lane: one request on its way at a time, first come first served, a touch before the reads that wait');
+
+  // 1b. 2026-11-22: a request that yields (a read of the app in front) lets the owner's touches go beside
+  //     it at once, one at a time and in their order; reads still wait for it; an input that reads the app itself
+  //     (the focused field) never goes beside it
+  {
+    const ylog: string[] = [];
+    const yl = new WdaLane(() => 'iPhone-1');
+    const stuck = manual(ylog, 'appread');
+    const ta = manual(ylog, 'tapA');
+    const tb = manual(ylog, 'tapB');
+    const rd = manual(ylog, 'read');
+    const fld = manual(ylog, 'field');
+    const ps0 = yl.run('read', 'GET /wda/activeAppInfo', 5000, stuck.make, undefined, { yields: true });
+    const pta = yl.run('input', 'POST /lotus/gesture', 5000, ta.make);
+    const ptb = yl.run('input', 'POST /lotus/gesture', 5000, tb.make);
+    const prd = yl.run('read', 'GET /wda/locked', 5000, rd.make);
+    assert.deepEqual(ylog, ['start appread', 'start tapA'], 'the first touch went beside the stuck read at once');
+    assert.deepEqual(yl.state().beside, 'POST /lotus/gesture');
+    ta.answer();
+    await pta;
+    await sleep(0);
+    assert.deepEqual(ylog, ['start appread', 'start tapA', 'start tapB'], 'the next one followed it, in order');
+    tb.answer();
+    await ptb;
+    await sleep(0);
+    stuck.abandon(); // its caller gave up; the phone still holds it
+    await assert.rejects(ps0, /timeout/);
+    const pf = yl.run('input', 'POST /lotus/field', 5000, fld.make, undefined, { beside: false });
+    await sleep(10);
+    assert.deepEqual(ylog, ['start appread', 'start tapA', 'start tapB'], 'the read and the field read wait for the stuck one');
+    stuck.end();
+    await sleep(0);
+    assert.deepEqual(ylog.slice(3), ['start field'], 'then the field (input first), then the read');
+    fld.answer();
+    await pf;
+    await sleep(0);
+    rd.answer();
+    await prd;
+    assert.equal(yl.idle, true);
+    ok('lane: touches go beside a request that yields (a read of the app in front), in order; reads still wait');
+  }
 
   // 2. a caller that stopped waiting (no answer in its time) still holds the lane until the request is over
   log.length = 0;

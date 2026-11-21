@@ -24,6 +24,11 @@ export class WdaError extends HttpError {
   named = false;
   /** No answer came in time (WDA may only be busy: it works one request at a time), rather than a refused connection. */
   timeout = false;
+  /**
+   * 2026-11-22: the connection itself failed (refused, reset, broken pipe): nothing on the phone took it. A busy WDA
+   * still takes connections (its listener isn't on the main queue), so this is WDA's process (or its forward) gone.
+   */
+  conn = false;
   constructor(public kind: Kind, message: string) {
     super(502, message);
   }
@@ -148,10 +153,34 @@ interface Entry {
   stallMs: number;
   stallSince: number;
   stallWhy: string | null;
-  /** When a touch, key or other input was last sent (background reads of the app wait INPUT_QUIET_MS after it). */
+  /** When a touch, key or other input was last sent, and how many were sent so far. */
   inputAt: number;
-  /** The app in front as /wda/activeAppInfo last said it (given while the app isn't asked). */
+  inputSeq: number;
+  /**
+   * The app in front as last known, and how (2026-11-22: never asked in the background): an explicit read of Lotus's
+   * (/wda/activeAppInfo), the server's own launch of an app, or a Home press. `appAt`: when.
+   */
   appInfo?: unknown;
+  appAt: number;
+  /** inputSeq when the app in front became known (any input after it may have changed it). */
+  appSeq: number;
+  appFrom: 'read' | 'launch' | 'home' | null;
+  /** 2026-11-22: reads of the app in front sent (only ever Lotus's own, asked for), refused (anyone else), and stuck. */
+  appReads: { sent: number; refused: number; stuck: number };
+  /** Reads of the app in front on their way or held for their late answer now (one at most). */
+  appInFlight: number;
+  /** Where the orientation came from: an explicit read of the app, or the live picture's shape. */
+  orientFrom: 'read' | 'picture' | null;
+  /**
+   * 2026-11-22: a connection to WDA failed (refused or reset) and WDA is being checked: until that's over, every call
+   * is answered at once with "reconnecting" (never queued behind the check, then failed: the owner's touches waited
+   * 10 s for "restarting" on iPhone-1).
+   */
+  linkDown: { since: number; why: string } | null;
+  /** The runner's xcodebuild output, its last lines (what XCTest said when the runner ended), token-free. */
+  xcodeTail: string[];
+  /** How the last runner ended or was given up on: when, why, what xcodebuild said last, and what was on its way. */
+  lastRunnerEnd: RunnerEnd | null;
   /** Where the screen's size came from: once it's the screen's own (/wda/screen), it's kept and never asked again. */
   screenFrom?: 'screen' | 'window' | 'model' | 'previous';
   /** 2026-11-21: this runner holds the farm's xcodebuild start turn (cleared once it's up, ended or killed). */
@@ -173,6 +202,21 @@ export function jammedStart(why: string): boolean {
 export interface HealRecord {
   at: number;
   reason: string;
+}
+
+/**
+ * 2026-11-22: how a runner ended (its xcodebuild exited) or was given up on (a restart began): the evidence of why,
+ * kept in the phone's stats (`wda_link.lastRunnerEnd`): what xcodebuild said last (XCTest names a crash, a kill, a
+ * lost device there), the request that was on its way, and how long before it the live view's capture started or
+ * stopped (its USB configuration change drops the phone off USB for a moment).
+ */
+export interface RunnerEnd {
+  at: number;
+  why: string;
+  xcodebuild: string[];
+  inFlight: string | null;
+  captureStartedMsBefore: number | null;
+  captureStoppedMsBefore: number | null;
 }
 
 /** How long WDA gets to answer each kind of request before it counts as hung (ms). */
@@ -218,7 +262,10 @@ export interface WdaTimeouts {
   hold?: number;
   /** How long a touch or a read may wait for its turn in the lane before it's dropped unsent (ms; default LANE_WAIT_MS). */
   laneWait?: number;
-  /** 2026-11-21 (2): an orientation read's time (ms; default 4000) and the screen size reads' (ms; default 5000). */
+  /**
+   * 2026-11-21 (2): an orientation read's time (ms) and (2026-11-22) every other explicit read of the app in front's
+   * (ms; default APP_READ_MS: the tree 12 s, the app 3 s, an element 6 s, the size 3 s).
+   */
   orient?: number;
   appRead?: number;
   /** The first pause of background reads of an app that doesn't answer accessibility, and the longest (ms; STALL_MS, STALL_MAX_MS). */
@@ -321,10 +368,34 @@ export const ACCESSIBILITY_DEADLINE_S = 4;
 export const STALL_MS = 60_000;
 export const STALL_MAX_MS = 5 * 60_000;
 export const INPUT_QUIET_MS = 10_000;
+/**
+ * 2026-11-22, the root cause behind iPhone-1 breaking "after a few touches" in TikTok, every time: the pauses above
+ * only delayed the background reads of the app in front. The detail card's /wda/activeAppInfo still went out each time
+ * its 10-s quiet window or its stall pause ran out, and the orientation was still asked when a live view opened and
+ * with every new session. WDA answers /wda/activeAppInfo on its one main thread with an accessibility hit-test into the
+ * app (FBActiveAppDetectionPoint: the accessibilityDeadline doesn't cover it), which TikTok's feed never answers: the
+ * main thread hung (still waiting 15.5 s later), the lane held it a minute, the owner's touches behind it failed, and
+ * the runner's process was then gone (/status refused, ECONNRESET, while the phone stayed on USB and its forward up).
+ *
+ * Now the server never reads the app in front on its own: no card read, no orientation poll, no read at a live view's
+ * start, none with a new session or a recovery. Only Lotus's own explicit reads (the UI tree for phones_read and
+ * tap-element, the focused field for typing) may, each bounded (APP_READ_MS), one at a time, never while that app is
+ * known not to answer, and never in a touch's way (it yields: src/lane.ts). The app's name comes from what was last
+ * known (an explicit read, the server's own launch, Home); the orientation from the live picture's shape.
+ */
+export const APP_READ_MS = { tree: 12_000, app: 3000, orientation: 3000, element: 6000, size: 3000 } as const;
+/** A refused or reset connection gets this long to come right (a forward restarted, a stale socket) before the call says "reconnecting". */
+export const QUICK_RECOVER_MS = 1500;
+/** /status asked this often when the connections themselves fail (WDA's process gone: ~6 s, not ~12; a phone re-enumerating on USB is back within it). */
+export const CONN_PROBE_EVERY_MS = 2000;
+/** Lines of the runner's xcodebuild output kept for the record of how it ended. */
+const XCODE_TAIL = 40;
 /** A read of the app in front answered within this long means the app answers accessibility again. */
 const APP_OK_MS = 2500;
 /** Requests that bring another app to the front (so a stall of the one before no longer counts). */
 const APP_SWITCH_RE = /^POST (\/session\/:id)?\/wda\/(homescreen|apps\/(launch|activate|terminate))$/;
+/** The Home Screen's bundle id (what the card says after a Home press). */
+const SPRINGBOARD = 'com.apple.springboard';
 /** WDA's own words when its accessibilityDeadline cut a read short (XCAXClient_iOS+FBSnapshotReqParams.m, #1210). */
 const DEADLINE_RE = /main run loop is responsive|likely in an unresponsive state|Aborting the accessibility snapshot/i;
 
@@ -343,8 +414,8 @@ export function appBound(method: string, p: string): boolean {
 
 /** A check whether WDA is dead waits this long at most for the request of ours still with the phone to be over. */
 const DRAIN_MS = 15_000;
-/** An orientation asked no older than this is wanted now (a read that waits its turn); older asks are polls (quiet). */
-const FRESH_ORIENT_MS = 500;
+/** An explicit orientation ask waits this long at most for its turn (it's only part of a UI read). */
+const FRESH_ORIENT_WAIT_MS = 4000;
 /** A launched runner's WDA gets this long (by the clock) to answer /status before the runner is given up on. */
 const START_MS = 180_000;
 
@@ -444,6 +515,8 @@ function within<T>(p: Promise<T>, ms: number, onTimeout: () => Error): Promise<T
 
 const newAgent = (maxSockets = 6) => new http.Agent({ keepAlive: true, maxSockets });
 type HttpErr = Error & { code?: string };
+/** The connection itself failed: refused, reset or broken (nothing on the phone took the request). */
+const connFailed = (x: HttpErr): boolean => /^(ECONNRESET|ECONNREFUSED|EPIPE|ENOTCONN|ECONNABORTED|EHOSTUNREACH)$/.test(x.code ?? '') || /socket hang up/i.test(x.message ?? '');
 type Resp = { status: number; text: string };
 
 /** How a request goes: its turn in the lane (default by its route), how long it may wait, or straight past the lane. */
@@ -455,11 +528,14 @@ interface Via {
   /** false: no wait for a late answer (the request is dropped at its timeout and frees the lane at once). */
   hold?: boolean;
   /**
-   * 2026-11-21 (2): the server's own look, nobody waits on it (a quiet read is one too). A background read of the app
-   * in front (appBound) is never sent while that app is stalled or for INPUT_QUIET_MS after a touch: a LaneBusy.
+   * 2026-11-22: Lotus asked for this read of the app in front itself (the UI tree, the focused field). A read of the
+   * app in front (appBound) without it is never sent, by anyone: the server never reads that app on its own.
    */
-  background?: boolean;
+  explicit?: boolean;
 }
+
+/** What a caller outside may say of a call: Lotus asked for it (a read of the app in front may then go). */
+export type CallVia = { explicit?: boolean };
 
 /**
  * One HTTP exchange with WDA. `result`: the answer, or a TIMEOUT error after `timeout` (or the error it failed with);
@@ -637,6 +713,8 @@ export class WdaManager {
    * a restart, a rebuild), else a session remade on the same runner. The phone is kept silent from here (src/real.ts).
    */
   onSession?: (udid: string, fresh: boolean) => void;
+  /** 2026-11-22: when the phone's live-view capture last started and stopped (ms since the epoch), for the runner's end record. */
+  captureTimes?: (udid: string) => { startedAt: number | null; stoppedAt: number | null };
 
   constructor(
     private cfg: Config,
@@ -735,6 +813,26 @@ export class WdaManager {
     console.log(`[wda ${e.udid.slice(-8)}] ${this.clean(e, m)}`); // UDID end: the start (00008110...) is the chip, same on both phones
   }
 
+  /**
+   * 2026-11-22: the runner ended or is given up on: what xcodebuild said last (XCTest says there why a runner ended: a
+   * crash, a kill, a lost device), what was on its way, and the capture's timing, kept in stats and logged. Only the
+   * lines that say something of an end, else the last few.
+   */
+  private noteRunnerEnd(e: Entry, why: string): void {
+    const said = e.xcodeTail.filter((l) => /crash|signal|kill|lost|terminat|exit|disconnect|error|fail|timed? ?out|watchdog|jetsam|unexpected|restart|interrupt|abort/i.test(l));
+    const lines = (said.length ? said : e.xcodeTail).slice(-8);
+    const now = Date.now();
+    const t = this.captureTimes?.(e.udid);
+    const before = (at: number | null | undefined) => (at && at <= now ? now - at : null);
+    const st = e.lane.state();
+    e.lastRunnerEnd = {
+      at: now, why: this.clean(e, why).slice(0, 300), xcodebuild: lines.map((l) => this.clean(e, l).slice(0, 200)),
+      inFlight: st.inFlight, captureStartedMsBefore: before(t?.startedAt), captureStoppedMsBefore: before(t?.stoppedAt),
+    };
+    const cap = e.lastRunnerEnd.captureStartedMsBefore !== null ? `; the live view's capture started ${(e.lastRunnerEnd.captureStartedMsBefore / 1000).toFixed(1)} s before` : '';
+    this.restartLog(e, `the runner ended or was given up on (${e.lastRunnerEnd.why})${st.inFlight ? `; on its way then: ${st.inFlight}` : ''}${cap}; xcodebuild's last words: ${lines.length ? lines.join(' | ') : '(none)'}`);
+  }
+
   /** A self-heal: counted, kept as the phone's last one and logged with its reason. */
   private healed(e: Entry, reason: string): void {
     reason = this.clean(e, reason);
@@ -753,7 +851,11 @@ export class WdaManager {
    * How WDA's own link is doing, for the phone's stats (`stats.controlLink.wda`): the state as told (debounced) and
    * as it is, liveness checks missed in a row, recoveries and runner restarts so far, ms since WDA last answered.
    */
-  linkHealth(udid: string): { state: ControlState; raw: ControlState; misses: number; recoveries: number; runnerRestarts: number; answeredMsAgo: number | null; busy: number; lane: LaneState; restarting: { attempt: number; of: number; since: number } | null; controlDown: string | null; needsReplug: boolean; appStall: { since: number; until: number; why: string | null } | null } | null {
+  linkHealth(udid: string): {
+    state: ControlState; raw: ControlState; misses: number; recoveries: number; runnerRestarts: number; answeredMsAgo: number | null; busy: number; lane: LaneState;
+    restarting: { attempt: number; of: number; since: number } | null; controlDown: string | null; needsReplug: boolean; appStall: { since: number; until: number; why: string | null } | null;
+    appReads: { sent: number; refused: number; stuck: number }; reconnecting: { since: number; why: string } | null; orientationFrom: 'read' | 'picture' | null; lastRunnerEnd: RunnerEnd | null;
+  } | null {
     const e = this.entries.get(udid);
     if (!e) return null;
     return {
@@ -763,6 +865,10 @@ export class WdaManager {
       answeredMsAgo: e.lastAnswer ? Date.now() - e.lastAnswer : null, busy: e.lane.load, lane: e.lane.state(),
       restarting: this.restarting(udid), controlDown: e.downWhy, needsReplug: !!e.downWhy && e.needsReplug,
       appStall: this.appStall(udid),
+      // 2026-11-22: reads of the app in front (only Lotus's own, asked for, are ever sent), a check under way after a
+      // refused connection, where the orientation came from, and how the last runner ended
+      appReads: { ...e.appReads }, reconnecting: e.linkDown ? { ...e.linkDown } : null, orientationFrom: e.orientFrom,
+      lastRunnerEnd: e.lastRunnerEnd,
     };
   }
 
@@ -796,10 +902,17 @@ export class WdaManager {
     if (!e || !e.wanted) return;
     if (e.restartP) throw this.restartingError(e);
     if (e.downWhy) throw this.controlDownError(e);
+    if (e.linkDown) throw this.reconnectingError(e);
   }
 
   private restartingError(e: Entry): HttpError {
     return new HttpError(503, `The phone's control link is restarting (attempt ${Math.max(1, e.attempt)})`, { state: 'restarting' });
+  }
+
+  /** 2026-11-22: a refused or reset connection is being checked (a few seconds): said at once, never waited for. */
+  private reconnectingError(e: Entry): HttpError {
+    const why = e.linkDown?.why ?? 'its WebDriverAgent stopped answering';
+    return new HttpError(503, `The phone's control link is reconnecting (${why}); try again in a few seconds`, { state: 'recovering' });
   }
 
   private controlDownError(e: Entry): HttpError {
@@ -871,6 +984,45 @@ export class WdaManager {
   }
   orientation(udid: string): Orientation | null {
     return this.entries.get(udid)?.orientation ?? null;
+  }
+
+  /**
+   * 2026-11-22: the live view's picture came or changed size (the USB capture follows the phone as it turns): how the
+   * phone is turned, from its shape, without asking WDA (the app in front's orientation is an accessibility read).
+   * Tall is portrait (upside down kept when that was known); wide keeps the landscape side last known, else
+   * landscape-left (an app's usual landscape: its top edge to the left).
+   */
+  noteFrame(udid: string, width: number, height: number): void {
+    const e = this.entries.get(udid);
+    if (!e || !(width > 0) || !(height > 0)) return;
+    const wide = width > height * 1.05;
+    const tall = height > width * 1.05;
+    if (!wide && !tall) return;
+    const o: Orientation = tall ? (e.orientation === 'portrait-upside-down' ? e.orientation : 'portrait') : isLandscape(e.orientation) ? e.orientation! : 'landscape-left';
+    e.orientAt = Date.now();
+    if (o === e.orientation) return;
+    this.log(e, `orientation ${e.orientation ?? 'unknown'} -> ${o} (from the live picture's shape, ${width}x${height})`);
+    e.orientation = o;
+    e.orientFrom = 'picture';
+    this.onOrientation?.(e.udid);
+  }
+
+  /**
+   * 2026-11-22: the app in front as last known (never asked for it: an explicit read of Lotus's, the server's own
+   * launch, a Home press), when, how, and whether the phone had input since (it may have changed).
+   */
+  knownApp(udid: string): { info: unknown; at: number; from: 'read' | 'launch' | 'home'; changedSince: boolean } | null {
+    const e = this.entries.get(udid);
+    if (!e || !e.appInfo || !e.appFrom) return null;
+    return { info: e.appInfo, at: e.appAt, from: e.appFrom, changedSince: e.inputSeq > e.appSeq };
+  }
+
+  /** The app in front is known to be this one now (an explicit read, a launch, Home). */
+  private setApp(e: Entry, info: unknown, from: 'read' | 'launch' | 'home'): void {
+    e.appInfo = info;
+    e.appAt = Date.now();
+    e.appSeq = e.inputSeq;
+    e.appFrom = from;
   }
   /**
    * Whether this phone's WDA has its MJPEG server (WDA's screenshots as a JPEG stream; stock WDA: yes). A WDA built
@@ -960,7 +1112,9 @@ export class WdaManager {
       lastAnswer: 0, laneAnswer: 0, misses: 0, missAt: 0, unreadyAt: 0, recoveries: 0, runnerRestarts: 0,
       flavor: 'stock', forkInfo: null, switching: false, launchError: null, liveFailed: null, forkFails: 0, readyAt: 0,
       attempt: 0, restartSince: 0, downWhy: null, epoch: 0, launchSeq: 0, fwdPorts: [], needsReplug: false,
-      stallUntil: 0, stallMs: 0, stallSince: 0, stallWhy: null, inputAt: 0,
+      stallUntil: 0, stallMs: 0, stallSince: 0, stallWhy: null, inputAt: 0, inputSeq: 0,
+      appAt: 0, appSeq: 0, appFrom: null, appReads: { sent: 0, refused: 0, stuck: 0 }, appInFlight: 0, orientFrom: null, linkDown: null,
+      xcodeTail: [], lastRunnerEnd: null,
     };
     const first = !this.entries.has(udid);
     e.epoch++;
@@ -1185,6 +1339,7 @@ export class WdaManager {
   }
 
   private relaunchLater(e: Entry, why: string): void {
+    if (e.wanted && !e.switching) this.noteRunnerEnd(e, why);
     this.killProcs(e);
     if (!e.wanted) return;
     e.status = 'failed';
@@ -1328,8 +1483,18 @@ export class WdaManager {
 
     // what xcodebuild said about a refused install or signing (a locked phone, an expired profile), for the switch's "why"
     const tail: string[] = [];
+    // 2026-11-22: and its last lines whatever they say (how the runner ended: noteRunnerEnd)
+    const lines: string[] = (e.xcodeTail = []);
     const keep = (d: Buffer) => {
-      for (const l of d.toString().split(/\r?\n/)) if (/error|fail|unable|cannot|locked|trust|profile|sign/i.test(l)) tail.push(l.trim().slice(0, 160));
+      for (const l of d.toString().split(/\r?\n/)) {
+        const t = l.trim();
+        if (!t) continue;
+        if (e.runner === xcode) {
+          lines.push(t.slice(0, 240));
+          if (lines.length > XCODE_TAIL) lines.splice(0, lines.length - XCODE_TAIL);
+        }
+        if (/error|fail|unable|cannot|locked|trust|profile|sign/i.test(t)) tail.push(t.slice(0, 160));
+      }
       if (tail.length > 4) tail.splice(0, tail.length - 4);
     };
     xcode.stdout?.on('data', keep);
@@ -1397,7 +1562,29 @@ export class WdaManager {
     if (e.token) headers[TOKEN_HEADER] = e.token;
     const label = routeLabel(method, p);
     const bound = !via.bypass && appBound(method, p);
+    const name = this.nameOf(e.udid);
+    // 2026-11-22: the server never reads the app in front on its own (the card, a poll, a live view's start, a new
+    // session, a recovery): only Lotus's own reads, asked for (`explicit`), ever go. Anything else is refused here,
+    // unsent, and counted (stats: appReads.refused)
+    if (bound && !via.explicit) {
+      e.appReads.refused++;
+      return Promise.reject(new LaneBusy(`${name}: ${label} not sent (the server never reads the app in front on its own)`, { skipped: true, appRead: 'refused' }));
+    }
+    // ...and an explicit one goes only while no other is on the phone and the app in front is known to answer
+    if (bound) {
+      const why = this.appReadBlocked(e);
+      if (why) return Promise.reject(this.appBusy(e, label, why));
+    }
+    // a Home press or a launch that WDA did: the app in front is known from it (2026-11-22: never asked)
+    let appAfter: { info: unknown; from: 'launch' | 'home' } | null = null;
     const go = (agent: http.Agent, holdMs: number) => {
+      if (bound) {
+        // checked again at its turn: a read ahead of it may have found the app not answering meanwhile
+        const why = this.appReadBlocked(e, true);
+        if (why) throw this.appBusy(e, label, why);
+        e.appReads.sent++;
+        e.appInFlight++;
+      }
       const t0 = Date.now();
       const x = exchange({
         port: e.wdaPort, method, path: p, body, headers, agent, timeout, holdMs,
@@ -1410,9 +1597,17 @@ export class WdaManager {
         },
         onStuck: (ms) => this.stuck(e, label, ms),
       });
+      if (appAfter) {
+        const known = appAfter;
+        x.result.then(
+          (r) => void (r.status >= 200 && r.status < 300 && this.setApp(e, known.info, known.from)),
+          () => {},
+        );
+      }
       // a read of the app in front: one that isn't answered in time (or that WDA's deadline cut short) means the app
       // doesn't answer accessibility now; a quick answer means it does again
       if (bound) {
+        x.ended.then(() => void (e.appInFlight = Math.max(0, e.appInFlight - 1)));
         x.result.then(
           (r) => {
             if (r.status >= 500 && DEADLINE_RE.test(r.text)) this.markStall(e, label, `WebDriverAgent's ${ACCESSIBILITY_DEADLINE_S} s deadline cut ${label} short`);
@@ -1429,44 +1624,73 @@ export class WdaManager {
     const prio = via.prio ?? routePriority(method, p);
     if (prio === 'input') {
       e.inputAt = Date.now();
-      // another app comes to the front (Home, a launch): the stall was the old app's
-      if (APP_SWITCH_RE.test(routeLabel(method, p)) || (/\/pressButton$/.test(p.split('?')[0]!) && /"home"/.test(body ?? ''))) this.clearStall(e);
-    }
-    if (bound && (via.background || prio === 'quiet')) {
-      const why = this.holdBack(e);
-      if (why) return Promise.reject(new LaneBusy(`${this.nameOf(e.udid)}: ${label} not sent (${why})`, { inFlight: e.lane.state().inFlight, skipped: true }));
+      e.inputSeq++;
+      // another app comes to the front (Home, a launch): the stall was the old app's, and the app in front is known
+      const route = p.split('?')[0]!;
+      const home = /\/wda\/homescreen$/.test(route) || (/\/pressButton$/.test(route) && /"home"/.test(body ?? ''));
+      if (home || APP_SWITCH_RE.test(label)) this.clearStall(e);
+      if (home) appAfter = { info: { bundleId: SPRINGBOARD, name: 'Home Screen' }, from: 'home' };
+      else if (/\/wda\/apps\/(launch|activate)$/.test(route)) {
+        const id = (() => {
+          try {
+            return JSON.parse(body ?? '{}')?.bundleId;
+          } catch {
+            return undefined;
+          }
+        })();
+        if (typeof id === 'string' && id) appAfter = { info: { bundleId: id }, from: 'launch' };
+      }
     }
     const wait = via.maxWait ?? (prio === 'quiet' ? QUIET_WAIT_MS : this.timeouts.laneWait ?? LANE_WAIT_MS);
     const holdMs = via.hold === false ? 0 : this.timeouts.hold ?? HOLD_MS;
     const agent = e.agent;
-    return e.lane.run(prio, label, wait, () => go(agent, holdMs), prio === 'quiet' ? label : undefined);
+    // 2026-11-22: a read of the app in front may be held by the phone for long (an app that doesn't answer
+    // accessibility): the owner's touches go beside it, never behind it (src/lane.ts); an input that reads the app
+    // itself (the focused field) never does
+    return e.lane.run(prio, label, wait, () => go(agent, holdMs), prio === 'quiet' ? label : undefined, { yields: bound, beside: !bound });
   }
 
   /**
    * A request the phone never answered, not even late (its hold ran out): XCTest may be stuck. WDA is checked (and
    * restarted only when /status goes unanswered, or no session can be made while nothing else is asked of it).
+   * 2026-11-22: never for a read of the app in front: that app doesn't answer accessibility (the stall says so), WDA
+   * itself is fine and its /status answers; checking it only queued more behind the same read.
    */
   private stuck(e: Entry, label: string, ms: number): void {
     if (!e.wanted || e.status !== 'ready' || e.restartP || e.downWhy) return;
     const why = `no answer within ${(ms / 1000).toFixed(1)} s to ${label}, not even late`;
+    const sp = label.indexOf(' ');
+    if (sp > 0 && appBound(label.slice(0, sp), label.slice(sp + 1))) {
+      e.appReads.stuck++;
+      if (!this.stalled(e)) this.markStall(e, label, why);
+      return void this.log(e, `${why}: the app in front doesn't answer accessibility; nothing is checked or restarted for it`);
+    }
     this.log(e, `${why}: checking WebDriverAgent`);
     void this.recover(e, why).catch(() => {});
   }
 
-  /** The app in front isn't answering accessibility reads now (a background read of it would only hold the phone). */
+  /** The app in front isn't answering accessibility reads now (a read of it would only hold the phone). */
   private stalled(e: Entry): boolean {
     return e.stallUntil > Date.now();
   }
 
-  /** Why a background read of the app in front isn't sent now, or null when it may be. */
-  private holdBack(e: Entry): string | null {
+  /**
+   * 2026-11-22: why an explicit read of the app in front can't go now (null: it may). `atTurn`: it's its turn in the
+   * lane, so one still held on the phone (whose caller gave up on it) means the phone is still stuck on it.
+   */
+  private appReadBlocked(e: Entry, atTurn = false): string | null {
     const now = Date.now();
     if (e.stallUntil > now) return `the app in front isn't answering accessibility reads (${e.stallWhy ?? 'it was slow'}); asked again in ${Math.ceil((e.stallUntil - now) / 1000)} s at the earliest`;
-    if (now - e.inputAt < (this.timeouts.inputQuiet ?? INPUT_QUIET_MS)) return 'the phone is being used: no background read of the app in front for a few seconds after a touch';
+    if (atTurn && e.appInFlight > 0) return 'an earlier read of the app in front is still on the phone';
     return null;
   }
 
-  /** A read of the app in front went unanswered: background reads of it pause, longer each time it happens again. */
+  /** An explicit read of the app in front that can't go now: a 503 that says why at once (the picture still works). */
+  private appBusy(e: Entry, label: string, why: string): LaneBusy {
+    return new LaneBusy(`${this.nameOf(e.udid)} can't read the app in front right now: ${why}, so ${label} was not sent (touches and the picture work as usual)`, { skipped: true, appRead: 'busy' });
+  }
+
+  /** A read of the app in front went unanswered: reads of it pause, longer each time it happens again. */
   private markStall(e: Entry, label: string, why: string): void {
     const now = Date.now();
     const again = e.stallMs > 0;
@@ -1474,7 +1698,7 @@ export class WdaManager {
     if (!e.stallSince || !again) e.stallSince = now;
     e.stallUntil = now + e.stallMs;
     e.stallWhy = why;
-    this.log(e, `the app in front isn't answering accessibility reads (${why}): no background reads of it for ${Math.round(e.stallMs / 1000)} s (orientation, app name and size stay as known; touches go as usual)`);
+    this.log(e, `the app in front isn't answering accessibility reads (${why}): no read of it for ${Math.round(e.stallMs / 1000)} s (orientation, app name and size stay as known; touches go as usual)`);
   }
 
   /** A read of the app in front answered quickly: it answers accessibility again. */
@@ -1512,6 +1736,7 @@ export class WdaManager {
       const why = x.code === 'TIMEOUT' ? `no answer within ${Math.round(timeout / 1000)}s` : `unreachable (${x.code ?? x.message})`;
       const werr = new WdaError('unreachable', why);
       werr.timeout = x.code === 'TIMEOUT';
+      werr.conn = connFailed(x);
       throw werr;
     }
     res.ok = res.status >= 200 && res.status < 300;
@@ -1536,7 +1761,7 @@ export class WdaManager {
   }
 
   /** GET /status, past the lane on a connection of its own (WDA answers it off its main queue, however busy that is). */
-  private async ping(e: Entry, timeout: number): Promise<{ ok: boolean; sessionId?: string; why?: string }> {
+  private async ping(e: Entry, timeout: number): Promise<{ ok: boolean; sessionId?: string; why?: string; conn?: boolean }> {
     try {
       const r = await this.request(e, 'GET', '/status', undefined, timeout, true, { bypass: true });
       let j: any = {};
@@ -1551,7 +1776,7 @@ export class WdaManager {
       return { ok, sessionId: typeof sid === 'string' && sid ? sid : undefined, ...(ok ? {} : { why: `HTTP ${r.status}` }) };
     } catch (err) {
       const x = err as HttpErr;
-      return { ok: false, why: x.code === 'TIMEOUT' ? `no answer in ${(timeout / 1000).toFixed(1)} s` : `unreachable (${x.code ?? x.message})` };
+      return { ok: false, why: x.code === 'TIMEOUT' ? `no answer in ${(timeout / 1000).toFixed(1)} s` : `unreachable (${x.code ?? x.message})`, conn: connFailed(x) };
     }
   }
 
@@ -1624,65 +1849,55 @@ export class WdaManager {
       if (said !== e.screenSaid) this.log(e, `screen ${said}`);
       e.screenSaid = said;
     };
-    // 2026-11-21 (2): every one of these reads asks the app in front (WDA's window and /wda/screen both look it up
-    // and read its orientation), which an app busy all the time can leave unanswered for tens of seconds. So: the
-    // model's known size at once when nothing better is known; the screen's own size read once per phone and kept
-    // (a screen doesn't change size); the app's window only when WDA has no screen size to give and the model isn't
-    // known; none of them (nor the orientation) while the app in front doesn't answer accessibility
+    // 2026-11-22: every WDA read of the size asks the app in front (WDA's window and /wda/screen both look it up and
+    // read its orientation), and a new session (a start, a restart, a recovery) is no reason to ask it: the size comes
+    // from what's known (the screen's own size read before, else the model's known size), the orientation stays as
+    // known (the live picture's shape says it: noteFrame). A phone whose model isn't known (none on the farm) has its
+    // size read when Lotus first reads its screen itself (ensureScreen, an explicit read).
+    void sid;
     if (!e.screen) {
       const known = pickScreen({ model });
       if (known) take(known);
     }
-    let sizeAsked = false;
-    let sizeSkipped = false;
-    let win: any = null;
-    // (rare: until the screen's own size is known, when a session is made; never while the app in front doesn't answer)
-    if (e.screenFrom !== 'screen') {
-      sizeAsked = true;
-      sizeSkipped = this.stalled(e);
-    }
-    if (sizeAsked && !sizeSkipped) {
-      const [scr] = await Promise.allSettled([this.raw(e, 'GET', '/wda/screen', undefined, this.timeouts.appRead ?? 5000)]);
-      const sv = scr.status === 'fulfilled' ? scr.value?.value ?? null : null;
-      if (scr.status === 'rejected' && scr.reason instanceof LaneBusy) sizeSkipped = true;
-      const screenOk = !!saneSize(sv?.screenSize);
-      if (!screenOk && !sizeSkipped && !(model && knownScreen(model))) {
-        // no screen size from WDA (an older build) and no model to go by: the app's window, checked
-        const [size] = await Promise.allSettled([this.raw(e, 'GET', `/session/${sid}/window/size`, undefined, this.timeouts.appRead ?? 5000)]);
-        win = size.status === 'fulfilled' ? size.value?.value ?? null : null;
-        if (size.status === 'rejected' && size.reason instanceof LaneBusy) sizeSkipped = true;
-      }
-      const pick = pickScreen({ screen: sv?.screenSize ?? null, window: win, scale: sv?.scale, model, previous: e.screen ?? null });
-      if (pick) take(pick);
-    }
-    // how the phone is turned (the poll and a changed picture ask again); not while the app in front doesn't answer
-    const orient = this.stalled(e) ? null : await this.readOrientation(e, sid);
-    const w = Number(win?.width);
-    const h = Number(win?.height);
-    // the screen's own size didn't answer (WDA busy, the app in front not answering, a session that went at once):
-    // asked again shortly, a few times
-    const settled = !sizeAsked || e.screenFrom === 'screen' || (e.screenFrom === 'window' && !sizeSkipped);
-    if (!settled && (e.screenTries ?? 0) < 3 && e.sessionId === sid) {
-      e.screenTries = (e.screenTries ?? 0) + 1;
-      // (while the app in front doesn't answer, once it's due to be asked again)
-      const t = setTimeout(() => {
-        if (e.sessionId === sid && e.status === 'ready') void this.readScreen(e, sid).catch(() => {});
-      }, Math.min(this.timeouts.stallMax ?? STALL_MAX_MS, Math.max(3000, e.stallUntil - Date.now() + 500)));
-      t.unref?.();
-    } else if (settled) e.screenTries = 0;
-    // WDA without /orientation: the window's shape still says wide or tall
-    const shape: Orientation | null = w > 0 && h > 0 ? (w > h ? (isLandscape(e.orientation) ? e.orientation : 'landscape-left') : isLandscape(e.orientation) || !e.orientation ? 'portrait' : e.orientation) : null;
-    const o = orient ?? shape;
-    if (o) {
-      e.orientation = o;
-      e.orientAt = Date.now();
-    }
+    // a phone whose model isn't in the table (none on the farm): its size can only come from WDA. Read once, as a
+    // setup read of its own (bounded, never while the app in front doesn't answer, never again once it's known)
+    if (!e.screen) await this.ensureScreen(e);
+    // how it's turned: as known; a phone never seen turned is taken as upright (a phone on a stand) until the live
+    // picture's shape or Lotus's own read says otherwise
+    if (!e.orientation) e.orientation = 'portrait';
     if (JSON.stringify([e.screen, e.orientation]) !== before) this.onOrientation?.(e.udid);
+  }
+
+  /**
+   * 2026-11-22: the screen's own size, asked once per phone as part of an explicit read of Lotus's (only until it's
+   * known from the screen itself, and only when the model's size isn't known: never on the farm's phones).
+   */
+  private async ensureScreen(e: Entry): Promise<void> {
+    if ((e.screen && e.screenFrom !== 'previous') || this.appReadBlocked(e)) return;
+    const model = this.modelOf?.(e.udid) ?? null;
+    const ms = this.timeouts.appRead ?? APP_READ_MS.size;
+    try {
+      const sv = (await this.raw(e, 'GET', '/wda/screen', undefined, ms, true, { explicit: true }))?.value ?? null;
+      let win: unknown = null;
+      // an older WDA gives no screen size: the app's window then (checked: never a letterboxed app's)
+      if (!saneSize(sv?.screenSize) && !knownScreen(model) && e.sessionId) {
+        win = (await this.raw(e, 'GET', `/session/${e.sessionId}/window/size`, undefined, ms, true, { explicit: true }).catch(() => null))?.value ?? null;
+      }
+      const pick = pickScreen({ screen: sv?.screenSize ?? null, window: win as any, scale: sv?.scale, model, previous: e.screen ?? null });
+      if (pick && (pick.from === 'screen' || pick.from === 'window')) {
+        e.screen = { width: pick.width, height: pick.height, scale: pick.scale };
+        e.screenFrom = pick.from;
+        this.log(e, `screen ${pick.width} x ${pick.height} pt @${pick.scale ?? '?'}x from ${pick.from === 'screen' ? 'the screen' : "the app's window"}${pick.note ? ` (${pick.note})` : ''}`);
+        this.onOrientation?.(e.udid);
+      }
+    } catch {
+      /* not now: asked with the next explicit read */
+    }
   }
 
   private async readOrientation(e: Entry, sid: string, via: Via = {}): Promise<Orientation | null> {
     try {
-      return orientationFromWda((await this.raw(e, 'GET', `/session/${sid}/orientation`, undefined, this.timeouts.orient ?? 4000, true, via))?.value);
+      return orientationFromWda((await this.raw(e, 'GET', `/session/${sid}/orientation`, undefined, this.timeouts.orient ?? APP_READ_MS.orientation, true, via))?.value);
     } catch (err) {
       this.sessionGone(e, sid, err);
       return null;
@@ -1726,23 +1941,24 @@ export class WdaManager {
   }
 
   /**
-   * How the phone is turned, asked again unless it was within `maxAgeMs` (one ask at a time per phone). Never
-   * recovers WDA: an ask that fails keeps what was known.
+   * How the phone is turned. 2026-11-22: WDA's orientation is the app in front's, read through accessibility, so it's
+   * asked only for an explicit read of Lotus's (`explicit`: the UI tree's rectangles are upright, so must the screen
+   * be), within `maxAgeMs`, one ask at a time, never while the app doesn't answer. Everyone else (the list, a poll, a
+   * still, the live picture) gets what's known: the live picture's shape keeps it current (noteFrame). Never recovers
+   * WDA: an ask that fails keeps what was known.
    */
-  refreshOrientation(udid: string, maxAgeMs = 1500): Promise<Orientation | null> {
+  refreshOrientation(udid: string, maxAgeMs = 1500, explicit = false): Promise<Orientation | null> {
     const e = this.entries.get(udid);
     if (!e) return Promise.resolve(null);
+    if (!explicit) return Promise.resolve(e.orientation);
     if (e.orientP) return e.orientP;
-    if (e.status !== 'ready' || !e.sessionId || e.recovering || Date.now() - e.orientAt < maxAgeMs) return Promise.resolve(e.orientation);
-    // 2026-11-21 (2): WDA's orientation is the app in front's, read through accessibility: while that app doesn't
-    // answer, it isn't asked (a fresh ask included: it would only hold the phone, the owner's touches behind it)
-    if (this.stalled(e)) return Promise.resolve(e.orientation);
+    if (e.status !== 'ready' || !e.sessionId || e.recovering || e.linkDown || Date.now() - e.orientAt < maxAgeMs) return Promise.resolve(e.orientation);
+    if (this.appReadBlocked(e)) return Promise.resolve(e.orientation);
     const sid = e.sessionId;
-    // 2026-11-21: a poll (every 3 s while watched, with every list): quiet, skipped while the phone is busy. Asked
-    // for a fresh one (the picture changed shape, a UI read, GET /orientation) it waits its turn like any read.
-    e.orientP = this.readOrientation(e, sid, { prio: maxAgeMs <= FRESH_ORIENT_MS ? 'read' : 'quiet' })
+    e.orientP = this.readOrientation(e, sid, { prio: 'read', explicit: true, maxWait: FRESH_ORIENT_WAIT_MS })
       .then((o) => {
         e.orientAt = Date.now();
+        if (o) e.orientFrom = 'read';
         if (o && o !== e.orientation) {
           this.log(e, `orientation ${e.orientation ?? 'unknown'} -> ${o}`);
           e.orientation = o;
@@ -1856,18 +2072,21 @@ export class WdaManager {
    * all (that one, or any other request's meanwhile) means it's there. Null when it is; else how each ask failed.
    * 'moot' when the phone changed meanwhile (a restart began, the runner ended, it was unplugged).
    */
-  private async confirmDead(e: Entry): Promise<string | null | 'moot'> {
+  private async confirmDead(e: Entry, conn = false): Promise<string | null | 'moot'> {
     const n = Math.max(1, this.timeouts.probes ?? DEAD_PROBES);
     const every = this.timeouts.probeEvery ?? PROBE_EVERY_MS;
+    // 2026-11-22: a refused or reset connection is no busy phone (a busy WDA still takes connections): /status is
+    // asked as often, but every CONN_PROBE_EVERY_MS while its own connections fail the same way (~6 s, not ~12)
+    const fast = Math.min(every, CONN_PROBE_EVERY_MS);
     const ms = this.timeouts.status ?? STATUS_MS;
     const fails: string[] = [];
     // 2026-11-21: never while a request of ours is still with the phone: it's busy, not dead. The lane drains first
     // (that request is answered, fails, or is given up at its hold); any answer meanwhile means WDA is there.
     const asked = Date.now();
     if (!e.lane.idle) {
-      const drained = await e.lane.drained(Math.min(this.timeouts.hold ?? HOLD_MS, DRAIN_MS));
+      const drained = await e.lane.drained(Math.min(this.timeouts.hold ?? HOLD_MS, conn ? Math.min(DRAIN_MS, 3000) : DRAIN_MS));
       if (e.lastAnswer >= asked) return null;
-      if (!drained) return 'moot'; // still busy with a request of ours: checked again when that one is over (stuck)
+      if (!drained && !conn) return 'moot'; // still busy with a request of ours: checked again when that one is over (stuck)
     }
     const t0 = Date.now();
     for (let i = 0; i < n; i++) {
@@ -1878,7 +2097,7 @@ export class WdaManager {
       if (r.ok || e.lastAnswer >= at) return null;
       fails.push(r.why ?? 'no answer');
       if (i < n - 1) {
-        const wait = every - (Date.now() - at);
+        const wait = (r.conn ? fast : every) - (Date.now() - at);
         if (wait > 0) await sleep(wait);
         if (e.lastAnswer >= at) return null; // something else got an answer meanwhile: WDA is there
       }
@@ -1896,7 +2115,7 @@ export class WdaManager {
    * and this rejects with its 503. A WDA that answers keeps its session when that still answers too; one that's gone
    * (`sessionGone`: WDA said so itself) is made anew; a WDA that answers but makes no session twice is restarted.
    */
-  private recover(e: Entry, why: string, sessionGone = false): Promise<void> {
+  private recover(e: Entry, why: string, sessionGone = false, conn = false): Promise<void> {
     if (e.restartP) return Promise.reject(this.restartingError(e));
     if (e.downWhy) return Promise.reject(this.controlDownError(e));
     if (e.recovering) return e.recovering;
@@ -1907,8 +2126,11 @@ export class WdaManager {
       e.recoveries++;
       e.misses = 0;
       this.healed(e, `recovering: ${why}`);
+      // 2026-11-22: its connections are refused or reset: until this check is over every call hears "reconnecting" at
+      // once (gate), rather than queueing behind the check and failing 10 s later
+      if (conn) e.linkDown = { since: Date.now(), why: `its WebDriverAgent stopped answering: ${why.replace(/^unreachable \((\w+)\)$/, '$1')}` };
       // WDA said itself that the session is gone: it's there (2026-11-21: no /status asks first, a new session at once)
-      const dead = sessionGone ? null : await this.confirmDead(e);
+      const dead = sessionGone ? null : await this.confirmDead(e, conn);
       if (dead !== null && dead !== 'moot') {
         void this.beginRestart(e, `${why}; then ${dead}`);
         throw this.restartingError(e);
@@ -1972,6 +2194,7 @@ export class WdaManager {
     })();
     const p: Promise<void> = run.finally(() => {
       if (e.recovering === p) e.recovering = undefined;
+      e.linkDown = null; // over: answered, or a restart under way (which says so itself)
     });
     e.recovering = p;
     return p;
@@ -2042,6 +2265,8 @@ export class WdaManager {
         const why = n === 1 ? reason : `attempt ${n - 1} failed: ${last}`;
         this.restartLog(e, `attempt ${n}/${max}: restarting WDA (${why})`);
         this.healed(e, `restarting WDA (attempt ${n}/${max}): ${why}`);
+        // 2026-11-22: what the runner given up on said last (unless its xcodebuild's exit was just recorded)
+        if (n === 1 && !(e.lastRunnerEnd && Date.now() - e.lastRunnerEnd.at < 5000)) this.noteRunnerEnd(e, why);
         // one phone at a time: the old runner torn down for good, then the new one up (or given up on), then the next phone
         const r = await this.exclusive(e, async () => {
           if (!live()) return { ok: false, why: 'the phone was stopped' };
@@ -2165,9 +2390,24 @@ export class WdaManager {
       // holds the phone's lane until the phone answers it, and only one that's never answered has WDA checked (stuck)
       if (err.timeout) throw this.named(e, err);
       try {
-        await this.recover(e, err.message, err.kind === 'session');
+        const checking = this.recover(e, err.message, err.kind === 'session', err.conn);
+        if (err.conn) {
+          // 2026-11-22: a refused or reset connection: asked once more only if WDA comes right at once (a forward
+          // started again, a stale socket); else this call is answered now ("reconnecting", "restarting") while the
+          // check goes on by itself. It used to wait for the check (~12 s of /status asks), the owner's next touches
+          // queued behind it, and all of them failed with "restarting" 10 s later.
+          const quick = await within(checking.then(() => true), QUICK_RECOVER_MS, () => new Error('wait')).catch((x: unknown) => x);
+          if (quick !== true) {
+            checking.catch(() => {});
+            if (quick instanceof HttpError && !(quick instanceof WdaError)) throw quick; // restarting, or control down
+            if (quick instanceof Error && quick.message !== 'wait') throw this.named(e, quick);
+            throw e.restartP ? this.restartingError(e) : e.downWhy ? this.controlDownError(e) : this.reconnectingError(e);
+          }
+        } else {
+          await checking;
+        }
       } catch (err2) {
-        if (err2 instanceof HttpError && !(err2 instanceof WdaError)) throw err2; // restarting, or control down: a 503
+        if (err2 instanceof HttpError && !(err2 instanceof WdaError)) throw err2; // restarting, reconnecting, or control down: a 503
         throw this.named(e, err2 instanceof WdaError ? err2 : err);
       }
       try {
@@ -2175,7 +2415,7 @@ export class WdaManager {
         e.lastOk = Date.now();
         return r;
       } catch (err3) {
-        if (err3 instanceof WdaError && err3.down && !err3.timeout) void this.recover(e, err3.message).catch(() => {});
+        if (err3 instanceof WdaError && err3.down && !err3.timeout) void this.recover(e, err3.message, false, err3.conn).catch(() => {});
         throw this.named(e, err3);
       }
     }
@@ -2235,15 +2475,16 @@ export class WdaManager {
    * refusal (a 4xx) that doesn't name the session is checked too: when WDA's session is no longer ours, ours expired
    * without WDA saying so in that answer, so a new one is made and the call asked once more.
    */
-  call(udid: string, method: string, sub: string, body?: unknown, timeout = 30000): Promise<any> {
+  call(udid: string, method: string, sub: string, body?: unknown, timeout = 30000, via: CallVia = {}): Promise<any> {
+    const how: Via = via.explicit ? { explicit: true } : {};
     return this.withRecovery(udid, async (e) => {
       const sid = await this.session(e);
       try {
-        return await this.raw(e, method, `/session/${sid}${sub}`, body, timeout);
+        return await this.raw(e, method, `/session/${sid}${sub}`, body, timeout, true, how);
       } catch (err) {
         if (!(err instanceof WdaError) || err.down || !(await this.sessionExpired(e, sid))) throw err;
         this.healed(e, `the session expired (${err.message}); making a new one`);
-        const r = await this.raw(e, method, `/session/${await this.session(e)}${sub}`, body, timeout);
+        const r = await this.raw(e, method, `/session/${await this.session(e)}${sub}`, body, timeout, true, how);
         this.setControl(e, 'ready');
         return r;
       }
@@ -2253,24 +2494,26 @@ export class WdaManager {
   /**
    * A quick read for the detail card: null unless WDA is up and not recovering right now; never waits for a start,
    * never recovers, never throws. `session`: a session route (asked only when a session exists).
+   * 2026-11-22: the app in front's name is never asked (an accessibility read): the card gets what's known
+   * (knownApp: an explicit read of Lotus's, a launch, Home). Only reads that never touch the app go (device info, battery).
    */
   async peek(udid: string, p: string, timeout = 2500, session = false): Promise<unknown> {
     const e = this.entries.get(udid);
-    if (!e || !e.wanted || e.status !== 'ready' || e.recovering) return null;
+    if (!e) return null;
+    const path = session && e.sessionId ? `/session/${e.sessionId}${p}` : p;
+    if (appBound('GET', path)) {
+      if (p === '/wda/activeAppInfo') return e.appInfo ?? null;
+      e.appReads.refused++;
+      return null;
+    }
+    if (!e.wanted || e.status !== 'ready' || e.recovering || e.linkDown) return null;
     if (session && !e.sessionId) return null;
-    // 2026-11-21 (2): the app in front's name is asked through accessibility; when it isn't asked now (the app doesn't
-    // answer, the phone is busy or being used) the card keeps what it said last
-    const app = p === '/wda/activeAppInfo';
-    const kept = app ? e.appInfo ?? null : null;
-    if (e.inflight > 0) return kept; // WDA is busy with an action: a card's read never piles on top of it
+    if (e.inflight > 0) return null; // WDA is busy with an action: a card's read never piles on top of it
     try {
       // quiet: skipped while anything else is on its way to the phone (src/lane.ts)
-      const v = (await this.raw(e, 'GET', session ? `/session/${e.sessionId}${p}` : p, undefined, timeout, true, { prio: 'quiet' }))?.value ?? null;
-      if (app && v) e.appInfo = v;
-      return v;
-    } catch (err) {
-      // not asked, or not answered in time: what it said last; WDA's own error answer: nothing
-      return err instanceof LaneBusy || (err instanceof WdaError && err.timeout) ? kept : null;
+      return (await this.raw(e, 'GET', path, undefined, timeout, true, { prio: 'quiet' }))?.value ?? null;
+    } catch {
+      return null;
     }
   }
 
@@ -2308,16 +2551,16 @@ export class WdaManager {
     await this.callSoft(udid, 'POST', '/wda/homescreen', {}, timeout);
   }
 
-  callNoSession(udid: string, method: string, p: string, body?: unknown, timeout = 30000): Promise<any> {
-    return this.withRecovery(udid, (e) => this.raw(e, method, p, body, timeout));
+  callNoSession(udid: string, method: string, p: string, body?: unknown, timeout = 30000, via: CallVia = {}): Promise<any> {
+    return this.withRecovery(udid, (e) => this.raw(e, method, p, body, timeout, true, via.explicit ? { explicit: true } : {}));
   }
 
   /** A read that never triggers a recovery (a slow /source on a heavy screen must not restart WDA). */
-  private async read(udid: string, p: string, timeout: number): Promise<any> {
+  private async read(udid: string, p: string, timeout: number, via: Via = {}): Promise<any> {
     const e = await this.usable(udid);
     e.inflight++;
     try {
-      const r = await this.raw(e, 'GET', p, undefined, timeout);
+      const r = await this.raw(e, 'GET', p, undefined, timeout, true, via);
       e.lastOk = Date.now();
       return r;
     } catch (err) {
@@ -2401,7 +2644,7 @@ export class WdaManager {
         e.lastOk = Date.now();
         return true;
       } else {
-        await this.recover(e, `${reason}: ${err.message}`);
+        await this.recover(e, `${reason}: ${err.message}`, false, err.conn);
       }
       e.lastOk = Date.now();
       this.setControl(e, 'ready');
@@ -2414,19 +2657,25 @@ export class WdaManager {
    * its wait for a turn in the lane a read is still answered inside a client's 30 s.
    */
   async source(udid: string): Promise<unknown> {
-    return (await this.read(udid, '/source?format=json', 20000))?.value ?? null;
+    // 2026-11-22: Lotus's own read (explicit), bounded (APP_READ_MS.tree), refused at once while the app in front is
+    // known not to answer; the screen's size first when this phone's model isn't known (never on the farm's phones)
+    const e = this.entries.get(udid);
+    if (e && e.status === 'ready' && !this.appReadBlocked(e)) await this.ensureScreen(e);
+    return (await this.read(udid, '/source?format=json', this.timeouts.appRead ?? APP_READ_MS.tree, { explicit: true }))?.value ?? null;
   }
 
-  /** The foreground app's bundle id, or null. */
+  /**
+   * The foreground app's bundle id, or null. 2026-11-22: only ever for Lotus's own read of the screen (explicit),
+   * within APP_READ_MS.app; not asked while the app in front doesn't answer (it would only hold the phone): unknown
+   * then, never a guess.
+   */
   async activeApp(udid: string): Promise<string | null> {
     const e = this.entries.get(udid);
     const said = (v: any) => (typeof v?.bundleId === 'string' && v.bundleId ? (v.bundleId as string) : null);
-    // 2026-11-21 (2): asked through the app's accessibility: not asked while the app in front doesn't answer (it
-    // would only hold the phone for seconds); unknown then, never a guess
     if (e && this.stalled(e)) return null;
     try {
-      const v = (await this.read(udid, '/wda/activeAppInfo', 6000))?.value;
-      if (e && v) e.appInfo = v;
+      const v = (await this.read(udid, '/wda/activeAppInfo', this.timeouts.appRead ?? APP_READ_MS.app, { explicit: true }))?.value;
+      if (e && v && said(v)) this.setApp(e, v, 'read');
       return said(v);
     } catch {
       return null;
@@ -2481,8 +2730,8 @@ export class WdaManager {
       e.lastOk = Date.now();
     } catch (err) {
       // never the text in a log or an answer (XCTest names its event after the first letters)
-      const safe = err instanceof WdaError ? Object.assign(new WdaError(err.kind, scrubTyped(err.message, text)), { timeout: err.timeout }) : err;
-      if (safe instanceof WdaError && safe.down && !safe.timeout) void this.recover(e, safe.message, safe.kind === 'session').catch(() => {});
+      const safe = err instanceof WdaError ? Object.assign(new WdaError(err.kind, scrubTyped(err.message, text)), { timeout: err.timeout, conn: err.conn }) : err;
+      if (safe instanceof WdaError && safe.down && !safe.timeout) void this.recover(e, safe.message, safe.kind === 'session', safe.conn).catch(() => {});
       throw this.named(e, safe);
     } finally {
       e.inflight--;
@@ -2498,7 +2747,7 @@ export class WdaManager {
   async field(udid: string, clear: boolean): Promise<FieldState | null> {
     const e = this.entries.get(udid);
     if (e && e.forkInfo && e.forkInfo.lotus >= FIELD_FORK_VERSION) {
-      const v = (await this.callNoSession(udid, 'POST', FORK_ROUTES.field, { clear }, clear ? 20000 : 8000))?.value;
+      const v = (await this.callNoSession(udid, 'POST', FORK_ROUTES.field, { clear }, clear ? 20000 : 8000, { explicit: true }))?.value;
       return fieldFrom(v);
     }
     if (e && (e.forkInfo || e.flavor === 'fork' || e.token)) {
@@ -2518,10 +2767,10 @@ export class WdaManager {
     while ((step = nextClearStep(now, done))) {
       done.push(step);
       if (step === 'element-clear') {
-        await this.call(udid, 'POST', `/element/${id}/clear`, {}, 15000).catch(() => {});
+        await this.call(udid, 'POST', `/element/${id}/clear`, {}, 15000, { explicit: true }).catch(() => {});
       } else {
         // Cmd+A selects the whole field; one Delete empties it (a Delete after nothing was selected takes one letter)
-        await this.call(udid, 'POST', '/wda/element/0/keyboardInput', { keys: [{ key: 'a', modifierFlags: 1 << 4 }] }, 8000);
+        await this.call(udid, 'POST', '/wda/element/0/keyboardInput', { keys: [{ key: 'a', modifierFlags: 1 << 4 }] }, 8000, { explicit: true });
         await this.call(udid, 'POST', '/wda/keys', { value: [''] }, 8000);
       }
       now = await this.readElement(udid, id);
@@ -2533,7 +2782,7 @@ export class WdaManager {
   /** The id of the element with the keyboard (GET /element/active), or null. */
   private async activeElement(udid: string): Promise<string | null> {
     try {
-      const v = (await this.call(udid, 'GET', '/element/active', undefined, 8000))?.value;
+      const v = (await this.call(udid, 'GET', '/element/active', undefined, this.timeouts.appRead ?? APP_READ_MS.element, { explicit: true }))?.value;
       // {ELEMENT: id} or the W3C form {"element-6066-…": id}: the one string in it
       const id = v?.ELEMENT ?? (v && typeof v === 'object' ? Object.values(v).find((x) => typeof x === 'string') : undefined);
       return typeof id === 'string' && id ? id : null;
@@ -2546,7 +2795,7 @@ export class WdaManager {
   private async readElement(udid: string, id: string): Promise<FieldState | null> {
     const attr = async (name: string) => {
       try {
-        return (await this.call(udid, 'GET', `/element/${id}/attribute/${name}`, undefined, 6000))?.value ?? null;
+        return (await this.call(udid, 'GET', `/element/${id}/attribute/${name}`, undefined, this.timeouts.appRead ?? APP_READ_MS.element, { explicit: true }))?.value ?? null;
       } catch {
         return undefined;
       }
@@ -2679,6 +2928,8 @@ export class WdaManager {
       void (async () => {
         const st = await this.ping(e, 3000);
         if (!st.ok) {
+          // 2026-11-22: its connection refused or reset: WDA's process (or its forward) is gone, checked now
+          if (st.conn) return void (await this.recover(e, `health check: /status ${st.why ?? 'unreachable'}`, false, true).catch(() => {}));
           // once isn't down: several in a row are (a /status that waited behind a slow request answers the next time)
           const quiet = new WdaError('unreachable', '/status did not answer');
           quiet.timeout = true;

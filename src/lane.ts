@@ -12,11 +12,25 @@ import { HttpError } from './types.js';
  *
  * The lane: one per phone, and every request to its WDA goes through it. At most one is on its way at a time; a touch
  * (input) goes before reads that wait; a read that waited too long is dropped, never sent late; a background read
- * (`quiet`: the orientation poll, the card, a liveness probe) is skipped at once when anything else is on its way. A
- * request the Mac stopped waiting for (its caller already heard "no answer") still holds the lane until the phone
- * really answers it (or a long cap), so nothing piles up behind it on the phone.
+ * (`quiet`: a liveness probe, the card's device info) is skipped at once when anything else is on its way. A request
+ * the Mac stopped waiting for (its caller already heard "no answer") still holds the lane until the phone really
+ * answers it (or a long cap), so nothing piles up behind it on the phone.
+ *
+ * 2026-11-22: ...except for the owner's touches. A request that `yields` (a read of the app in front through
+ * accessibility: an app busy all the time keeps it for tens of seconds, and it is never a touch's business) lets one
+ * input at a time go beside it at once, instead of the touch waiting its turn behind it and being dropped as "busy"
+ * (iPhone-1 in TikTok: "Drag failed: Sending paused a few seconds after 3 failures in a row"). Reads still wait for
+ * it; inputs keep their order.
  */
 export type LanePrio = 'input' | 'read' | 'quiet';
+
+/** How one request goes through the lane. */
+export interface LaneOpts {
+  /** On its way (or held for its late answer), it lets the next input go beside it at once (2026-11-22: a read of the app in front). */
+  yields?: boolean;
+  /** May go beside a request that yields (default: any input; false for an input that reads the app in front itself). */
+  beside?: boolean;
+}
 
 /** A request that was never sent: the phone was busy with an earlier one (or skipped: a background read). 503. */
 export class LaneBusy extends HttpError {
@@ -36,6 +50,8 @@ export interface LaneRun<T> {
 interface Job {
   prio: LanePrio;
   label: string;
+  yields: boolean;
+  beside: boolean;
   at: number;
   maxWaitMs: number;
   key?: string;
@@ -55,14 +71,20 @@ export interface LaneState {
   abandoned: boolean;
   /** Requests waiting their turn. */
   waiting: number;
+  /** 2026-11-22: the input on its way beside a request that yields, or null. */
+  beside: string | null;
 }
+
+type Slot = { label: string; prio: LanePrio; since: number; abandoned: boolean; yields: boolean };
 
 /** Inputs first, then reads, then quiet reads; first come, first served within each. */
 const RANK: Record<LanePrio, number> = { input: 0, read: 1, quiet: 2 };
 
 export class WdaLane {
   private queue: Job[] = [];
-  private current: { label: string; prio: LanePrio; since: number; abandoned: boolean } | null = null;
+  private current: Slot | null = null;
+  /** 2026-11-22: one input on its way beside a `current` that yields. */
+  private side: Slot | null = null;
   private drains = new Set<() => void>();
   private now: () => number;
   private explain?: (label: string) => string | null;
@@ -78,12 +100,12 @@ export class WdaLane {
 
   /** Nothing on its way and nothing waiting. */
   get idle(): boolean {
-    return !this.current && !this.queue.length;
+    return !this.current && !this.side && !this.queue.length;
   }
 
   /** Requests on their way or waiting (stats). */
   get load(): number {
-    return (this.current ? 1 : 0) + this.queue.length;
+    return (this.current ? 1 : 0) + (this.side ? 1 : 0) + this.queue.length;
   }
 
   state(): LaneState {
@@ -92,6 +114,7 @@ export class WdaLane {
       since: this.current?.since ?? null,
       abandoned: this.current?.abandoned ?? false,
       waiting: this.queue.length,
+      beside: this.side?.label ?? null,
     };
   }
 
@@ -99,16 +122,20 @@ export class WdaLane {
    * Runs `start` when it's this request's turn, and answers what it answers. `maxWaitMs`: how long it may wait for
    * its turn before it's dropped unsent (a LaneBusy). A quiet read is skipped at once (a LaneBusy) while anything
    * that isn't a quiet read is on its way or waiting; the same quiet read (`key`) asked again meanwhile joins it.
+   * `opts.yields`: once on its way, the next input goes beside it.
    */
-  run<T>(prio: LanePrio, label: string, maxWaitMs: number, start: () => LaneRun<T>, key?: string): Promise<T> {
+  run<T>(prio: LanePrio, label: string, maxWaitMs: number, start: () => LaneRun<T>, key?: string, opts: LaneOpts = {}): Promise<T> {
     if (prio === 'quiet') {
-      const busy = (this.current && this.current.prio !== 'quiet') || this.queue.some((j) => j.prio !== 'quiet');
+      const busy = (this.current && this.current.prio !== 'quiet') || !!this.side || this.queue.some((j) => j.prio !== 'quiet');
       if (busy) return Promise.reject(this.busyError(label, true));
       const same = key ? this.queue.find((j) => j.key === key) : undefined;
       if (same) return new Promise<T>((resolve, reject) => same.joined.push({ resolve: resolve as (v: unknown) => void, reject }));
     }
     return new Promise<T>((resolve, reject) => {
-      const job: Job = { prio, label, at: this.now(), maxWaitMs, key, start: start as () => LaneRun<unknown>, resolve: resolve as (v: unknown) => void, reject, joined: [] };
+      const job: Job = {
+        prio, label, yields: !!opts.yields, beside: prio === 'input' && opts.beside !== false, at: this.now(), maxWaitMs, key, start: start as () => LaneRun<unknown>,
+        resolve: resolve as (v: unknown) => void, reject, joined: [],
+      };
       if (Number.isFinite(maxWaitMs)) {
         job.timer = setTimeout(() => {
           const i = this.queue.indexOf(job);
@@ -136,7 +163,7 @@ export class WdaLane {
 
   /** Resolves true once nothing is on its way (at once when idle), false after `ms`. */
   drained(ms: number): Promise<boolean> {
-    if (!this.current) return Promise.resolve(true);
+    if (!this.current && !this.side) return Promise.resolve(true);
     return new Promise<boolean>((resolve) => {
       const done = () => {
         clearTimeout(t);
@@ -145,14 +172,14 @@ export class WdaLane {
       };
       const t = setTimeout(() => {
         this.drains.delete(done);
-        resolve(!this.current);
+        resolve(!this.current && !this.side);
       }, Math.max(0, ms));
       this.drains.add(done);
     });
   }
 
   private busyError(label: string, skipped: boolean): LaneBusy {
-    const c = this.current;
+    const c = this.current ?? this.side;
     const on = c ? `${c.label}, ${((this.now() - c.since) / 1000).toFixed(1)} s so far${c.abandoned ? ', still waiting for the phone to answer it' : ''}` : 'requests ahead of it';
     const ahead = this.queue.length;
     const why = c ? this.explain?.(c.label) ?? null : null;
@@ -164,31 +191,63 @@ export class WdaLane {
     );
   }
 
-  private next(): Job | undefined {
+  /**
+   * The next job by rank (first come within one); `beside`: the first input that may go beside a request that yields
+   * (none when an input ahead of it may not: inputs keep their order).
+   */
+  private next(beside = false): Job | undefined {
+    if (beside) {
+      const first = this.queue.find((j) => j.prio === 'input');
+      return first?.beside ? first : undefined;
+    }
     let best: Job | undefined;
-    for (const j of this.queue) if (!best || RANK[j.prio] < RANK[best.prio]) best = j;
+    for (const j of this.queue) {
+      if (!best || RANK[j.prio] < RANK[best.prio]) best = j;
+    }
     return best;
   }
 
   private pump(): void {
-    if (this.current) return;
-    const job = this.next();
-    if (!job) {
-      for (const d of [...this.drains]) d();
-      return;
+    for (;;) {
+      // the lane's own slot (never while an input is still beside the one before: one more on the phone at most)
+      if (!this.current && !this.side) {
+        const job = this.next();
+        if (job) {
+          this.begin(job, 'main');
+          continue;
+        }
+      }
+      // 2026-11-22: what's on its way yields: the next input goes beside it now (inputs keep their order)
+      if (this.current?.yields && !this.side) {
+        const job = this.next(true);
+        if (job) {
+          this.begin(job, 'side');
+          continue;
+        }
+      }
+      break;
     }
+    if (!this.current && !this.side) for (const d of [...this.drains]) d();
+  }
+
+  private begin(job: Job, where: 'main' | 'side'): void {
     this.queue.splice(this.queue.indexOf(job), 1);
     if (job.timer) clearTimeout(job.timer);
-    const cur = { label: job.label, prio: job.prio, since: this.now(), abandoned: false };
-    this.current = cur;
+    const cur: Slot = { label: job.label, prio: job.prio, since: this.now(), abandoned: false, yields: job.yields };
+    if (where === 'main') this.current = cur;
+    else this.side = cur;
+    const release = () => {
+      if (this.current === cur) this.current = null;
+      if (this.side === cur) this.side = null;
+    };
     let run: LaneRun<unknown>;
     try {
       run = job.start();
     } catch (err) {
-      this.current = null;
+      release();
       job.reject(err);
       for (const j of job.joined) j.reject(err);
-      return this.pump();
+      return;
     }
     let over = false;
     const answered = () => {
@@ -208,7 +267,7 @@ export class WdaLane {
     );
     const free = () => {
       over = true;
-      if (this.current === cur) this.current = null;
+      release();
       this.pump();
     };
     run.ended.then(free, free);

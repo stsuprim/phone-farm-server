@@ -256,6 +256,58 @@ server's many callers reach it one at a time, a slow still and a still's 500 rec
 would wait too long is dropped with a clear "busy", a request never answered has WDA checked (restarted only when it's
 really gone), and `/status` goes past the lane.
 
+### The server never reads the app in front on its own (2026-11-22, the root cause in TikTok)
+
+The owner: "EVEN this on the freaking phone1 it breaks control after few touches". iPhone-1, TikTok's For You feed in
+front: the page said "Drag failed: Sending paused a few seconds after 3 failures in a row"; the owner's tap had waited
+10.3 s and failed with "The phone's control link is restarting (attempt 1)"; the last heal said "restarting WDA
+(attempt 1/4): unreachable (ECONNRESET); then /status asked 4 times over 12.0 s, never answered"; and the card's
+`GET /wda/activeAppInfo` was still unanswered 15.5 s later.
+
+**Why.** Some of WebDriverAgent's routes read the *app in front* through accessibility (its orientation, window, name,
+`/wda/screen`, the tree, elements). WDA answers them on its one main thread, and an app that is busy all the time (a
+video feed) never answers them; `/wda/activeAppInfo`'s hit-test into the app isn't even covered by WDA's
+`accessibilityDeadline`. The 2026-11-21 fix only *paused* such reads: the card's `/wda/activeAppInfo` still went out each
+time its 10-s quiet window or its stall pause ran out (and the orientation was still asked when a live view opened and
+with every new session). That one read held WDA's main thread; the lane held the owner's touches behind it; and a main
+thread blocked that long is what iOS kills an app for: the runner's process was gone (`/status`, which isn't on the
+main thread, was refused, ECONNRESET, while the phone stayed on USB and its port forward stayed up), so the server
+restarted it, and the touches that queued behind that check failed 10 s later. Replayed end to end in
+`test/tiktok.ts` (a fake phone with one main thread, TikTok never answering, iOS's 10-s watchdog): on 54977f4 the card's
+`/wda/activeAppInfo` reached the phone, blocked it 10 s, the runner was killed and restarted, and a swipe failed after
+17.5 s with "restarting (attempt 1)", the phone's own evidence.
+
+**Now:**
+
+- **No read of the app in front unless Lotus asked for it.** `src/wda.ts` refuses, unsent, every such request that
+  isn't explicit (`appBound()`): the card, the list, the watch, a live view's picture, a new session, a recovery never
+  read it. Only Lotus's own reads go: the UI tree (`GET /ui`, phones_read, tap-element), the app's name and orientation
+  with it, and the focused field for typing; each bounded (`APP_READ_MS`: the tree 12 s, the app 3 s), one at a time,
+  refused at once while that app is known not to answer (`appStall`, 60 s doubling to 5 min), and never checked or
+  restarted for when it hangs (WDA answers `/status`: it's the app, not WDA). Stats: `wda.appReads {sent, refused,
+  stuck}`.
+- **The app's name** on the card is what's last known (Lotus's own read, the server's launch, a Home press) with
+  `asOf`, `from` and `maybeChanged` (input came after it), never a guess.
+- **The orientation** comes from the live picture's shape (the USB capture follows the phone as it turns), else what
+  was known; there's no orientation poll any more. A phone never seen turned is taken as upright.
+- **The size** comes from the model's known size (both farm phones), else is read once with Lotus's first look.
+- **Touches never wait behind such a read.** A read of the app in front *yields* in the lane: the owner's touches go
+  beside it at once (in order), instead of waiting behind it and being dropped "busy".
+- **A runner that's gone never swallows touches.** A refused or reset connection is no busy WDA: the request is
+  answered at once with `"The phone's control link is reconnecting (...)"` (`state: "recovering"`), so is every
+  request while WDA is checked, `/status` is asked every 2 s (not 4), and a dead runner is restarted in ~6 s instead of
+  ~12; during the restart requests hear "restarting" at once. Clients count none of these as failed touches.
+- **Evidence kept.** How the last runner ended: `wda.lastRunnerEnd {at, why, xcodebuild: [its last lines], inFlight,
+  captureStartedMsBefore, captureStoppedMsBefore}` (and `[wda-restart] ... the runner ended or was given up on` in the
+  log), so the next one says by itself whether XCTest saw a crash, a kill or a lost device.
+- **A live view after a replug** (iPhone-2 "connecting"): the wake that a picture-less view asks for waits for the
+  phone's control link to come up (up to 150 s, outside the phone's lock/wake turn) instead of giving up after 15 s, so
+  the phone is unlocked as soon as it can be and the viewer's next try gets the picture.
+
+`test/tiktok.ts` (2 minutes, real clocks: TikTok in front, the owner touching every 1-2 s, a rest, Home and back, the
+card and the list asked all along) checks 0 failed touches, 0 reads of the app in front, 0 runner restarts;
+`test/stall.ts` checks each rule on its own.
+
 ### Long runs (2026-11-21)
 
 What keeps the server up for weeks, with phones watched from far links that sleep and drop:
@@ -308,7 +360,7 @@ with `--expose-gc`).
 | `battery.level`, `battery.percent` | `level` a fraction 0..1; `percent` the same as a whole number 0..100 (`round(level * 100)`; the list's own `battery` is 0..100 too) | lockdown's battery domain (`ideviceinfo -q com.apple.mobile.battery`: `BatteryCurrentCapacity`), else the IORegistry, else WDA's `/wda/batteryInfo` |
 | `battery.charging` | `true` while it's on power and charging (or full on the charger) | `BatteryIsCharging` / `FullyCharged` + `ExternalConnected`, else the IORegistry's `IsCharging`, else WDA |
 | `temperatureC` | the battery's temperature, degrees Celsius, one decimal | `idevicediagnostics ioregentry AppleSmartBattery`: `Temperature` (hundredths of a degree, so / 100; a battery that says whole degrees is read as degrees; under 1 or 90+ is a bad read: null) |
-| `app` | the app in front: `{bundleId, name}` | WDA `/wda/activeAppInfo`; the name from the phone's app list or the well-known apps when WDA gives none (`"Home Screen"` for SpringBoard) |
+| `app` | the app in front as last known: `{bundleId, name, asOf?, from?, maybeChanged?}` | 2026-11-22: never asked for the card (an accessibility read of that app): Lotus's own last read of `/wda/activeAppInfo`, the server's own launch, or a Home press (`from`: `read`, `launch`, `home`; `maybeChanged` when input came after it); the name from the phone's app list or the well-known apps (`"Home Screen"` for SpringBoard) |
 | `uptimeSec`, `bootedAt` | seconds since the phone booted, and when that was (ms since the epoch) | **`null` on stock WDA**: neither lockdown nor WDA's `/wda/device/info` says when an iPhone booted. They're read when a WDA build adds `uptime` / `systemUptime` (seconds) or `bootTime` to `/wda/device/info` |
 | `model`, `ios` | the product type (`iPhone14,5`) and the iOS version | `ideviceinfo` `ProductType`, `ProductVersion` |
 | `wda` | WebDriverAgent's signing: `expiresAt` (ISO 8601), `daysLeft`, `state` (as `GET /api/wda`; `"unavailable"` in mock mode or with the re-sign off) | the re-sign scheduler |
@@ -385,9 +437,10 @@ device takes a second or two; everything after it is a few ms.
 ### Orientation and coordinates
 
 `orientation` is how the phone is held: `portrait`, `landscape-left` (turned 90 degrees counter-clockwise, its top edge on the
-left; WDA's `LANDSCAPE`), `landscape-right` (turned clockwise) or `portrait-upside-down`. It's read from WDA
-(`GET /session/:id/orientation`) with the screen size, cached, asked again every 3 s while a view of the phone is open
-(and at once when the picture's size changes), and sent to every open view when it changes:
+left; WDA's `LANDSCAPE`), `landscape-right` (turned clockwise) or `portrait-upside-down`. 2026-11-22: it comes from
+the live picture's shape (the USB capture follows the phone as it turns: tall is portrait, wide keeps the landscape side
+last known, else `landscape-left`), and from WDA (`GET /session/:id/orientation`, the app in front's, an accessibility
+read) only with Lotus's own read of the screen; never polled. It's sent to every open view when it changes:
 
 ```json
 {"type":"orientation","udid":"...","orientation":"landscape-left","point_width":844,"point_height":390,
@@ -1017,7 +1070,7 @@ After `git pull`/code changes run `npm run build` and `launchctl kickstart -k gu
 
 `npm run check` type-checks. `npm test` runs `test/h264.ts` (helper framing, config-before-key, latest-only drop to keyframe,
 helper restarts, offer/RTCP parsing, WebRTC's keyframe unit, RTP clock and pacer queue), `test/input.ts` (live touch straight to the phone and its fallbacks, the HID sidecar's
-protocol, the WDA patch, latency metering, acks' `via`/`ms`), `test/orient.ts` (upright -> device mapping in all four orientations, units, the capture check, orientation in the list, hellos and on change), `test/touch.ts` (order, coalescing, acks, auto-release, wake first, fallbacks with a reason), `test/ui.ts` (UI tree flattening, the element finder, apps by name, `/ui`, `/tap-element`, `/type`, `/key`, `/launch`, `/act`, reports and verify), `test/info.ts` (the detail card: the battery / IORegistry / WDA parsers, the ~15 s cache, `GET /info`, `info` in the list, WDA's quiet read), `test/connect.ts` (a capture warmed ahead and kept warm, a keyframe at once on join, `connectMs` and `first-frame`, `POST /warm`), `test/reliability.ts` (an expired WDA session remade on a 4xx, never a stale UI tree, the settle wait and ids from a changed screen, a playing gesture holding the next action, HID inputs that time out or break off, HID reconnect), `test/heal.ts` (a fake WDA that expires its session, hangs or dies and an iproxy that exits, all healed and counted; a hung action's 504, bursts spaced, the probe before the first action after idle, wake-on-touch; units; `POST /focus`, `focused`, `percent` and `info` pushed), `test/restart.ts` (WDA restarted only when it's really dead: a slow call restarts nothing, three unanswered asks of `/status` do; a 503 at once during a restart; a recover joins it; 4 attempts backed off, then "control down"; a recover or WDA answering brings it back), `test/lane.ts` (one request at a time per phone: a touch first, a late answer holding the lane, stale reads dropped, background reads skipped, a slow still or a still's 500 never recovering or restarting anything, `/status` past the lane), `test/rtc.ts` (WebRTC in mock mode with a node-datachannel client: signaling, ICE,
+protocol, the WDA patch, latency metering, acks' `via`/`ms`), `test/orient.ts` (upright -> device mapping in all four orientations, units, the capture check, orientation in the list, hellos and on change), `test/touch.ts` (order, coalescing, acks, auto-release, wake first, fallbacks with a reason), `test/ui.ts` (UI tree flattening, the element finder, apps by name, `/ui`, `/tap-element`, `/type`, `/key`, `/launch`, `/act`, reports and verify), `test/info.ts` (the detail card: the battery / IORegistry / WDA parsers, the ~15 s cache, `GET /info`, `info` in the list, WDA's quiet read), `test/connect.ts` (a capture warmed ahead and kept warm, a keyframe at once on join, `connectMs` and `first-frame`, `POST /warm`), `test/reliability.ts` (an expired WDA session remade on a 4xx, never a stale UI tree, the settle wait and ids from a changed screen, a playing gesture holding the next action, HID inputs that time out or break off, HID reconnect), `test/heal.ts` (a fake WDA that expires its session, hangs or dies and an iproxy that exits, all healed and counted; a hung action's 504, bursts spaced, the probe before the first action after idle, wake-on-touch; units; `POST /focus`, `focused`, `percent` and `info` pushed), `test/restart.ts` (WDA restarted only when it's really dead: a slow call restarts nothing, three unanswered asks of `/status` do; a 503 at once during a restart; a recover joins it; 4 attempts backed off, then "control down"; a recover or WDA answering brings it back), `test/lane.ts` (one request at a time per phone: a touch first, a late answer holding the lane, stale reads dropped, background reads skipped, a slow still or a still's 500 never recovering or restarting anything, `/status` past the lane), `test/stall.ts` (run from it: the server never reads the app in front on its own; Lotus's own reads bounded, refused while the app doesn't answer, never in a touch's way; a dead runner said at once and restarted in seconds), `test/tiktok.ts` (2 minutes end to end with TikTok in front: the owner's touches, the card and the list; 0 failed touches, 0 reads of the app, 0 restarts; `TIKTOK_MS` shortens it), `test/rtc.ts` (WebRTC in mock mode with a node-datachannel client: signaling, ICE,
 RTP, PLI -> IDR, SPS/PPS with every keyframe, `rtc-key`, the RTP clock, data channels and acks, stats, rtc-error), `test/audio.ts` (the sound: the helper's audio records, `audio on/off`, the held capture, the Opus track beside the picture, a session without sound, the volume raised and put back, a crash's raise put right) and `test/smoke.ts` (a mock server: auth, every endpoint, MJPEG,
 H.264 WebSocket, the MJPEG fallback, ping/pong). Mock mode's H.264 is a real, decodable stream (a tiny built-in encoder:
 Constrained Baseline 208x448, I_PCM keyframes and skip-coded deltas), so clients can test decoding against it.

@@ -122,6 +122,8 @@ export class RealBackend implements Backend {
   private volume: VolumeGuard; // the phone's media volume while its sound is on the Mac
   /** Which phones are plugged in: one poll that misses a phone never counts as an unplug (src/presence.ts). */
   private presence = new Presence();
+  /** A closed capture host's start and stop times (the host itself is gone). */
+  private capTimes = new Map<string, { startedAt: number | null; stoppedAt: number | null }>();
   private runCmd: RunCmd;
   /** Set by the server: a phone's orientation or upright size changed. */
   onOrientation?: (udid: string) => void;
@@ -153,6 +155,11 @@ export class RealBackend implements Backend {
       if (c) c.tries = 0; // the phone turned: a new chance for the capture to follow
       this.captureCheck(udid);
       this.onOrientation?.(udid);
+    };
+    // 2026-11-22: when the live view's capture started and stopped, for the record of how a WDA runner ended
+    this.wda.captureTimes = (udid) => {
+      const h = this.hosts.get(udid);
+      return h ? { startedAt: h.startedAt, stoppedAt: h.stoppedAt } : this.capTimes.get(udid) ?? { startedAt: null, stoppedAt: null };
     };
     void this.poll();
     this.timer = setInterval(() => void this.poll(), cfg.pollMs);
@@ -275,7 +282,9 @@ export class RealBackend implements Backend {
         this.h264Sources.delete(k);
       }
     }
-    this.hosts.get(udid)?.close();
+    const host = this.hosts.get(udid);
+    host?.close();
+    if (host) this.capTimes.set(udid, { startedAt: host.startedAt, stoppedAt: host.stoppedAt });
     this.hosts.delete(udid);
     const c = this.capture.get(udid);
     if (c?.timer) clearTimeout(c.timer);
@@ -288,8 +297,9 @@ export class RealBackend implements Backend {
     return this.wda.orientation(udid);
   }
 
-  refreshOrientation(udid: string, maxAgeMs?: number): Promise<Orientation | null> {
-    return this.wda.refreshOrientation(udid, maxAgeMs);
+  /** 2026-11-22: WDA is asked only for Lotus's own read of the screen (`explicit`); everyone else gets what's known. */
+  refreshOrientation(udid: string, maxAgeMs?: number, explicit = false): Promise<Orientation | null> {
+    return this.wda.refreshOrientation(udid, maxAgeMs, explicit);
   }
 
   /** CAPTURE_ROTATE: off (default), cw / ccw (turn a sideways picture upright that way), or 90 / 180 / 270 (always). */
@@ -299,16 +309,20 @@ export class RealBackend implements Backend {
     return v === '90' || v === '180' || v === '270' ? Number(v) : 'off';
   }
 
-  /** A lane's picture size came or changed: the phone may just have turned, so ask it, then see whether they agree. */
+  /**
+   * A lane's picture size came or changed: the phone may just have turned. 2026-11-22: its shape says how (the USB
+   * capture follows the phone as it turns), and WDA is never asked (the app in front's orientation is an accessibility
+   * read: a live view opening on TikTok's feed used to send one, which held WDA's main thread).
+   */
   private captureInfo(udid: string, info: H264Info): void {
     if (!(info.width > 0) || !(info.height > 0)) return;
     let c = this.capture.get(udid);
     if (!c) this.capture.set(udid, (c = { tries: 0, mismatch: null }));
     c.size = { width: info.width, height: info.height };
-    void this.wda.refreshOrientation(udid, 0).then(
-      () => this.captureCheck(udid),
-      () => {},
-    );
+    // the picture as the phone is turned: our own quarter turn (CAPTURE_ROTATE) undone first
+    const turned = (this.hosts.get(udid)?.rotated ?? 0) % 180 !== 0;
+    this.wda.noteFrame(udid, turned ? info.height : info.width, turned ? info.width : info.height);
+    this.captureCheck(udid);
   }
 
   /**
@@ -505,20 +519,24 @@ export class RealBackend implements Backend {
     const basic: PhoneFacts = { ...basicFacts(p), connectedAt: p.online ? this.seen.get(udid) ?? null : null };
     if (!p.online) return basic;
     const quiet = (cmd: string, args: string[], ms: number) => run(cmd, args, ms).catch(() => '');
-    const [lockdown, ioreg, app, dev] = await Promise.all([
+    // 2026-11-22: the app in front is never asked for the card (WDA reads it through accessibility, which TikTok's feed
+    // left hanging on WDA's one main thread, every time the card looked again): it's what's known (Lotus's own last
+    // read, the server's launch, Home), with when and whether the phone had input since
+    const known = this.wda.knownApp(udid);
+    const [lockdown, ioreg, dev] = await Promise.all([
       quiet('ideviceinfo', ['-u', udid, '-q', 'com.apple.mobile.battery'], 4000),
       quiet('idevicediagnostics', ['-u', udid, 'ioregentry', 'AppleSmartBattery'], 5000),
-      this.wda.peek(udid, '/wda/activeAppInfo', 2500),
       this.wda.peek(udid, '/wda/device/info', 2500),
     ]);
     let batt = mergeBattery(parseBatteryDomain(lockdown), parseIoreg(ioreg));
     if (batt.level === null || batt.charging === null) batt = mergeBattery(batt, parseWdaBattery(await this.wda.peek(udid, '/wda/batteryInfo', 2500, true)));
     const d = parseDeviceInfo(dev, Date.now());
+    const app = parseActiveApp(known?.info ?? null, this.appCache.get(udid)?.apps ?? null);
     return {
       ...basic,
       battery: { level: batt.level ?? basic.battery.level, charging: batt.charging },
       temperatureC: batt.temperatureC,
-      app: parseActiveApp(app, this.appCache.get(udid)?.apps ?? null),
+      app: app && known ? { ...app, asOf: known.at, from: known.from, ...(known.changedSince ? { maybeChanged: true } : {}) } : app,
       uptimeSec: d.uptimeSec,
       bootedAt: d.bootedAt,
       thermal: d.thermal,
@@ -1043,6 +1061,12 @@ export class RealBackend implements Backend {
 
   restartWda(udid: string): void {
     this.wda.restartRunner(udid);
+  }
+
+  /** 2026-11-22: the phone's control link takes requests within `ms` (it may be starting after a replug). */
+  whenControlReady(udid: string, ms: number): Promise<boolean> {
+    if (!this.phones.get(udid)?.online) return Promise.resolve(false);
+    return this.wda.whenReady(udid, ms);
   }
 
   /** Probe the phone's WDA session and heal what's wrong (src/wda.ts probe); false when WDA can't take input. */
