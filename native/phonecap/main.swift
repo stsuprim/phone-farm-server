@@ -33,7 +33,9 @@
 //   (scripts/build-native.mjs copies the caps above to build/phonecap.caps, so the server knows what this build speaks)
 // stderr: human-readable log lines. Exit codes: 2 no device, 3 camera access denied, 4 capture failed,
 //          5 device disconnected, 6 encoder failed, 7 several iPhones share a name and can't be told apart,
-//          8 the picture kept its old shape after the phone turned (the server starts the capture again).
+//          8 the picture kept its old shape after the phone turned (the server starts the capture again),
+//          9 the session ran but the iPhone screen device gave no frame at all within FIRST_FRAME_SECONDS (the
+//            server starts the capture again: a new session on the device gets frames).
 // --udid: macOS 27 gives iPhone screens random UUIDs, so phonecap links them to UDIDs itself (see "UDID -> screen
 //          device mapping"); --list prints each capture device's uniqueID, name, UDID (or "unresolved") and how.
 //
@@ -57,6 +59,12 @@ func log(_ s: String) {
 }
 
 func nowMs() -> Double { Date().timeIntervalSince1970 * 1000 }
+
+/// 2026-11-23 (iPhone-2 stuck on "connecting" after a replug): a CoreMediaIO iPhone screen device opened right after
+/// a replug, or before the phone is ready, can run its session without ever handing over a frame until it's opened
+/// again. A session that gave no frame this long after startRunning exits 9 and the server starts a new one. Only the
+/// first frame is watched: a still screen sends no frames at all, so a quiet running capture is not a stuck one.
+let FIRST_FRAME_SECONDS = 5.0
 
 // MARK: - options
 
@@ -1183,6 +1191,7 @@ final class Capturer: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate {
     private var lastBuffer: CVPixelBuffer?
     private var lastRaw: CVPixelBuffer? // the last frame as captured (before any turn)
     private var lastFrameAt = 0.0
+    private var gotFrame = false // a video frame came from the device (used on the capture queue only)
     private var input: AVCaptureDeviceInput?
     var audio: AudioTap?
     // the buffers' shape against the screen's own (see followSource); used on the capture queue only
@@ -1257,6 +1266,12 @@ final class Capturer: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate {
         }
         session.startRunning()
         log("capturing \(device.localizedName) [\(device.uniqueID)]")
+        // the first-frame watchdog (see FIRST_FRAME_SECONDS): checked on the capture queue, where frames arrive
+        queue.asyncAfter(deadline: .now() + FIRST_FRAME_SECONDS) { [weak self] in
+            guard let self = self, !self.gotFrame else { return }
+            log("no frames from the iPhone screen device in \(Int(FIRST_FRAME_SECONDS)) s (running: \(self.session.isRunning)); starting over")
+            exit(9)
+        }
     }
 
     /// The screen's own picture size now (the device's video port format), or nil when it doesn't say.
@@ -1378,6 +1393,10 @@ final class Capturer: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate {
 
     func captureOutput(_ output: AVCaptureOutput, didOutput sb: CMSampleBuffer, from connection: AVCaptureConnection) {
         guard let raw = CMSampleBufferGetImageBuffer(sb) else { return }
+        if !gotFrame {
+            gotFrame = true
+            log("first frame \(CVPixelBufferGetWidth(raw))x\(CVPixelBufferGetHeight(raw))")
+        }
         followSource(width: CVPixelBufferGetWidth(raw), height: CVPixelBufferGetHeight(raw))
         lastRaw = raw
         let pb = rotation != 0 ? (turned(raw) ?? raw) : raw

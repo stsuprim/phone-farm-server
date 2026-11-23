@@ -139,14 +139,27 @@ export interface H264Info {
 export interface ProducerHooks {
   record(r: Rec): void;
   exit(reason: string): void;
+  /** 2026-11-23: the helper found the phone's screen and its capture session runs (its "capturing ..." line). */
+  capturing?(): void;
 }
 export interface Producer {
   key(): void;
   stop(): void;
+  /**
+   * It calls hooks.capturing() once its capture session runs (the real helper), so the first-keyframe watchdog
+   * counts from then, not while the helper still waits for the phone's screen device (up to 12 s after a replug).
+   */
+  reportsCapturing?: boolean;
   /** A new target bitrate for the running encoder (absent: fixed bitrate). */
   bitrate?(bps: number): void;
   /** A new frame rate for the running encoder (absent: fixed). */
   fps?(fps: number): void;
+  /**
+   * 2026-11-23: it ran without giving a picture: end it so a new start makes a new capture session (absent: stop()).
+   * A lanes host (src/lanes.ts) ends its whole process unless that process gave pictures. Its exit hook isn't needed
+   * afterwards (the source has already moved on).
+   */
+  restart?(why: string): void;
 }
 export type StartProducer = (want: H264Settings, hooks: ProducerHooks) => Producer;
 
@@ -274,6 +287,17 @@ export class H264Viewer {
 export interface SourceOptions {
   idleMs?: number; // stop the helper this long after the last viewer leaves
   openTimeoutMs?: number; // give up on the first keyframe after this long
+  /**
+   * 2026-11-23: a capture that has given no keyframe this long after its session runs (the helper's "capturing" line;
+   * a producer that doesn't tell: after its start) is ended and started over, counted as a failed start. Default:
+   * openTimeoutMs. A helper that runs without frames is never left running.
+   */
+  firstKeyMs?: number;
+  /**
+   * A helper that tells when it's capturing but hasn't this long after its start (it waits up to 12 s for the phone's
+   * screen device, then exits by itself) is ended the same way. Default 20 s.
+   */
+  deviceWaitMs?: number;
   log?: (m: string) => void;
   /** Whose lane this is: "lan" (full settings) or "remote" (a far viewer's), for the stats. */
   kind?: 'lan' | 'remote' | 'thumb';
@@ -306,6 +330,14 @@ export class H264Source {
   private restartTimer?: NodeJS.Timeout;
   private failures = 0;
   private gotKey = false;
+  // 2026-11-23, the first-keyframe watchdog: a helper alive but silent (iPhone-2 after a replug) is ended, never waited on
+  private watch?: NodeJS.Timeout;
+  private startedAt = 0;
+  private attempts = 0; // starts since the last keyframe (1: the first try; more: restarts)
+  private capturingAt = 0; // when the running helper said its capture session runs (0: not yet)
+  private reports = false; // the running producer tells when it's capturing
+  private firstKeyMs: number;
+  private deviceWaitMs: number;
   private brokenUntil = 0;
   private lastKeyReq = 0;
   private keyPending = false;
@@ -332,6 +364,8 @@ export class H264Source {
   constructor(private label: string, private startFn: StartProducer, private want: H264Settings, opts: SourceOptions = {}) {
     this.idleMs = opts.idleMs ?? 10_000;
     this.openTimeoutMs = opts.openTimeoutMs ?? 8_000;
+    this.firstKeyMs = opts.firstKeyMs ?? this.openTimeoutMs;
+    this.deviceWaitMs = opts.deviceWaitMs ?? 20_000;
     this.log = opts.log ?? ((m) => console.log(`[h264 ${label}] ${m}`));
     this.kind = opts.kind ?? null;
     if (opts.onInfo) this.infoSubs.add(opts.onInfo);
@@ -361,6 +395,21 @@ export class H264Source {
     return Date.now() < this.brokenUntil ? `H.264 capture failed: ${this.lastError ?? 'unknown error'}` : null;
   }
 
+  /**
+   * What the capture is doing, for the stats (why there's no picture): "off", "running", "waiting for first frame
+   * (restart 2)", "starting over (restart 1): <why>", or "gave up until <time> (tries again then): <why>".
+   */
+  state(): string {
+    const n = this.attempts - 1;
+    const again = n > 0 ? ` (restart ${n})` : '';
+    if (Date.now() < this.brokenUntil) return `gave up until ${new Date(this.brokenUntil).toLocaleTimeString()} (tries again then): ${this.lastError ?? 'unknown error'}`;
+    if (this.producer && this.gotKey) return 'running';
+    if (this.producer) return this.reports && !this.capturingAt ? `looking for the phone's screen${again}` : `waiting for first frame${again}`;
+    // the next start is restart number `attempts`
+    if (this.restartTimer) return `starting over (restart ${Math.max(1, this.attempts)}): ${this.lastError ?? 'the capture stopped'}`;
+    return 'off';
+  }
+
   /** Settings for the next start; a running helper keeps its settings (it's shared). */
   setWant(w: H264Settings): void {
     if (!this.producer) this.want = { ...w };
@@ -380,7 +429,17 @@ export class H264Source {
         reject,
         timer: setTimeout(() => {
           this.waiters = this.waiters.filter((x) => x !== w);
-          reject(new Error(this.lastError ? `H.264 capture did not start: ${this.lastError}` : `no H.264 keyframe within ${this.openTimeoutMs / 1000}s`));
+          const err = new Error(this.lastError ? `H.264 capture did not start: ${this.lastError}` : `no H.264 keyframe within ${this.openTimeoutMs / 1000}s`);
+          // 2026-11-23: a capture that gave this open nothing and that nobody else waits on is ended now, so the next
+          // open starts a fresh one (before, it ran on silent and every later open waited on it: "connecting" forever)
+          // (a helper still looking for the phone's screen is left to find it or exit by itself; one capturing for
+          // only a moment is left to the watchdog)
+          const since = this.reports ? this.capturingAt : this.startedAt;
+          const settled = Math.min(this.firstKeyMs, this.openTimeoutMs / 2, 3000);
+          if (this.producer && !this.gotKey && !this.waiters.length && !this.sinks.size && since && Date.now() - since >= settled) {
+            this.silent(`no picture from the phone's screen within ${this.openTimeoutMs / 1000} s (the capture ran without giving a frame); it starts over with the next viewer`);
+          }
+          reject(err);
           this.maybeIdle();
         }, this.openTimeoutMs),
       };
@@ -482,6 +541,7 @@ export class H264Source {
       capture_to_encoded_ms: round1(this.capToEnc),
       encoded_to_sent_ms: round1(encToSent),
       capture_to_sent_ms: round1(this.capToSent),
+      state: this.state(),
       viewers_ws: ws,
       viewers_rtc: rtc.length,
       path: rtc.map((v) => v.t.path?.() ?? null).find((p) => p) ?? null,
@@ -499,6 +559,10 @@ export class H264Source {
   private start(): void {
     const gen = ++this.gen;
     this.gotKey = false;
+    this.startedAt = Date.now();
+    this.capturingAt = 0;
+    this.reports = false;
+    this.attempts++;
     this.log(`starting capture (${this.want.fps} fps, ${this.want.scale}%, ${(this.want.bitrate / 1e6).toFixed(1)} Mbps${this.want.maxBitrate ? ` up to ${(this.want.maxBitrate / 1e6).toFixed(1)}` : ''})`);
     try {
       this.producer = this.startFn(this.want, {
@@ -508,14 +572,70 @@ export class H264Source {
         exit: (reason) => {
           if (gen === this.gen) this.onExit(reason);
         },
+        capturing: () => {
+          if (gen !== this.gen || this.capturingAt) return;
+          this.capturingAt = Date.now();
+          // the first keyframe is due firstKeyMs from now (a call from inside startFn: armed just below)
+          if (this.producer && !this.gotKey) this.armWatch(gen);
+        },
       });
     } catch (err) {
       this.onExit((err as Error).message);
       return;
     }
+    this.reports = !!this.producer.reportsCapturing;
     this.applied = this.want.bitrate;
     this.appliedFps = this.want.fps;
     if (this.targets.size) this.applyBitrate();
+    this.armWatch(gen);
+  }
+
+  /**
+   * 2026-11-23, the root cause of iPhone-2 on "connecting" for good: a helper can run without ever giving a frame (a
+   * CoreMediaIO screen device opened right after a replug, or before the phone is ready, runs its session without
+   * handing over a buffer until it's opened again). Only an exit restarted a helper, and every open found the silent
+   * one running and waited on it again. Now a capture with no keyframe firstKeyMs after its start is ended and
+   * started over with backoff, counted as a failed start (3 in a row: given up for 60 s with the reason, then tried
+   * again with the next viewer).
+   */
+  private armWatch(gen: number): void {
+    this.clearWatch();
+    // a helper that tells when it's capturing and hasn't yet: it may still be waiting for the phone's screen device
+    const looking = this.reports && !this.capturingAt;
+    const ms = looking ? this.deviceWaitMs : this.firstKeyMs;
+    const secs = +(ms / 1000).toFixed(2);
+    const t = setTimeout(() => {
+      if (this.watch === t) this.watch = undefined;
+      if (gen !== this.gen || this.gotKey || !this.producer) return;
+      this.silent(
+        looking
+          ? `the capture helper found no screen to capture for this iPhone within ${secs} s; starting it over`
+          : `no picture from the phone's screen within ${secs} s after the capture started (it ran without giving a frame); starting it over`,
+      );
+    }, ms);
+    t.unref?.();
+    this.watch = t;
+  }
+
+  private clearWatch(): void {
+    if (this.watch) clearTimeout(this.watch);
+    this.watch = undefined;
+  }
+
+  /** End a capture that runs without giving a picture; it counts as a failed start (restart with backoff, give-up). */
+  private silent(why: string): void {
+    const p = this.producer;
+    this.gen++; // its records and its exit no longer count
+    this.producer = undefined;
+    this.clearWatch();
+    this.log(`no keyframe ${Math.round((Date.now() - this.startedAt) / 100) / 10} s after the start: ending the silent capture`);
+    try {
+      if (p?.restart) p.restart(why);
+      else p?.stop();
+    } catch (err) {
+      this.log(`ending the silent capture: ${(err as Error).message}`);
+    }
+    this.onExit(why);
   }
 
   private onRecord(r: Rec): void {
@@ -551,7 +671,13 @@ export class H264Source {
         this.key = r;
         this.keyPending = false;
         this.deltasSinceKey = 0;
-        this.gotKey = true;
+        if (!this.gotKey) {
+          this.gotKey = true;
+          this.clearWatch();
+          if (this.attempts > 1) this.log(`picture after ${this.attempts - 1} restart${this.attempts > 2 ? 's' : ''}`);
+          this.attempts = 0;
+          this.lastError = null;
+        }
         this.failures = 0;
         this.meter.tick();
         if (this.info && this.waiters.length) {
@@ -595,6 +721,7 @@ export class H264Source {
 
   private onExit(reason: string): void {
     this.producer = undefined;
+    this.clearWatch();
     this.movedAt = 0;
     this.info = this.config = this.key = undefined;
     this.lastError = reason;
@@ -647,6 +774,7 @@ export class H264Source {
 
   private stop(): void {
     this.gen++;
+    this.clearWatch();
     this.producer?.stop();
     this.producer = undefined;
     this.info = this.config = this.key = undefined;
@@ -660,6 +788,9 @@ export class H264Source {
     this.stop();
   }
 }
+
+/** phonecap's stderr line once its capture session runs (main.swift: `log("capturing <name> [<id>]")`). */
+export const CAPTURING_LINE = /^phonecap: capturing /;
 
 /** The helper's command line for its first lane (lane 0). */
 export function helperArgs(want: H264Settings): string[] {
@@ -691,6 +822,7 @@ export function helperProducer(bin: string, args: string[], label: string): Star
     p.stderr!.on('data', (d: Buffer) => {
       for (const line of d.toString().split(/\r?\n/).filter(Boolean)) {
         console.log(`[phonecap ${label}] ${line}`);
+        if (!done && CAPTURING_LINE.test(line)) hooks.capturing?.();
         tail.push(line.replace(/^phonecap:\s*/, ''));
         if (tail.length > 3) tail.shift();
       }
@@ -699,6 +831,7 @@ export function helperProducer(bin: string, args: string[], label: string): Star
     p.on('error', (err) => exit(`could not start the capture helper: ${err.message}`));
     p.on('exit', (code, sig) => exit(tail.length ? tail[tail.length - 1]! : `capture helper exited (${code ?? sig})`));
     return {
+      reportsCapturing: true,
       key: () => {
         if (p.stdin!.writable) p.stdin!.write('key\n');
       },
@@ -724,7 +857,7 @@ export function phoneStats(
   mjpeg: { fps: number; viewers: number },
   h264Reason: string | null,
   buildError: string | null = null,
-): import('./types.js').StreamStats {
+): import('./types.js').StreamStats & { capture_state: string } {
   const all = (Array.isArray(src) ? src : src ? [src] : []).map((s) => s.stats());
   const busy = all.filter((s) => s.viewers_ws + s.viewers_rtc > 0).sort((a, b) => b.viewers_ws + b.viewers_rtc - (a.viewers_ws + a.viewers_rtc));
   const h = busy[0] ?? all[0];
@@ -733,7 +866,10 @@ export function phoneStats(
   const viewersRtc = sum((s) => s.viewers_rtc);
   const h264Viewers = viewersWs + viewersRtc;
   const codec = h264Viewers ? 'h264' : mjpeg.viewers ? 'mjpeg' : null;
-  return {
+  // 2026-11-23: why there's no picture, from the busiest lane (else any lane that isn't off): "waiting for first frame
+  // (restart 2)", "starting over (restart 1): ...", "gave up until ...: ...", "running" or "off"
+  const captureState = (h && h.state !== 'off' ? h.state : all.map((s) => s.state).find((s) => s !== 'off')) ?? 'off';
+  const out: import('./types.js').StreamStats = {
     codec,
     fps: codec === 'h264' ? h!.fps : codec === 'mjpeg' ? mjpeg.fps : null,
     encode_ms: h?.encode_ms ?? null,
@@ -765,4 +901,5 @@ export function phoneStats(
     })),
     helper_build_error: buildError,
   };
+  return Object.assign(out, { capture_state: captureState });
 }

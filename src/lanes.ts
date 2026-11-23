@@ -1,7 +1,7 @@
 import { ChildProcess, spawn } from 'node:child_process';
 import { REMOTE_CEILING_BPS, REMOTE_KEY_SECONDS, REMOTE_LONG_SIDE, REMOTE_MAX_FPS, REMOTE_START_BPS } from './congestion.js';
 import { AUDIO_KIND } from './audio.js';
-import { bitrateFor, H264Settings, helperArgs, KIND, Producer, ProducerHooks, RecordParser, StartProducer } from './h264.js';
+import { bitrateFor, CAPTURING_LINE, H264Settings, helperArgs, KIND, Producer, ProducerHooks, RecordParser, StartProducer } from './h264.js';
 import type { H264Want } from './types.js';
 
 /**
@@ -96,6 +96,7 @@ export class PhonecapHost {
   private audioWanted = false;
   private withAudio = false; // the running process was started with --audio
   private gotPicture = false; // the running process gave a picture
+  private live = false; // the running process said its capture session runs (its "capturing ..." line)
   private audioStrikes = 0;
   private noAudioUntil = 0;
   // a capture held open after its last lane (the phone's volume going back down while the sound is still on the Mac)
@@ -144,7 +145,9 @@ export class PhonecapHost {
     const proc = this.proc;
     let stopped = false;
     const mine = () => !stopped && this.proc === proc && this.lanes.get(id) === hooks;
+    if (this.live) hooks.capturing?.(); // a lane added to a running capture: its first keyframe is due from now
     return {
+      reportsCapturing: true,
       key: () => {
         if (mine()) this.write(`key ${id}`);
       },
@@ -160,6 +163,21 @@ export class PhonecapHost {
         this.lanes.delete(id);
         if (this.lanes.size) this.write(`unlane ${id}`);
         else this.kill();
+      },
+      // 2026-11-23: this lane got no picture in time (src/h264.ts H264Source's watchdog). A process that never gave
+      // any lane a picture runs a capture session that hands over no frames (iPhone-2 after a replug): it's ended
+      // (every lane hears it and starts it again, a new session); one that gives pictures only loses this lane.
+      restart: (why) => {
+        if (!mine()) return;
+        if (this.gotPicture) {
+          stopped = true;
+          this.lanes.delete(id);
+          if (this.lanes.size) this.write(`unlane ${id}`);
+          else this.kill();
+          return;
+        }
+        console.log(`[phonecap ${this.label}] ${why}`);
+        this.restart(why);
       },
     };
   }
@@ -230,6 +248,7 @@ export class PhonecapHost {
     this.startedAt = Date.now();
     this.withAudio = sound;
     this.gotPicture = false;
+    this.live = false;
     if (this.rotation) this.write(`rotate ${this.rotation}`);
     if (sound && this.audioWanted) this.write('audio on');
     if (this.sink && !sound) this.sink.unavailable(`the capture failed with sound on, so it runs without sound until ${new Date(this.noAudioUntil).toLocaleTimeString()}`);
@@ -261,6 +280,10 @@ export class PhonecapHost {
     p.stderr?.on('data', (d: Buffer) => {
       for (const line of d.toString().split(/\r?\n/).filter(Boolean)) {
         console.log(`[phonecap ${this.label}] ${line}`);
+        if (this.proc === p && !this.live && CAPTURING_LINE.test(line)) {
+          this.live = true;
+          for (const h of [...this.lanes.values()]) h.capturing?.();
+        }
         tail.push(line.replace(/^phonecap:\s*/, ''));
         if (tail.length > 3) tail.shift();
       }

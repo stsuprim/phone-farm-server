@@ -1,8 +1,8 @@
 // Unit tests for the H.264 pipeline: helper framing, config-before-key, latest-only drop-to-keyframe,
 // helper failure handling, and the WebRTC helpers (offer parsing, RTCP PLI/FIR, path kinds).
 import assert from 'node:assert/strict';
-import { encodeRecord, H264Source, H264Viewer, KIND, ProducerHooks, Rec, RecordParser, Transport, wsMessage } from '../src/h264.js';
-import { mockSpsPps } from '../src/h264mock.js';
+import { encodeRecord, H264Source, H264Viewer, KIND, phoneStats, ProducerHooks, Rec, RecordParser, StartProducer, Transport, wsMessage } from '../src/h264.js';
+import { mockProducer, mockSpsPps } from '../src/h264mock.js';
 import { firstErrorLine } from '../src/real.js';
 import { hasParameterSets, keyInFlightMs, keyUnit, PaceQueue, parseOffer, pathKind, RtpClock, rtcpWantsKey, STALE_FRAME_MS } from '../src/rtc.js';
 
@@ -177,6 +177,129 @@ const info = Buffer.from(JSON.stringify({ width: 100, height: 200, fps: 60 }));
   assert.match(src.unavailable() ?? '', /no screen capture device/);
   src.close();
   ok('helper stops 10 s (here 50 ms) after the last viewer; restarts with backoff; gives up after 3 failed starts');
+}
+
+// ---- 2026-11-23: a helper alive but silent (iPhone-2 on "connecting" for good after a replug) ----
+/** A hand-driven producer that keeps every start's hooks (a silenced one's late records and exit must not count). */
+function manualMany() {
+  const all: { hooks: ProducerHooks; stops: number; restarts: string[] }[] = [];
+  const start = (_w: unknown, hooks: ProducerHooks) => {
+    const one = { hooks, stops: 0, restarts: [] as string[] };
+    all.push(one);
+    return { key: () => {}, stop: () => void one.stops++, restart: (why: string) => void one.restarts.push(why) };
+  };
+  const picture = (i: number) => {
+    const h = all[i]!.hooks;
+    h.record({ kind: KIND.INFO, time: Date.now(), payload: info, arrived: Date.now() });
+    h.record({ kind: KIND.CONFIG, time: Date.now(), payload: mockSpsPps(), arrived: Date.now() });
+    h.record({ kind: KIND.KEY, time: Date.now(), payload: Buffer.from([0, 0, 0, 1, 0x65]), arrived: Date.now() });
+  };
+  return { all, start, picture };
+}
+{
+  // a producer that never sends a keyframe is ended and started again (with backoff), and the new one is watched too
+  const m = manualMany();
+  const src = new H264Source('t', m.start, want, { log: () => {}, idleMs: 50, openTimeoutMs: 4000, firstKeyMs: 150 });
+  const p = src.open();
+  assert.equal(m.all.length, 1);
+  assert.equal(src.state(), 'waiting for first frame');
+  await sleep(220);
+  assert.equal(m.all[0]!.restarts.length, 1, 'the silent capture was ended (a new session next time)');
+  assert.match(m.all[0]!.restarts[0]!, /no picture from the phone's screen within 0\.15 s/);
+  assert.equal(src.running, false);
+  assert.match(src.state(), /^starting over \(restart 1\): no picture from the phone's screen/);
+  m.all[0]!.hooks.exit('late exit of the silenced helper'); // ignored: the source has moved on
+  m.all[0]!.hooks.record({ kind: KIND.KEY, time: Date.now(), payload: Buffer.from([0, 0, 0, 1, 0x65]), arrived: Date.now() });
+  assert.equal(src.ready, false, "a silenced helper's late records don't count");
+  await sleep(500); // the backoff (500 ms) -> a fresh start
+  assert.equal(m.all.length, 2, 'started again');
+  assert.equal(src.state(), 'waiting for first frame (restart 1)');
+  m.picture(1);
+  assert.deepEqual(await p, { width: 100, height: 200, fps: 60, scale: 100 }, 'the waiting open gets the new picture');
+  assert.equal(src.state(), 'running');
+  const watcher = new H264Viewer(fakeTransport().t, src);
+  src.add(watcher);
+  await sleep(250);
+  assert.equal(m.all.length, 2, 'a capture with a picture is never ended by the watchdog');
+  assert.equal(m.all[1]!.restarts.length + m.all[1]!.stops, 0);
+  src.remove(watcher);
+  src.close();
+  ok('a capture that runs without a keyframe is ended after firstKeyMs and started again; its late records are ignored');
+}
+{
+  // silent three times in a row: given up with a clear reason (not endless "connecting"), and tried again afterwards
+  const m = manualMany();
+  const src = new H264Source('t', m.start, want, { log: () => {}, idleMs: 50, openTimeoutMs: 5000, firstKeyMs: 100 });
+  const p = src.open();
+  await assert.rejects(p, /H\.264 capture failed: no picture from the phone's screen/);
+  assert.equal(m.all.length, 3);
+  assert.ok(m.all.every((x) => x.restarts.length === 1), 'every silent capture was ended');
+  assert.match(src.unavailable() ?? '', /no picture from the phone's screen/);
+  assert.match(src.state(), /^gave up until .* \(tries again then\): no picture from the phone's screen/);
+  const st = phoneStats(src, { fps: 0, viewers: 0 }, src.unavailable()) as { capture_state?: string; h264_reason: string | null };
+  assert.match(st.capture_state ?? '', /^gave up until/, "GET /phones says why there's no picture");
+  assert.match(st.h264_reason ?? '', /no picture from the phone's screen/);
+  (src as unknown as { brokenUntil: number }).brokenUntil = 0; // the 60 s are over
+  assert.equal(src.unavailable(), null);
+  const p2 = src.open();
+  assert.equal(m.all.length, 4, 'after the give-up the next open starts a fresh capture');
+  m.picture(3);
+  await p2;
+  assert.equal(src.state(), 'running');
+  src.close();
+  ok('three silent starts: given up for 60 s with the reason in unavailable() and state(); a fresh capture after that');
+}
+{
+  // an open that timed out on a silent capture nobody else waits on ends it: the next open starts a fresh one
+  const m = manualMany();
+  const src = new H264Source('t', m.start, want, { log: () => {}, idleMs: 50, openTimeoutMs: 120, firstKeyMs: 60_000 });
+  await assert.rejects(src.open(), /no H\.264 keyframe within 0\.12s/, "the viewer's reason still reads as before (rtc.ts wakes on it)");
+  assert.equal(m.all[0]!.restarts.length, 1, 'the silent capture was ended with the open');
+  assert.equal(src.running, false);
+  assert.equal(src.state(), 'off');
+  const p = src.open();
+  assert.equal(m.all.length, 2, 'the next open starts a fresh capture instead of waiting on the silent one');
+  m.picture(1);
+  await p;
+  // a second open waiting on the same capture keeps it (the watchdog still covers it)
+  src.close();
+  const m2 = manualMany();
+  const src2 = new H264Source('t', m2.start, want, { log: () => {}, idleMs: 50, openTimeoutMs: 120, firstKeyMs: 60_000 });
+  const a = src2.open();
+  await sleep(60);
+  const b = src2.open();
+  await assert.rejects(a);
+  assert.equal(m2.all[0]!.restarts.length, 0, 'another open still waits on it: kept');
+  await assert.rejects(b);
+  assert.equal(m2.all[0]!.restarts.length, 1, 'the last waiter gone: ended');
+  src2.close();
+  ok('an open that times out on a silent capture ends it, so the next open starts fresh (never waits on it again)');
+}
+{
+  // a real (mock) producer that sends keyframes is never touched by the watchdog
+  let starts = 0;
+  let stops = 0;
+  const scene = { hue: 200, frame: 0, marks: [], app: 'com.apple.springboard' };
+  const real = mockProducer(() => scene);
+  const start: StartProducer = (w, h) => {
+    starts++;
+    const p = real(w, h);
+    return { ...p, stop: () => (stops++, p.stop()) };
+  };
+  const src = new H264Source('t', start, { fps: 20, scale: 100, bitrate: 2e6 }, { log: () => {}, idleMs: 50, openTimeoutMs: 3000, firstKeyMs: 100 });
+  const got = await src.open();
+  assert.equal(got.width, 208);
+  const v = fakeTransport();
+  const viewer = new H264Viewer(v.t, src);
+  src.add(viewer);
+  await sleep(400);
+  assert.equal(starts, 1);
+  assert.equal(stops, 0);
+  assert.equal(src.state(), 'running');
+  assert.ok(v.sent.length > 3, 'frames keep coming');
+  src.remove(viewer);
+  src.close();
+  ok('a capture that gives keyframes is untouched by the watchdog (one start, no stop, state "running")');
 }
 
 // ---- WebRTC helpers ----

@@ -89,6 +89,88 @@ const tick = () => new Promise((r) => setImmediate(r));
   ok('host: first lane starts phonecap, others via "lane", key/bitrate/fps per lane, unlane, quit with the last, crash -> all');
 }
 
+// ---- 2026-11-23: a phonecap that runs without frames (iPhone-2 after a replug) is ended and started again ----
+{
+  const spawned: { lines: string[]; proc: ChildProcess & EventEmitter; out: PassThrough; err: PassThrough; kills: string[] }[] = [];
+  const spawnFn = (_bin: string, _args: string[]) => {
+    const proc = new EventEmitter() as ChildProcess & EventEmitter;
+    const stdin = new PassThrough();
+    const out = new PassThrough();
+    const err = new PassThrough();
+    const rec = { lines: [] as string[], proc, out, err, kills: [] as string[] };
+    stdin.on('data', (d: Buffer) => rec.lines.push(...d.toString().split('\n').filter(Boolean)));
+    Object.assign(proc, { stdin, stdout: out, stderr: err, kill: (s: string) => (rec.kills.push(s), true) });
+    spawned.push(rec);
+    return proc;
+  };
+  const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+  const picture = (i: number, lane = 0) =>
+    spawned[i]!.out.write(Buffer.concat([
+      encodeRecord((lane << 4) | KIND.INFO, Date.now(), Buffer.from('{"width":100,"height":200,"fps":60,"scale":100}')),
+      encodeRecord((lane << 4) | KIND.KEY, Date.now(), Buffer.from([0, 0, 0, 1, 0x65])),
+    ]));
+
+  // the host: a lane's restart ends a process that never gave a picture (every lane hears it) ...
+  const host = new PhonecapHost('phonecap', ['--udid', 'U'], 'test', spawnFn);
+  const exits: string[] = [];
+  const a = host.start({ fps: 60, scale: 100, bitrate: 8_000_000 }, { record: () => {}, exit: (why) => exits.push(`a: ${why}`) });
+  host.start({ fps: 30, scale: 50, bitrate: 1_500_000 }, { record: () => {}, exit: (why) => exits.push(`b: ${why}`) });
+  a.restart!('no picture');
+  assert.equal(host.running, false);
+  assert.ok(spawned[0]!.kills.includes('SIGTERM') && spawned[0]!.lines.includes('quit'), 'the silent process is ended');
+  assert.deepEqual(exits, ['a: no picture', 'b: no picture']);
+  // ... and one that gives pictures only loses that lane
+  const c = host.start({ fps: 60, scale: 100, bitrate: 8_000_000 }, { record: () => {}, exit: (why) => exits.push(`c: ${why}`) });
+  const d = host.start({ fps: 30, scale: 50, bitrate: 1_500_000 }, { record: () => {}, exit: (why) => exits.push(`d: ${why}`) });
+  picture(1);
+  await tick();
+  d.restart!('no picture on lane 1');
+  await tick();
+  assert.equal(host.running, true, 'a process that gives pictures runs on');
+  assert.equal(spawned[1]!.lines.at(-1), 'unlane 1');
+  assert.equal(exits.length, 2);
+  c.stop();
+  host.close();
+
+  // an H264Source on a host: while phonecap looks for the phone's screen the long device wait applies; once it says
+  // it's capturing, a phonecap without a keyframe is ended after firstKeyMs and a new one started
+  const capturing = (i: number) => spawned[i]!.err.write('phonecap: capturing iPhone [ABC]\n');
+  const host2 = new PhonecapHost('phonecap', ['--udid', 'V'], 'test', spawnFn);
+  const n0 = spawned.length;
+  const src = new H264Source('t lan', host2.start, { fps: 60, scale: 100, bitrate: 8_000_000 }, { log: () => {}, idleMs: 50, openTimeoutMs: 4000, firstKeyMs: 120, deviceWaitMs: 1500 });
+  const opened = src.open();
+  assert.equal(spawned.length, n0 + 1);
+  assert.equal(phoneStats(src, { fps: 0, viewers: 0 }, null).capture_state, "looking for the phone's screen");
+  await sleep(250);
+  assert.equal(spawned[n0]!.kills.length, 0, 'a phonecap still looking for the screen device is given the device wait');
+  capturing(n0);
+  await tick();
+  assert.equal(phoneStats(src, { fps: 0, viewers: 0 }, null).capture_state, 'waiting for first frame');
+  await sleep(180);
+  assert.ok(spawned[n0]!.kills.includes('SIGTERM'), 'the silent phonecap was ended');
+  assert.equal(host2.running, false);
+  assert.match(phoneStats(src, { fps: 0, viewers: 0 }, null).capture_state, /^starting over \(restart 1\): no picture/);
+  await sleep(550);
+  assert.equal(spawned.length, n0 + 2, 'a new phonecap (a new capture session)');
+  capturing(n0 + 1);
+  await tick();
+  assert.equal(phoneStats(src, { fps: 0, viewers: 0 }, null).capture_state, 'waiting for first frame (restart 1)');
+  picture(n0 + 1);
+  const got = await opened;
+  assert.equal(got.width, 100);
+  assert.equal(phoneStats(src, { fps: 0, viewers: 0 }, null).capture_state, 'running');
+  // a second lane on the running capture: its first keyframe is due from when it's added (the helper gives it one)
+  const src2 = new H264Source('t remote', host2.start, { fps: 30, scale: 50, bitrate: 1_500_000 }, { log: () => {}, idleMs: 50, openTimeoutMs: 4000, firstKeyMs: 120, deviceWaitMs: 1500 });
+  const opened2 = src2.open();
+  assert.equal(phoneStats(src2, { fps: 0, viewers: 0 }, null).capture_state, 'waiting for first frame');
+  picture(n0 + 1, 1);
+  await opened2;
+  src2.close();
+  src.close();
+  host2.close();
+  ok('lanes: a silent phonecap is ended (every lane hears it) and started again; one with pictures only loses the lane');
+}
+
 // ---- profiles: LAN as asked, a far viewer smaller, 30 fps, starting low ----
 {
   const lan = profileFor({ fps: 60, scale: 100, quality: null, bitrate: 10_000_000, remote: false }, 8_000_000, 2778);
