@@ -45,6 +45,7 @@ restarting (attempt N)", "state": "restarting"}`; after the restarts gave up, 50
 | POST | `/phones/:udid/clear` | `{}` | empties the focused field in one go: the same as `type` with `{text: "", clear: true}` |
 | POST | `/phones/:udid/key` | `{key}`: `home`, `lock`, `volumeUp`, `volumeDown`, `enter`, `delete` | the report (`lock` locks the phone: the next action wakes it first; `volumeUp` is refused with 403 while `PHONE_SILENT` is on) |
 | POST | `/phones/:udid/keyboard` | `{owner: true, ops: [{text} \| {key, mods, n}]}` (at most 64 ops, 10,000 characters) | `{ok, via, ms}`; see [The PC keyboard](#the-pc-keyboard-2026-11-24) |
+| | `/phones/:udid/files/…` | photos, videos, files and folders onto the phone | see [Files onto a phone](#files-onto-a-phone-2026-11-24) |
 | POST | `/phones/:udid/clipboard` | `{owner: true, action: "copy" \| "cut" \| "paste", text?}` | `{ok, action, how, text?, exact?, why?, via, ms}`; see [The PC keyboard](#the-pc-keyboard-2026-11-24) |
 | POST | `/phones/:udid/home` | `{}` | the report |
 | POST | `/phones/:udid/launch` | `{bundleId}` or `{name}` (as `GET .../apps` lists it: `"Settings"`, `"TikTok"`) | the report; 404 with nearby names when no app has that name |
@@ -746,6 +747,54 @@ our WebDriverAgent before v5.
   selected...). `paste` with `text` (at most 10,000) types it at 60 keys a second (`how: "typed"`, in a password field
   too; a newline is Return); without `text` it presses Cmd+V (`how: "phone"`).
 - **A password field's text is never read**; its length stays on the Mac.
+
+### Files onto a phone (2026-11-24)
+
+`src/files.ts` (uploads, the queue), `src/phonefiles.ts` (the phone's side), `src/mockfiles.ts`. Photos and videos go into
+the phone's **Photos** byte for byte with their own date; everything else, and whole folders, into **Files > On My
+iPhone > Lotus**. Nothing is converted, overwritten, deleted, shared or posted. Needs our WebDriverAgent v6 on the phone
+(it installs itself). `GET /api/settings` says `files: true` on a server that has it. Why this way:
+`research/lotus-app/phones-send-ios.md` in Lotus's folder.
+
+**What the owner does once per phone**
+- After v6 is on it, the first photo or video makes the phone ask *"Lotus" would like to add to your Photos*. Tap
+  **Allow** there (the live view will do). The control app comes to the front for that one question and the phone then
+  goes to its Home Screen. Nothing else ever brings it to the front. Until it's answered photos wait (3 minutes, then
+  they fail with why and can be sent again); other files go on. If it was refused: Settings > Privacy & Security >
+  Photos > Lotus > Add Photos Only.
+- Nothing for Files. The folder shows in Files after the first file. It belongs to the control app (now named "Lotus"
+  on the Home Screen): **deleting that app from the phone deletes the files in it**, so move what should stay. While
+  a phone is back on the stock WebDriverAgent the folder is hidden, not gone.
+
+**Routes** (`/phones/:udid/files/…` and `/api/devices/:udid/files/…`, the same token; every answer has `ok`)
+- `GET can` -> `{ok, photos: {ok, why?, ask?}, files: {ok, why?, folder}, away?, maxBytes, freeBytes?, chunk}`. Photos and
+  Files each stand on their own. `photos.ask`: it works, and the phone's prompt comes with the first photo (`why` says
+  so). `away`: the phone can't be asked now; a send to it waits. `maxBytes`: the most one send (batch) may be;
+  `roomBytes`: what the Mac's disk takes right now.
+- `POST uploads` `{name, rel?, size, mtime? (ms), to: "auto"|"photos"|"files", batch?, key}` -> `{id, state, offset, size,
+  sent, chunk}`. **`rel` is the whole path with the folder's own name first** (`Trip/day 1/a.jpg`) and is what makes a
+  file part of a folder; a file on its own has none. The same `key` gives the unfinished upload, and a finished one only
+  to the batch that sent it. 400 a bad name (`..`, absolute, `\`, `:`, control characters, over 255 bytes a part or 32
+  deep; never says the name), 415 `{can: false}` the phone can't take it and why, 413 the send is too large, 507
+  the Mac (`roomBytes`; more once files landed) or the phone (`freeBytes`) is too full. A failed or cancelled one sent
+  again in its batch is replaced by the new one.
+- `PUT uploads/:id?offset=N` raw bytes, at most `chunk` (4 MB) -> `{offset, size}`. 409 `{offset}` at another place, 400
+  `{offset}` when the piece broke off: go on from there.
+- `POST uploads/:id/finish` `{sha256}` -> the upload's state. 409 `{offset}` not whole, 422 `{offset: 0}` not the file.
+- `POST folder` `{rel, batch?}`: an empty folder, in its turn.
+- `GET uploads/:id` -> `{id, state, offset, size, sent, landed?: {where, path?}, why?}`; `why` also on a `done` one that
+  went to Files instead of Photos, and on a `queued` one that waits. `GET uploads?batch=` -> `{batch, now, count, counts,
+  uploads}`; `&brief=1` without `uploads`, `&after=<now of an earlier answer>` only those that changed since.
+- An unknown upload is a 404 with `error: "unknown upload"`.
+- `DELETE uploads/:id`, `DELETE uploads?batch=` (`{batch, cancelled, landed: {photos, files}}`): what landed stays. One
+  being put in its place right now is waited for (at most 20 s) and said.
+
+A batch's top folder gets a free name once ("Trip (2)") and all of it goes there; any other taken name gets " (2)".
+Files wait in `data/sends` (0700, 0600) until landed, cancelled or a day old; 5 GB of the Mac's disk stays free; an upload
+that's over is kept a day for questions about it, with no name on disk (after a restart `landed` has no `path`); names and contents are never logged. The phone checks the SHA-256 too. One file at a
+time per phone, in 1 MB pieces on connections of its own (routes off WebDriverAgent's main queue, never in the phone's
+request lane): a piece waits for a touch of the last 250 ms (2 s at most) and goes at 8 MB/s while the phone is watched.
+A phone that goes away, a restarted runner or server: it goes on from where the phone has it.
 
 ## Live view: WebRTC, H.264, MJPEG
 

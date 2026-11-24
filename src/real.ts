@@ -11,6 +11,8 @@ import { H264Info, H264Source, helperProducer, phoneStats, StartProducer } from 
 import { basicFacts, mergeBattery, parseActiveApp, parseBatteryDomain, parseDeviceInfo, parseIoreg, parseWdaBattery } from './info.js';
 import { PhonecapHost, profileFor } from './lanes.js';
 import { FieldState, scrubTyped } from './field.js';
+import { PhoneFiles, RealFiles } from './phonefiles.js';
+import { TOKEN_HEADER } from './fork.js';
 import { isText, KeyStep, pieces } from './keys.js';
 import { HidHost, HidPartial, hidPlayMs, HidTimeout, hidTypable, iosMajor, toHid } from './hid.js';
 import type { InputResult } from './inputlog.js';
@@ -131,12 +133,15 @@ export class RealBackend implements Backend {
   private runCmd: RunCmd;
   /** Set by the server: a phone's orientation or upright size changed. */
   onOrientation?: (udid: string) => void;
+  readonly files: PhoneFiles;
 
   /** `opts` (tests): the command runner, a WdaManager and a Presence of their own, and no polling timer. */
   constructor(private cfg: Config, opts: { run?: RunCmd; wda?: WdaManager; presence?: Presence; timer?: boolean } = {}) {
     this.runCmd = opts.run ?? run;
     if (opts.presence) this.presence = opts.presence;
     this.wda = opts.wda ?? new WdaManager(cfg, (udid) => this.phones.get(udid)?.name ?? udid);
+    // 2026-11-24: files straight to each phone's control app, past its request lane (routes off WDA's main queue)
+    this.files = new RealFiles({ target: (udid) => this.wda.filesTarget(udid), ask: (udid) => this.wda.filesAsk(udid), tokenHeader: TOKEN_HEADER });
     const silent = cfg.phoneSilent !== false;
     this.volume = new VolumeGuard({
       percent: cfg.audio === false || silent ? 0 : cfg.audioPhoneVolume ?? 0,
@@ -1149,6 +1154,7 @@ export class RealBackend implements Backend {
     for (const h of this.hosts.values()) h.close();
     for (const h of this.hid.values()) h.close();
     this.volume.close();
+    this.files.close?.();
     await this.wda.shutdown(); // runners' sessions deleted and their processes gone, not left on the phones
   }
 }

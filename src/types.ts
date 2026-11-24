@@ -364,5 +364,7 @@ export interface Backend {
    * (a live view is open) and someone listens.
    */
   audio?(udid: string): import('./audio.js').AudioFeed | string;
+  /** 2026-11-24: files onto a phone (src/files.ts drives it); none on a backend that can't. */
+  files?: import('./phonefiles.js').PhoneFiles;
   close(): Promise<void>;
 }

@@ -181,14 +181,24 @@ static NSString *const FBServerURLEndMarker = @"<-ServerURLHere";
         if (nil == strongSelf) {
           return;
         }
-        NSDictionary *arguments = [NSJSONSerialization JSONObjectWithData:request.body options:NSJSONReadingMutableContainers error:NULL];
+        // >>> LOTUS: a piece of a file comes as raw bytes, and nothing about a file (its name) is ever logged
+        BOOL isLotusFile = [route.path hasPrefix:@"/lotus/files/"];
+        NSDictionary *arguments = nil;
+        if ([route.path isEqualToString:@"/lotus/files/put"]) {
+          arguments = @{@"lotusBody": request.body ?: [NSData data]};
+        } else {
+          arguments = [NSJSONSerialization JSONObjectWithData:request.body options:NSJSONReadingMutableContainers error:NULL];
+        }
+        // <<< LOTUS
         FBRouteRequest *routeParams = [FBRouteRequest
           routeRequestWithURL:request.url
           parameters:request.params
           arguments:arguments ?: @{}
         ];
 
-        [FBLogger verboseLog:routeParams.description];
+        if (!isLotusFile) { // LOTUS
+          [FBLogger verboseLog:routeParams.description];
+        }
 
         @try {
           [route mountRequest:routeParams intoResponse:response];

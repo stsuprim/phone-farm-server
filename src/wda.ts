@@ -5,6 +5,7 @@ import path from 'node:path';
 import { Config } from './config.js';
 import { ClearStep, FieldState, fieldFrom, nextClearStep, scrubTyped } from './field.js';
 import { isNamed, KeyPress, modFlags, NAMED } from './keys.js';
+import { FILES_FORK_VERSION, FILES_ROUTES, FilesTarget, NEEDS_UPDATE, PhoneAway } from './phonefiles.js';
 import { FIELD_FORK_VERSION, FORK_ROUTES, ForkLaunch, KEYS_FORK_VERSION, launchPlan, LIVE_GAPPED, LIVE_SEGMENTED, TOKEN_ENV, TOKEN_HEADER, usableLiveMode, WdaFlavor } from './fork.js';
 import { isLandscape, Orientation, orientationFromWda, uprightSize, uprightToPanel } from './orient.js';
 import { LaneBusy, LanePrio, LaneState, routeLabel, routePriority, WdaLane } from './lane.js';
@@ -3134,6 +3135,38 @@ export class WdaManager {
     }
     if (typeof v?.jpeg !== 'string' || !v.jpeg) throw new WdaError('rejected', 'the phone gave no still');
     return Buffer.from(v.jpeg, 'base64');
+  }
+
+  /** 2026-11-24: where a file for the phone goes (our build's /lotus/files routes), or why it can't go now or at all. */
+  filesTarget(udid: string): FilesTarget {
+    const e = this.entries.get(udid);
+    if (!e || !e.wanted) return { away: `${this.nameOf(udid)} is not connected` };
+    if (e.status !== 'ready' || e.switching) return { away: `${this.nameOf(udid)}'s control link is starting` };
+    if (e.flavor !== 'fork') return { no: NEEDS_UPDATE };
+    if (!e.forkInfo) return { away: `${this.nameOf(udid)}'s control link is starting` };
+    if (e.forkInfo.lotus < FILES_FORK_VERSION) return { no: NEEDS_UPDATE };
+    return { port: e.wdaPort, token: e.token };
+  }
+
+  /**
+   * The phone's own "add to Photos" prompt, once (our build v6): the control app comes to the front for it. The owner
+   * answers it on the phone; nothing here ever does.
+   */
+  async filesAsk(udid: string): Promise<void> {
+    const t = this.filesTarget(udid);
+    if ('no' in t) throw new HttpError(501, t.no);
+    if ('away' in t) throw new PhoneAway(t.away);
+    const e = this.entries.get(udid)!;
+    e.inflight++;
+    try {
+      const v = (await this.raw(e, 'POST', FILES_ROUTES.ask, {}, 15_000, false))?.value;
+      if (v?.asked !== true && v?.status === 'notDetermined') throw new PhoneAway(`${this.nameOf(udid)}'s screen is off or locked, so it can't ask about Photos yet`);
+    } catch (err) {
+      if (err instanceof WdaError && err.kind === 'unknown') throw new HttpError(501, NEEDS_UPDATE);
+      throw err instanceof PhoneAway ? err : new PhoneAway(`${this.nameOf(udid)} is busy`);
+    } finally {
+      e.inflight--;
+    }
   }
 
   /** The phone's own live-touch self-test (POST /lotus/selftest, our build): which way of holding a finger down works. */

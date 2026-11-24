@@ -9,6 +9,7 @@ import { encodePng } from './png.js';
 import type { InputResult } from './inputlog.js';
 import { FieldState, visualLength } from './field.js';
 import { isText, KeyPress, KeyStep } from './keys.js';
+import { MockFiles } from './mockfiles.js';
 import { AppInfo, Backend, ButtonName, ControlState, H264Want, HttpError, Image, ImageFormat, InputMethods, PathPoint, PhoneFacts, PhoneInfo, ScreenInfo, StreamSettings, WarmState } from './types.js';
 
 const MOCK: InputResult = { via: 'mock' };
@@ -28,6 +29,8 @@ export interface MockOptions {
   playMs?: number;
   /** The mock phones' sound: true (default) fake Opus frames every 20 ms while captured and listened to; a string says why there's none. */
   audio?: boolean | string;
+  /** Where files sent to the mock phones land (default a temp folder of its own, deleted at the end). */
+  filesDir?: string;
 }
 
 /** The mock home screen's apps (GET /ui shows them as buttons; tapping one opens it). */
@@ -101,6 +104,8 @@ export class MockBackend implements Backend {
   /** What the mock sound did, in order (tests): "on", "off", "flowing", "quiet", "ended". */
   readonly audioLog: string[] = [];
   private mjpeg = new Map<string, { viewers: number; meter: RateMeter }>();
+  /** Files sent to the mock phones (a temp folder). */
+  readonly files: MockFiles;
   private born = Date.now();
   /** How often each phone's facts were gathered (tests: the ~15 s cache). */
   readonly factsAsked = new Map<string, number>();
@@ -108,6 +113,7 @@ export class MockBackend implements Backend {
   onOrientation?: (udid: string) => void;
 
   constructor(count: number, private opts: MockOptions = {}) {
+    this.files = new MockFiles(opts.filesDir, (udid) => this.phones.get(udid)?.info.online ?? false);
     const models = ['iPhone14,5', 'iPhone13,2', 'iPhone15,2', 'iPhone12,1'];
     for (let i = 0; i < count; i++) {
       const udid = `00008110-MOCK${String(i + 1).padStart(4, '0')}A1B2C3D4`;
@@ -581,6 +587,7 @@ export class MockBackend implements Backend {
 
   async close() {
     clearInterval(this.battTimer);
+    this.files.close();
     for (const t of this.streams) clearInterval(t);
     this.streams.clear();
     for (const s of this.h264Sources.values()) s.close();

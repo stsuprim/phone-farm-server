@@ -5,6 +5,7 @@ import { WebSocket, WebSocketServer } from 'ws';
 import { ackExtra, Agent } from './agent.js';
 import { bitrateAsk, DEFAULT_CEILING_BPS, RateControl, REMOTE_START_BPS, WsFlow } from './congestion.js';
 import { Control, ControlOptions, touchAck, TouchOwner } from './control.js';
+import { FileSends } from './files.js';
 import { H264Viewer, KIND, RateMeter, REMOTE_DROP_BYTES, Transport, wsMessage } from './h264.js';
 import { IdleLock } from './idle.js';
 import { imageSize } from './imgsize.js';
@@ -16,6 +17,9 @@ import { isRemote, NO_PICTURE_WAKE_MS, pathKind, rtcSignaling } from './rtc.js';
 import { SettingsStore } from './settings.js';
 import { Backend, H264Want, HttpError, PhoneInfo, Profile, QualityTier, SessionStats, StreamSettings, WarmState } from './types.js';
 import type { Updater } from './updater.js';
+
+/** A touch or key this recent makes a file on its way to the phone wait (ms). */
+const FILE_YIELD_MS = 250;
 
 /** What createServer can be given besides the backend (index.ts passes all of them; tests some). */
 export interface ServerExtras {
@@ -46,6 +50,10 @@ export interface ServerExtras {
   /** How often a stream socket is pinged, and how long one that answered pings before may stay silent (ms; tests). */
   streamPingMs?: number;
   streamDeadMs?: number;
+  /** 2026-11-24: the private folder files wait in on this Mac (src/files.ts; index.ts: data/sends); none = no sending. */
+  filesDir?: string;
+  /** Tests: the sends' own times and sizes. */
+  files?: Partial<import('./files.js').FileSendsOptions>;
   /** Tests: the live touch's times (src/control.ts: releaseMs, quietMs, holdRepeatMs, ownerGraceMs). */
   touch?: Pick<ControlOptions, 'releaseMs' | 'quietMs' | 'holdRepeatMs' | 'ownerGraceMs'>;
 }
@@ -238,6 +246,44 @@ export function streamSettings(q: URLSearchParams, remote = false): StreamSettin
 
 export { ackExtra };
 
+/** /phones/:udid/files/…: `can`, `folder`, `uploads`, `uploads/:id`, `uploads/:id/finish`. */
+async function filesRoute(sends: FileSends, req: http.IncomingMessage, url: URL, m: RegExpExecArray): Promise<Record<string, unknown>> {
+  let udid: string;
+  try {
+    udid = decodeURIComponent(m[1]!);
+  } catch {
+    throw new HttpError(404, 'unknown phone');
+  }
+  const [, , what, id, finish] = m;
+  const q = url.searchParams;
+  if (what === 'can' && !id) {
+    if (req.method !== 'GET') throw new HttpError(405, 'use GET');
+    return sends.canView(udid);
+  }
+  if (what === 'folder' && !id) {
+    if (req.method !== 'POST') throw new HttpError(405, 'use POST');
+    return { ok: true, ...(await sends.folder(udid, await readJson(req))) };
+  }
+  if (what !== 'uploads') throw new HttpError(404, 'not found');
+  if (!id) {
+    if (req.method === 'POST') return { ok: true, ...(await sends.create(udid, await readJson(req))) };
+    if (req.method === 'GET') return { ok: true, ...sends.batch(udid, q.get('batch') ?? '', { brief: flag(q.get('brief')), after: Number(q.get('after')) || 0 }) };
+    if (req.method === 'DELETE') return { ok: true, ...(await sends.cancelBatch(udid, q.get('batch') ?? '')) };
+    throw new HttpError(405, 'use POST, GET or DELETE');
+  }
+  if (finish) {
+    if (req.method !== 'POST') throw new HttpError(405, 'use POST');
+    return { ok: true, ...(await sends.finish(udid, id, await readJson(req))) };
+  }
+  if (req.method === 'PUT') {
+    const at = q.get('offset') ?? '';
+    return { ok: true, ...(await sends.put(udid, id, /^\d{1,16}$/.test(at) ? Number(at) : -1, req)) };
+  }
+  if (req.method === 'GET') return { ok: true, ...sends.status(udid, id) };
+  if (req.method === 'DELETE') return { ok: true, ...(await sends.cancel(udid, id)) };
+  throw new HttpError(405, 'use PUT, GET or DELETE');
+}
+
 const flag = (v: string | null | undefined) => /^(1|true|yes)$/i.test(v ?? '');
 /** GET /ui is answered within this (a client waits 30 s), with why when the phone couldn't be read in time. */
 export const UI_BUDGET_MS = 25_000;
@@ -283,7 +329,9 @@ export function createServer(backend: Backend, token: string, updater?: Updater,
   const control = new Control(backend, undefined, { natural: () => !extras.exactTouch, seed: extras.touchSeed, ...extras.touch });
   // the owner's live press waits for a wake only when the phone is known to be locked: the look at a quiet phone's
   // screen (a screenshot through WDA) runs beside it, never in front of it
+  const inputAt = new Map<string, number>();
   control.onInput = (udid, discrete, live) => {
+    inputAt.set(udid, Date.now());
     const locked = idle.state(udid).locked === true;
     const waking = idle.activity(udid, discrete);
     return live && !locked ? null : waking;
@@ -292,6 +340,23 @@ export function createServer(backend: Backend, token: string, updater?: Updater,
   // the first action after a quiet spell (and one that hung) has the phone's WDA probed and healed first
   if (backend.heal) control.onHeal = (udid, reason) => backend.heal!(udid, reason);
   const agent = new Agent(backend, control);
+  // 2026-11-24: files for the phones: one at a time each, behind its touches and slower while it's watched
+  const sends = backend.files && extras.filesDir
+    ? new FileSends({
+        dir: extras.filesDir,
+        phone: backend.files,
+        known: async (udid) => {
+          const p = (await backend.list()).find((x) => x.udid === udid);
+          if (!p) throw new HttpError(404, 'unknown phone');
+          return { online: p.online, name: p.name };
+        },
+        pressure: (udid) => ({ touch: Date.now() - (inputAt.get(udid) ?? 0) < FILE_YIELD_MS, live: idle.state(udid).viewers > 0 || (backend.capturing?.(udid) ?? false) }),
+        wake: async (udid) => {
+          if (idle.supported) await idle.wake(udid);
+        },
+        ...extras.files,
+      })
+    : undefined;
 
   // ---- orientation: every open view of a phone hears when it turns (or its picture changes size) ----
   /** The phone as it's turned now: orientation and the upright screen in points and pixels. */
@@ -664,12 +729,12 @@ export function createServer(backend: Backend, token: string, updater?: Updater,
       }
       if (path === '/api/settings' || path === '/settings') {
         // `naturalTouch: true` is not a setting any more (2026-11-16: always on): it only says this server has it
-        // (2026-11-24: `keyboard: true`, likewise: this server has /keyboard and /clipboard)
-        if (req.method === 'GET') return send(res, 200, { ...settings.get(), naturalTouch: true, keyboard: true });
+        // (2026-11-24: `keyboard: true`, likewise: this server has /keyboard and /clipboard; `files`: it takes files)
+        if (req.method === 'GET') return send(res, 200, { ...settings.get(), naturalTouch: true, keyboard: true, files: !!sends });
         if (req.method !== 'PUT' && req.method !== 'POST') throw new HttpError(405, 'use GET or PUT');
         const next = settings.put(await readJson(req));
         void idle.tick().catch(() => {}); // a shorter idle time applies now
-        return send(res, 200, { ...next, naturalTouch: true, keyboard: true });
+        return send(res, 200, { ...next, naturalTouch: true, keyboard: true, files: !!sends });
       }
       if (path === '/api/wda' || path === '/wda') {
         if (req.method !== 'GET') throw new HttpError(405, 'use GET');
@@ -701,6 +766,23 @@ export function createServer(backend: Backend, token: string, updater?: Updater,
         }
         if (req.method !== 'POST') throw new HttpError(405, 'use POST');
         return send(res, 200, await updater.now());
+      }
+
+      // 2026-11-24: files onto a phone (src/files.ts; research/lotus-app/phones-send-brief.md)
+      const fm = /^\/(?:phones|api\/devices)\/([^/]+)\/files\/(can|folder|uploads)(?:\/([^/]+?)(\/finish)?)?$/.exec(path);
+      if (fm) {
+        res.setHeader('cache-control', 'no-store');
+        if (!sends) return send(res, 503, { ok: false, error: 'this server takes no files for its phones' });
+        try {
+          return send(res, 200, await filesRoute(sends, req, url, fm));
+        } catch (err) {
+          // an answer before a piece was read: the rest of it (at most a piece) is let go, so the answer arrives
+          if (!req.readableEnded && !req.destroyed) {
+            if (Number(req.headers['content-length'] ?? 0) > sends.chunk) res.setHeader('connection', 'close');
+            else req.resume();
+          }
+          throw err;
+        }
       }
 
       const m = /^\/(?:phones|api\/devices)\/([^/]+)\/(screenshot|tap|swipe|path|hold|touch|type|clear|key|keyboard|clipboard|home|launch|recover|input|wake|lock|ui|apps|orientation|tap-element|act|info|warm|focus|owner)$/.exec(path);
@@ -1226,6 +1308,7 @@ export function createServer(backend: Backend, token: string, updater?: Updater,
   }
 
   server.on('close', () => {
+    void sends?.close();
     if (watchTimer) clearInterval(watchTimer);
     if (ctlTimer) clearInterval(ctlTimer);
   });

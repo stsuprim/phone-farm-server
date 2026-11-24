@@ -23,6 +23,7 @@
  *                         {"key": character or XCUIKeyboardKey name, "modifierFlags", "n"} (a shortcut)]}, played in
  *                         order with no lookup of the app in front. v5 also serves WDA's own
  *                         /wda/element/0/keyboardInput (the server's first choice for shortcuts).
+ *   /lotus/files/...      v6 (2026-11-24): files from the PC into Photos and Files (FBLotusFiles.inc)
  *
  * Coordinates are points of the screen as the record's orientation says (the Mac's server sends portrait points
  * with "orientation": 1, turning a landscape touch onto the panel itself).
@@ -65,7 +66,7 @@
 #pragma clang diagnostic ignored "-Weverything"
 
 /** The version of our changes. The Mac's server installs this build on a phone whose build says another number. */
-static const NSInteger LotusForkVersion = 5;
+static const NSInteger LotusForkVersion = 6;
 static NSString *const LotusUpstreamTag = @"v16.15.3";
 
 /** How long one step of a live move takes on the phone (seconds): about a frame. */
@@ -140,6 +141,9 @@ static BOOL LotusLiveWatching = NO;
 @end
 
 @interface FBLotusCommands : NSObject <FBCommandHandler>
+// used by FBLotusFiles.inc too
++ (void)lotus_spin:(NSTimeInterval)seconds;
++ (double)lotus_number:(id)value fallback:(double)fallback low:(double)low high:(double)high;
 @end
 
 @implementation FBLotusCommands
@@ -1045,6 +1049,9 @@ static BOOL LotusLiveWatching = NO;
 }
 
 @end
+
+// v6: files from the PC (Photos, Files)
+#include "FBLotusFiles.inc"
 
 #pragma clang diagnostic pop
 

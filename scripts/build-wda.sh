@@ -57,4 +57,8 @@ for UDID in "$@"; do
     exit 1
   fi
   tail -n 3 "$LOG"
+  # Photos and Files on the phone (v6): the runner's Info.plist, then signed again; it never fails the build
+  if [ "$FLAVOR" = "fork" ]; then
+    bash scripts/lotus-runner-plist.sh "$OUT/Build/Products/Debug-iphoneos/WebDriverAgentRunner-Runner.app"
+  fi
 done

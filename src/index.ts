@@ -126,7 +126,7 @@ const resigner =
         problem: signProblem,
       });
 resignerRef = resigner;
-const server = createServer(backend, cfg.token, updater, { settings, idle, resigner, version, fork });
+const server = createServer(backend, cfg.token, updater, { settings, idle, resigner, version, fork, filesDir: path.join(cfg.dataDir, 'sends') });
 
 server.listen(cfg.port, cfg.host, () => {
   console.log(`phone-farm-server ${version.commit ?? '(no commit)'} listening on http://${cfg.host}:${cfg.port} (${cfg.mock ? 'MOCK' : 'real'} mode)`);

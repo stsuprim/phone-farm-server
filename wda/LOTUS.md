@@ -22,6 +22,9 @@ they agree).
 | `WebDriverAgentLib/Utilities/FBMjpegServer.{h,m}` | Deleted, and taken out of `WebDriverAgent.xcodeproj`. Nothing ever listens on 9100. |
 | `WebDriverAgentLib/Commands/FBLotusCommands.inc` | New. Our routes (below). Included by `FBCustomCommands.m`, so it needs no entry in the Xcode project. |
 | `WebDriverAgentLib/Commands/FBCustomCommands.m` | One line: the include. |
+| `WebDriverAgentLib/Commands/FBLotusFiles.inc` | New, v6: the files routes, included at the end of `FBLotusCommands.inc`. Photos, AVFoundation and ImageIO link by themselves (modules). |
+| `WebDriverAgentLib/Routing/FBWebServer.m` (v6) | `/lotus/files/put` gets the request's raw bytes, and no files request is ever in the verbose log. |
+| the runner's `Info.plist` (v6) | Not a source: Xcode makes the runner app itself. The repo's `scripts/lotus-runner-plist.sh` (run by `build-wda.sh` after each fork build) adds `NSPhotoLibraryAddUsageDescription`, `UIFileSharingEnabled`, `LSSupportsOpeningDocumentsInPlace` and the name "Lotus", and signs the app again as `embed-runner-icon.sh` does. When that fails the runner is left as Xcode made it: all else works and `can` says why Photos and Files don't. |
 
 The port is not a source change: upstream reads `USE_PORT`. The server gives each phone its own high port
 (28100 + the phone's index by default) and forwards the same number on the Mac.
@@ -37,6 +40,8 @@ The port is not a source change: upstream reads `USE_PORT`. The server gives eac
 | `POST /lotus/selftest` | Finds out on the phone itself which way of holding a finger down works. See below. |
 | `POST /lotus/field` | v4 (2026-11-18). `{clear: bool}` -> `{found, secure, len, value?, method?, cleared?}`: the field with the keyboard (the app in front's element with keyboard focus). With `clear` it's emptied in one go first, each way only while the field still holds something: the keyboard's Clear key (one HID keypress), then Cmd+A (`typeKey`, Xcode 15+) and one Delete, then a triple tap and one Delete; never a Delete per letter. A secure field (`XCUIElementTypeSecureTextField`, or text that is only bullets) gives its length only, and always gets the Cmd+A step (a web view's password field can read empty when it isn't). Waits for a gesture still playing first. The server reads the field before and after `type` with it (README, "Typing"). Not compiled where it was written: the Mac's build is the check (a failed build keeps v3 running, and the server then answers a clear with 501). |
 | `POST /lotus/keys` | v5 (2026-11-24). `{keys: [{usage, n} \| {key, modifierFlags, n}]}` -> `{played}`: the owner's keyboard. `usage`: a HID keypress of the keyboard page; `key`: a character or an XCUIKeyboardKey name with XCUIKeyModifierFlags, as an event record of its own (no lookup of the app in front). v5 also serves upstream's `/session/:id/wda/element/0/keyboardInput` (element 0 only), the server's first choice for shortcuts. **To see on the Mac:** it compiles; Ctrl+A, C, X, V and arrows on the Phones page act in Notes and in TikTok's comment box. A failed build keeps v4 running, and the server then answers shortcuts with 501. |
+
+| `GET /lotus/files/can`, `POST /lotus/files/{ask,begin,put,land,dir,drop}` | v6 (2026-11-24), `FBLotusFiles.inc`: files from the PC. `begin`, `put` (raw bytes, `?id=&offset=`) and `drop` keep an unfinished file in the runner's own tmp; `land` checks size and SHA-256, then adds it to Photos (PhotoKit, add-only, `shouldMoveFile`, the file's own bytes) or moves it into the runner's Documents, which Files shows as "Lotus", under a free name. Standalone (off the main queue) but `ask`, which brings the runner to the front once for iOS's Photos prompt and goes Home after the answer. Nothing is read from the library, logged, shared or overwritten. |
 
 ### Live touch and its self-test
 
@@ -109,6 +114,11 @@ the real check:
    should still say mode 4; iPhone-1 mode 5 with `gapMs` 40, 100 or 200 (each run's `seen` under `modes`).
 4. **A live drag** on the Phones page follows the pointer while the button is down (with mode 4, a few segments a
    second, each about 100-150 ms behind the pointer); a list scrolls without flinging between segments.
+
+5. **v6, files.** It compiles; the build log ends with "the runner has Photos and Files"; the runner still installs
+   and answers; `GET /phones/:udid/files/can` says both `ok` (Photos with `ask`). One photo: the prompt shows "Lotus",
+   Allow, the photo is in Photos with its date. A video, a PDF and a folder. A re-sign (reinstall) keeps the folder's
+   files. A drag while a 2 GB file is on its way is as quick as before. A photo sent while the phone is locked.
 
 ## Turning it off from afar
 

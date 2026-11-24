@@ -20,6 +20,7 @@ import { MockBackend } from '../src/mock.js';
 import { provisionDates, provisionTeam, WdaResigner } from '../src/resign.js';
 import type { Backend, PathPoint } from '../src/types.js';
 import { createServer } from '../src/server.js';
+import { FILES_FORK_VERSION, FILES_ROUTES } from '../src/phonefiles.js';
 import { FAST_TOUCH_ROUTE, gestureBody, gestureRoute, liveBody, WdaManager } from '../src/wda.js';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -732,11 +733,12 @@ const fakeSpawn = ((cmd: string, args: string[], opts: { env?: NodeJS.ProcessEnv
   const re = new RegExp(allow.replace('(?:/[^/]+)?', '(?:/[^/]+)?'), 'i');
   for (const p of ['/status', '/session', '/session/ABC', '/screenshot', '/session/ABC/screenshot', '/source', '/session/ABC/actions', '/session/ABC/window/size', '/session/ABC/appium/settings', '/orientation',
     '/wda/screen', '/wda/activeAppInfo', '/wda/device/info', '/session/ABC/wda/batteryInfo', '/session/ABC/wda/pressButton', '/wda/homescreen', '/session/ABC/wda/keys', '/wda/lock', '/wda/unlock', '/wda/locked',
-    '/session/ABC/wda/tap', '/session/ABC/wda/apps/launch', '/lotus/info', '/lotus/gesture', '/lotus/touch', '/lotus/shot', '/lotus/selftest', '/lotus/field', '/lotus/keys', '/session/ABC/wda/element/0/keyboardInput']) {
+    '/session/ABC/wda/tap', '/session/ABC/wda/apps/launch', '/lotus/info', '/lotus/gesture', '/lotus/touch', '/lotus/shot', '/lotus/selftest', '/lotus/field', '/lotus/keys', '/session/ABC/wda/element/0/keyboardInput',
+    ...Object.values(FILES_ROUTES)]) {
     assert.ok(re.test(p), `${p} is served`);
   }
   for (const p of ['/health', '/calibrate', '/wda/shutdown', '/wda/healthcheck', '/session/ABC/url', '/session/ABC/element', '/session/ABC/wda/pasteboard', '/wda/apps/list/x', '/session/ABC/execute', '/session/ABC/alert/text',
-    '/wda/siri/activate', '/session/ABC/wda/setPasteboard', '/session/ABC/wda/video/start', '/lotus/other', '/session/ABC/wda/performIoHidEvent', '/session/ABC/wda/keyboard/dismiss', '/session/ABC/wda/element/E1/keyboardInput', '/wda/getPasteboard']) {
+    '/wda/siri/activate', '/session/ABC/wda/setPasteboard', '/session/ABC/wda/video/start', '/lotus/other', '/lotus/files', '/lotus/files/list', '/lotus/files/get', '/session/ABC/wda/performIoHidEvent', '/session/ABC/wda/keyboard/dismiss', '/session/ABC/wda/element/E1/keyboardInput', '/wda/getPasteboard']) {
     assert.ok(!re.test(p), `${p} is not served`);
   }
   // no MJPEG server anywhere in what's built
@@ -747,12 +749,24 @@ const fakeSpawn = ((cmd: string, args: string[], opts: { env?: NodeJS.ProcessEnv
   // live touch: records that don't lift, the persistent-state flags only where XCTest has them, and a stale finger lifted
   assert.ok(inc.includes('respondsToSelector:@selector(setBeginsPersistentState:)') && inc.includes('respondsToSelector:@selector(setEndsPersistentState:)'));
   assert.match(inc, /\+ \(void\)lotus_watchLive[\s\S]*LotusLiveStaleSeconds/);
+  // v6: files into Photos (add-only, never asked for without the text iOS shows) and Files; a piece's raw bytes; no log
+  const filesInc = read('WebDriverAgentLib', 'Commands', 'FBLotusFiles.inc');
+  assert.ok(meta!.version >= FILES_FORK_VERSION && inc.includes('#include "FBLotusFiles.inc"') && inc.indexOf('#include "FBLotusFiles.inc"') < inc.indexOf('#pragma clang diagnostic pop'));
+  for (const route of Object.values(FILES_ROUTES)) assert.ok(filesInc.includes(`@"${route}"`), `${route} is registered`);
+  assert.ok(!/FBLogger|NSLog|UIActivity|openURL|removeItemAtPath:target/.test(filesInc), 'nothing logged, shared, opened or deleted once it landed');
+  assert.ok(!/PHAccessLevelReadWrite|PHAsset fetch|fetchAssets/.test(filesInc), 'the library is never read');
+  assert.match(filesInc, /lotus_photosStatus\n\{\n  if \(!\[self lotus_photosKey\]\)/, 'no Photos without its text');
+  assert.ok(web.includes('@"/lotus/files/put"') && web.includes('if (!isLotusFile)'), "a piece's raw bytes, and no request of a file in a log");
   assert.ok(inc.includes('#pragma clang diagnostic ignored "-Weverything"'), 'a warning in our additions never fails the build');
   // the build script builds it from this repo with the same team, certificate and bundle id
   const sh = fs.readFileSync(path.join(ROOT, 'scripts', 'build-wda.sh'), 'utf8');
   assert.ok(!sh.includes('\r'), 'build-wda.sh has Unix line endings');
   assert.match(sh, /if \[ "\$FLAVOR" = "fork" \]; then[\s\S]*PROJ="\$\(pwd\)\/wda"[\s\S]*WDA_FORK_DERIVED_DATA/);
   assert.match(sh, /DEVELOPMENT_TEAM="\$TEAM" CODE_SIGN_IDENTITY="Apple Development" \\\n\s+PRODUCT_BUNDLE_IDENTIFIER="\$BUNDLE"/);
+  const rp = fs.readFileSync(path.join(ROOT, 'scripts', 'lotus-runner-plist.sh'), 'utf8');
+  assert.ok(!rp.includes('\r') && sh.includes('bash scripts/lotus-runner-plist.sh "$OUT/Build/Products/Debug-iphoneos/WebDriverAgentRunner-Runner.app"'));
+  for (const k of ['NSPhotoLibraryAddUsageDescription', 'UIFileSharingEnabled', 'LSSupportsOpeningDocumentsInPlace', 'CFBundleDisplayName']) assert.ok(rp.includes(`put ${k} `), `${k} goes into the runner's Info.plist`);
+  assert.ok(rp.indexOf('codesign --force') > rp.indexOf('put UIFileSharingEnabled') && rp.includes('--preserve-metadata=identifier,entitlements'), 'and it is signed again');
   ok('sources: the licence, the version, the token check before any route, the bare refusal, the route list, no MJPEG, the build script');
 }
 
