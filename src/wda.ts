@@ -4,7 +4,8 @@ import http from 'node:http';
 import path from 'node:path';
 import { Config } from './config.js';
 import { ClearStep, FieldState, fieldFrom, nextClearStep, scrubTyped } from './field.js';
-import { FIELD_FORK_VERSION, FORK_ROUTES, ForkLaunch, launchPlan, LIVE_GAPPED, LIVE_SEGMENTED, TOKEN_ENV, TOKEN_HEADER, usableLiveMode, WdaFlavor } from './fork.js';
+import { isNamed, KeyPress, modFlags, NAMED } from './keys.js';
+import { FIELD_FORK_VERSION, FORK_ROUTES, ForkLaunch, KEYS_FORK_VERSION, launchPlan, LIVE_GAPPED, LIVE_SEGMENTED, TOKEN_ENV, TOKEN_HEADER, usableLiveMode, WdaFlavor } from './fork.js';
 import { isLandscape, Orientation, orientationFromWda, uprightSize, uprightToPanel } from './orient.js';
 import { LaneBusy, LanePrio, LaneState, routeLabel, routePriority, WdaLane } from './lane.js';
 import { knownScreen, pickScreen, saneSize, ScreenPick } from './screens.js';
@@ -2713,29 +2714,96 @@ export class WdaManager {
    * on a stale socket, since part of it may be typed already; only a refused session (nothing typed) is asked again.
    */
   async typeText(udid: string, text: string, keysPerSecond: number): Promise<void> {
-    const e = await this.usable(udid);
     const timeout = 10000 + Math.ceil((text.length * 1000) / Math.max(1, keysPerSecond)) * 2;
     const body = { value: Array.from(text), frequency: Math.max(1, Math.round(keysPerSecond)) };
+    await this.sendOnce(await this.usable(udid), '/wda/keys', body, timeout, text);
+  }
+
+  /**
+   * One session POST sent once only (typing, keys): never again after a recovery or on a stale socket, since part of
+   * it may have happened; only a refused session (nothing happened) is asked again on a new one. `typed`: taken out of
+   * any error. Throws the plain WdaError of an unknown route as it is (`kind: "unknown"`), everything else named.
+   */
+  private async sendOnce(e: Entry, sub: string, body: unknown, timeout: number, typed: string, via: CallVia = {}, sessionless = false): Promise<void> {
+    const how: Via = via.explicit ? { explicit: true } : {};
     e.inflight++;
     try {
-      const sid = await this.session(e);
-      try {
-        await this.raw(e, 'POST', `/session/${sid}/wda/keys`, body, timeout, false);
-      } catch (err) {
-        // a session WDA no longer knows refused the request before typing anything: once more on a new one
-        if (!(err instanceof WdaError) || err.kind !== 'session') throw err;
-        e.sessionId = undefined;
-        await this.raw(e, 'POST', `/session/${await this.session(e)}/wda/keys`, body, timeout, false);
+      if (sessionless) await this.raw(e, 'POST', sub, body, timeout, false, how);
+      else {
+        const sid = await this.session(e);
+        try {
+          await this.raw(e, 'POST', `/session/${sid}${sub}`, body, timeout, false, how);
+        } catch (err) {
+          // a session WDA no longer knows refused the request before typing anything: once more on a new one
+          if (!(err instanceof WdaError) || err.kind !== 'session') throw err;
+          e.sessionId = undefined;
+          await this.raw(e, 'POST', `/session/${await this.session(e)}${sub}`, body, timeout, false, how);
+        }
       }
       e.lastOk = Date.now();
     } catch (err) {
       // never the text in a log or an answer (XCTest names its event after the first letters)
-      const safe = err instanceof WdaError ? Object.assign(new WdaError(err.kind, scrubTyped(err.message, text)), { timeout: err.timeout, conn: err.conn }) : err;
+      const safe = err instanceof WdaError ? Object.assign(new WdaError(err.kind, scrubTyped(err.message, typed)), { timeout: err.timeout, conn: err.conn }) : err;
       if (safe instanceof WdaError && safe.down && !safe.timeout) void this.recover(e, safe.message, safe.kind === 'session', safe.conn).catch(() => {});
       throw this.named(e, safe);
     } finally {
       e.inflight--;
     }
+  }
+
+  /**
+   * What the keyboard can do on this phone (2026-11-24): "full" = keys and shortcuts too (a stock WDA, or our build v5+);
+   * "text" = only text, Return, Backspace and Tab (an older build of ours serves no other key route).
+   */
+  keysMode(udid: string): 'full' | 'text' {
+    const e = this.entries.get(udid);
+    if (!e) return 'text';
+    if (e.flavor === 'fork' || e.token || e.forkInfo) return (e.forkInfo?.lotus ?? 0) >= KEYS_FORK_VERSION ? 'full' : 'text';
+    return 'full';
+  }
+
+  /**
+   * One key, `n` times, with its modifiers (2026-11-24, the owner's keyboard). A plain key (an arrow, Tab, Esc, forward
+   * delete) goes as a HID keypress, which asks nothing of the app in front: our build's /lotus/keys in one request, a
+   * stock WDA's performIoHidEvent press by press. One with modifiers goes through WDA's keyboardInput (XCTest's typeKey),
+   * which looks the app in front up: while that app doesn't answer (TikTok's feed), our build plays it as an event
+   * record instead (/lotus/keys, no lookup; WDA_KEYS=record always does). Sent once only, like text.
+   */
+  async pressKey(udid: string, p: KeyPress): Promise<void> {
+    const e = await this.usable(udid);
+    const named = isNamed(p.key) ? NAMED[p.key] : null;
+    const ours = !!(e.flavor === 'fork' || e.token || e.forkInfo);
+    if (this.keysMode(udid) !== 'full') {
+      const text = !p.mods.length ? named?.text ?? (p.key === 'tab' ? '\t' : undefined) : undefined;
+      if (text !== undefined) return this.sendOnce(e, '/wda/keys', { value: Array.from(text.repeat(p.n)), frequency: 30 }, 15_000, text);
+      throw this.noKeys(udid);
+    }
+    const timeout = 6000 + p.n * 150;
+    try {
+      if (!p.mods.length && named) {
+        if (ours) return await this.sendOnce(e, FORK_ROUTES.keys, { keys: [{ usage: named.usage, n: p.n }] }, timeout, '', {}, true);
+        for (let i = 0; i < p.n; i++) await this.sendOnce(e, '/wda/performIoHidEvent', { page: 0x07, usage: named.usage, duration: 0.01 }, 6000, '');
+        return;
+      }
+      const key = named?.xcui ?? p.key;
+      const modifierFlags = modFlags(p.mods);
+      const record = () => this.sendOnce(e, FORK_ROUTES.keys, { keys: [{ key, modifierFlags, n: p.n }] }, timeout, '', {}, true);
+      if (ours && process.env.WDA_KEYS === 'record') return await record();
+      try {
+        await this.sendOnce(e, '/wda/element/0/keyboardInput', { keys: Array.from({ length: p.n }, () => ({ key, modifierFlags })) }, timeout, '', { explicit: true });
+      } catch (err) {
+        // the app in front doesn't answer accessibility, so nothing was sent: the way that doesn't ask it
+        if (ours && err instanceof LaneBusy && err.extra?.appRead === 'busy') return await record();
+        throw err;
+      }
+    } catch (err) {
+      if (err instanceof WdaError && (err.kind === 'unknown' || /typeKey API|can't press/i.test(err.message))) throw this.noKeys(udid);
+      throw err;
+    }
+  }
+
+  private noKeys(udid: string): HttpError {
+    return new HttpError(501, `the WebDriverAgent build on ${this.nameOf(udid)} can't press shortcuts and arrows yet: the server installs the new one by itself, try again in a few minutes`, { state: 'keys-text' });
   }
 
   /**

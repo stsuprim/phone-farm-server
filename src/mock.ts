@@ -8,6 +8,7 @@ import { isLandscape, Orientation } from './orient.js';
 import { encodePng } from './png.js';
 import type { InputResult } from './inputlog.js';
 import { FieldState, visualLength } from './field.js';
+import { isText, KeyPress, KeyStep } from './keys.js';
 import { AppInfo, Backend, ButtonName, ControlState, H264Want, HttpError, Image, ImageFormat, InputMethods, PathPoint, PhoneFacts, PhoneInfo, ScreenInfo, StreamSettings, WarmState } from './types.js';
 
 const MOCK: InputResult = { via: 'mock' };
@@ -61,6 +62,14 @@ interface MockPhone {
   marks: Mark[];
   app: string;
   typed: string;
+  /** The caret and the other end of the selection in `typed` (the same: nothing selected), the phone's clipboard, undo. */
+  caret: number;
+  anchor: number;
+  board: string;
+  undo: string[];
+  redo: string[];
+  /** The field is a password field (its text never leaves the phone), or none has the keyboard (tests). */
+  fieldKind: 'plain' | 'secure' | 'none';
   frame: number;
   orientation: Orientation;
   /** What reached the phone, in order (tests): "tap x,y", "down x,y", "move x,y", "up x,y", "button volumeUp"... */
@@ -110,7 +119,7 @@ export class MockBackend implements Backend {
           scale: PIXEL_SCALE, point_width: SCREEN_W, point_height: SCREEN_H,
           width: SCREEN_W * PIXEL_SCALE, height: SCREEN_H * PIXEL_SCALE,
         },
-        hue: hash(udid) % 360, marks: [], app: SPRINGBOARD, typed: '', frame: 0, orientation: 'portrait', log: [],
+        hue: hash(udid) % 360, marks: [], app: SPRINGBOARD, typed: '', caret: 0, anchor: 0, board: '', undo: [], redo: [], fieldKind: 'plain', frame: 0, orientation: 'portrait', log: [],
       });
     }
     // slowly drain the batteries so the UI has something moving
@@ -396,19 +405,116 @@ export class MockBackend implements Backend {
   }
   async type(udid: string, text: string): Promise<InputResult> {
     const p = this.live(udid);
-    for (const ch of text) p.typed = ch === '\b' ? p.typed.slice(0, -1) : (p.typed + ch).slice(-200);
+    this.insert(p, text);
     p.log.push(`type ${JSON.stringify(text)}`);
     return MOCK;
   }
-  /** The phone's one text field (what was typed), never secure here. */
+
+  /** What's typed goes in at the caret, over the selection ("\b" takes the selection, or the letter before the caret). */
+  private insert(p: MockPhone, text: string): void {
+    for (const ch of text) {
+      const [a, b] = this.selection(p);
+      if (ch === '\b') this.replace(p, a === b ? Math.max(0, a - 1) : a, b, '');
+      else this.replace(p, a, b, ch);
+    }
+  }
+  private selection(p: MockPhone): [number, number] {
+    const at = (n: number) => Math.min(Math.max(0, n), p.typed.length);
+    return [at(Math.min(p.caret, p.anchor)), at(Math.max(p.caret, p.anchor))];
+  }
+  private replace(p: MockPhone, a: number, b: number, text: string): void {
+    if (a === b && !text) return;
+    p.undo.push(p.typed);
+    p.redo = [];
+    p.typed = p.typed.slice(0, a) + text + p.typed.slice(b);
+    p.caret = p.anchor = a + text.length;
+  }
+
+  /** The PC keyboard on the mock's one field: text, arrows, deletes and shortcuts as iOS does them. The log never holds what was typed. */
+  async keyboard(udid: string, steps: KeyStep[], opts: { paste?: boolean } = {}): Promise<InputResult> {
+    const p = this.live(udid);
+    for (const s of steps) {
+      if (isText(s)) {
+        this.insert(p, s.text);
+        p.log.push(`${opts.paste ? 'paste' : 'keys'} ${s.text.length}`);
+        continue;
+      }
+      for (let i = 0; i < s.n; i++) this.press(p, s);
+      p.log.push(`key ${[...s.mods, s.key].join('+')}${s.n > 1 ? ` x${s.n}` : ''}`);
+    }
+    return MOCK;
+  }
+  private press(p: MockPhone, k: KeyPress): void {
+    const t = p.typed;
+    const [a, b] = this.selection(p);
+    const cmd = k.mods.includes('cmd');
+    const alt = k.mods.includes('alt');
+    const caret = Math.min(p.caret, t.length);
+    const left = () => (cmd ? t.lastIndexOf('\n', caret - 1) + 1 : alt ? t.slice(0, caret).replace(/\S+\s*$/, '').length : Math.max(0, caret - 1));
+    const right = () => {
+      if (cmd) return t.indexOf('\n', caret) < 0 ? t.length : t.indexOf('\n', caret);
+      return alt ? caret + (/^\s*\S+/.exec(t.slice(caret))?.[0].length ?? 0) : Math.min(t.length, caret + 1);
+    };
+    const go = (to: number) => {
+      p.caret = to;
+      if (!k.mods.includes('shift')) p.anchor = to;
+    };
+    switch (k.key) {
+      case 'left': return go(left());
+      case 'right': return go(right());
+      case 'up': return go(0);
+      case 'down': return go(t.length);
+      case 'backspace': return this.replace(p, a === b ? left() : a, b, '');
+      case 'delete': return this.replace(p, a, a === b ? right() : b, '');
+      case 'a':
+        if (cmd) [p.anchor, p.caret] = [0, t.length];
+        return;
+      case 'c':
+      case 'x':
+        if (!cmd || a === b || p.fieldKind !== 'plain') return;
+        p.board = t.slice(a, b);
+        if (k.key === 'x') this.replace(p, a, b, '');
+        return;
+      case 'v':
+        if (cmd) this.replace(p, a, b, p.board);
+        return;
+      case 'z': {
+        if (!cmd) return;
+        const [from, to] = k.mods.includes('shift') ? [p.redo, p.undo] : [p.undo, p.redo];
+        const was = from.pop();
+        if (was === undefined) return;
+        to.push(t);
+        p.typed = was;
+        p.caret = p.anchor = was.length;
+        return;
+      }
+      case 'enter': return this.replace(p, a, b, '\n');
+      case 'tab': return this.replace(p, a, b, '\t');
+      default:
+    }
+  }
+  /** Tests: what kind of field has the keyboard, and what it holds. */
+  setField(udid: string, kind: 'plain' | 'secure' | 'none', text = ''): void {
+    const p = this.live(udid);
+    Object.assign(p, { fieldKind: kind, typed: text, caret: text.length, anchor: text.length, undo: [], redo: [] });
+  }
+  /** Tests: the field's text on the phone itself, and the phone's clipboard. */
+  held(udid: string): { text: string; board: string } {
+    const p = this.live(udid);
+    return { text: p.typed, board: p.board };
+  }
+  /** The phone's one text field (what was typed). */
   async field(udid: string, opts: { clear?: boolean } = {}): Promise<FieldState | null> {
     const p = this.live(udid);
     if (opts.clear) {
       const had = p.typed.length > 0;
       p.typed = '';
+      p.caret = p.anchor = 0;
       p.log.push('clear');
       return { found: true, secure: false, len: 0, value: '', method: had ? 'element-clear' : 'empty', cleared: true };
     }
+    if (p.fieldKind === 'none') return { found: false, secure: false, len: null };
+    if (p.fieldKind === 'secure') return { found: true, secure: true, len: visualLength(p.typed) };
     return { found: true, secure: false, len: visualLength(p.typed), value: p.typed };
   }
   async home(udid: string): Promise<InputResult> {
@@ -424,7 +530,7 @@ export class MockBackend implements Backend {
     return MOCK;
   }
   inputMethods(_udid: string): InputMethods {
-    return { hid: 'unsupported', hid_reason: 'mock phones', wda_fast: 'no' };
+    return { hid: 'unsupported', hid_reason: 'mock phones', wda_fast: 'no', keys: 'full' };
   }
 
   private lockedSet = new Set<string>();

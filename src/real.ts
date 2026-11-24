@@ -11,6 +11,7 @@ import { H264Info, H264Source, helperProducer, phoneStats, StartProducer } from 
 import { basicFacts, mergeBattery, parseActiveApp, parseBatteryDomain, parseDeviceInfo, parseIoreg, parseWdaBattery } from './info.js';
 import { PhonecapHost, profileFor } from './lanes.js';
 import { FieldState, scrubTyped } from './field.js';
+import { isText, KeyStep, pieces } from './keys.js';
 import { HidHost, HidPartial, hidPlayMs, HidTimeout, hidTypable, iosMajor, toHid } from './hid.js';
 import type { InputResult } from './inputlog.js';
 import { MjpegSource } from './mjpeg.js';
@@ -34,6 +35,9 @@ const HID_RETRY_MS = 60000;
 const HID_TYPING = process.env.HID_TYPING === '1';
 /** How fast the phone's keyboard types (keys a second; about HID's old pace, readable on the phone's screen). */
 const TYPE_KEYS_PER_SECOND = Math.min(60, Math.max(4, Number(process.env.TYPE_KEYS_PER_SECOND) || 15));
+/** 2026-11-24: the owner's own keyboard keeps up with a fast typist; pasted text at WDA's own full speed. */
+const OWNER_KEYS_PER_SECOND = 40;
+const PASTE_KEYS_PER_SECOND = 60;
 /**
  * 2026-11-16: a phone's USB screen capture runs only while a live view of it is open. It starts with the first viewer
  * and stops this long after the last one left (long enough for a page to redraw or a WebRTC session to be made anew,
@@ -785,6 +789,7 @@ export class RealBackend implements Backend {
       // 2026-11-21: the build this phone runs (or is being started with), as the control app's status says it; it
       // said "stock" for our build whenever WDA wasn't up at that moment (forkInfo is only known once it answers)
       wda: this.wda.flavor(udid),
+      keys: this.wda.keysMode(udid),
       wda_live: this.wda.liveWhy(udid) === null ? 'ready' : 'off',
       wda_live_reason: this.wda.liveWhy(udid),
     };
@@ -849,6 +854,10 @@ export class RealBackend implements Backend {
    * it ("aaa" in a password); a HID keyboard also hides the on-screen one. HID_TYPING=1 brings it back.
    */
   async type(udid: string, text: string): Promise<InputResult> {
+    return this.typeAt(udid, text, TYPE_KEYS_PER_SECOND);
+  }
+
+  private async typeAt(udid: string, text: string, keysPerSecond: number): Promise<InputResult> {
     this.known(udid);
     let why: string | null = null;
     if (HID_TYPING && hidTypable(text)) {
@@ -858,13 +867,24 @@ export class RealBackend implements Backend {
       why = hid.why;
     }
     try {
-      await this.wda.typeText(udid, text, TYPE_KEYS_PER_SECOND);
+      await this.wda.typeText(udid, text, keysPerSecond);
     } catch (err) {
       // never the text itself in an answer or a log (XCTest names its record after the first letters)
       const m = scrubTyped((err as Error)?.message ?? String(err), text);
       throw new HttpError(err instanceof HttpError ? err.status : 502, `${m}; it was not typed again: look at the field before trying again`);
     }
     return why ? { via: 'wda', reason: why } : { via: 'wda' };
+  }
+
+  /** 2026-11-24, the PC keyboard: the steps in order, each sent once (a failed one stops the rest: nothing is typed out of order). */
+  async keyboard(udid: string, steps: KeyStep[], opts: { paste?: boolean } = {}): Promise<InputResult> {
+    this.known(udid);
+    let r: InputResult = { via: 'wda' };
+    for (const s of steps) {
+      if (!isText(s)) await this.wda.pressKey(udid, s);
+      else for (const t of pieces(s.text)) r = await this.typeAt(udid, t, opts.paste ? PASTE_KEYS_PER_SECOND : OWNER_KEYS_PER_SECOND);
+    }
+    return r;
   }
 
   /** The focused field: read it, or with `clear` empty it in one go first (WdaManager.field). */

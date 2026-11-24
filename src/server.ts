@@ -197,6 +197,9 @@ function send(res: http.ServerResponse, status: number, body: unknown): void {
   res.end(data);
 }
 
+/** POST /keyboard and /clipboard answer within this (ms), also while a long text is still being typed. */
+const KEYS_ANSWER_MS = 20_000;
+
 async function readJson(req: http.IncomingMessage): Promise<Record<string, unknown>> {
   const chunks: Buffer[] = [];
   let size = 0;
@@ -661,11 +664,12 @@ export function createServer(backend: Backend, token: string, updater?: Updater,
       }
       if (path === '/api/settings' || path === '/settings') {
         // `naturalTouch: true` is not a setting any more (2026-11-16: always on): it only says this server has it
-        if (req.method === 'GET') return send(res, 200, { ...settings.get(), naturalTouch: true });
+        // (2026-11-24: `keyboard: true`, likewise: this server has /keyboard and /clipboard)
+        if (req.method === 'GET') return send(res, 200, { ...settings.get(), naturalTouch: true, keyboard: true });
         if (req.method !== 'PUT' && req.method !== 'POST') throw new HttpError(405, 'use GET or PUT');
         const next = settings.put(await readJson(req));
         void idle.tick().catch(() => {}); // a shorter idle time applies now
-        return send(res, 200, { ...next, naturalTouch: true });
+        return send(res, 200, { ...next, naturalTouch: true, keyboard: true });
       }
       if (path === '/api/wda' || path === '/wda') {
         if (req.method !== 'GET') throw new HttpError(405, 'use GET');
@@ -699,7 +703,7 @@ export function createServer(backend: Backend, token: string, updater?: Updater,
         return send(res, 200, await updater.now());
       }
 
-      const m = /^\/(?:phones|api\/devices)\/([^/]+)\/(screenshot|tap|swipe|path|hold|touch|type|clear|key|home|launch|recover|input|wake|lock|ui|apps|orientation|tap-element|act|info|warm|focus|owner)$/.exec(path);
+      const m = /^\/(?:phones|api\/devices)\/([^/]+)\/(screenshot|tap|swipe|path|hold|touch|type|clear|key|keyboard|clipboard|home|launch|recover|input|wake|lock|ui|apps|orientation|tap-element|act|info|warm|focus|owner)$/.exec(path);
       if (!m) return send(res, 404, { error: 'not found' });
       const udid = decodeURIComponent(m[1]!);
       const action = m[2]!;
@@ -801,6 +805,26 @@ export function createServer(backend: Backend, token: string, updater?: Updater,
       const t0 = performance.now();
       if (action === 'tap-element') return send(res, 200, await agent.inOrder(udid, () => agent.tapElement(udid, body)));
       if (action === 'act') return send(res, 200, await agent.inOrder(udid, () => agent.batch(udid, body)));
+      if (action === 'keyboard' || action === 'clipboard') {
+        // 2026-11-24: the owner's PC keyboard and clipboard; never Lotus's, never logged, never kept
+        if (body.owner !== true) throw new HttpError(400, `the ${action} is the owner's: "owner" must be true`);
+        agent.ownerInput(udid);
+        res.setHeader('cache-control', 'no-store');
+        const going = action === 'keyboard'
+          ? control.handle(udid, { ...body, type: action }).then((r) => ({ ok: true, ...ackExtra(r, t0) }))
+          : control.clipboard(udid, body).then(({ clip, result }) => ({ ok: true, ...clip, ...ackExtra(result, t0) }));
+        // a long text is still being typed: answered before a client gives up (its turn in the queue goes on)
+        let timer: NodeJS.Timeout | undefined;
+        const late = new Promise<Record<string, unknown>>((done) => {
+          timer = setTimeout(() => done({ ok: true, ...(action === 'clipboard' ? { action: body.action, how: body.action === 'paste' ? 'typed' : 'phone-only' } : {}), pending: true, note: 'Still typing on the phone' }), KEYS_ANSWER_MS);
+        });
+        try {
+          return send(res, 200, await Promise.race([going, late]));
+        } finally {
+          clearTimeout(timer);
+          going.catch(() => {}); // after a late answer: the phone's input log has it (never what was typed)
+        }
+      }
       const msg = { ...body, type: action };
       if (action === 'touch') {
         agent.ownerInput(udid); // 2026-11-17: a live touch is the owner's: Lotus pauses on this phone

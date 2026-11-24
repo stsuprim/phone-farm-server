@@ -732,11 +732,11 @@ const fakeSpawn = ((cmd: string, args: string[], opts: { env?: NodeJS.ProcessEnv
   const re = new RegExp(allow.replace('(?:/[^/]+)?', '(?:/[^/]+)?'), 'i');
   for (const p of ['/status', '/session', '/session/ABC', '/screenshot', '/session/ABC/screenshot', '/source', '/session/ABC/actions', '/session/ABC/window/size', '/session/ABC/appium/settings', '/orientation',
     '/wda/screen', '/wda/activeAppInfo', '/wda/device/info', '/session/ABC/wda/batteryInfo', '/session/ABC/wda/pressButton', '/wda/homescreen', '/session/ABC/wda/keys', '/wda/lock', '/wda/unlock', '/wda/locked',
-    '/session/ABC/wda/tap', '/session/ABC/wda/apps/launch', '/lotus/info', '/lotus/gesture', '/lotus/touch', '/lotus/shot', '/lotus/selftest']) {
+    '/session/ABC/wda/tap', '/session/ABC/wda/apps/launch', '/lotus/info', '/lotus/gesture', '/lotus/touch', '/lotus/shot', '/lotus/selftest', '/lotus/field', '/lotus/keys', '/session/ABC/wda/element/0/keyboardInput']) {
     assert.ok(re.test(p), `${p} is served`);
   }
   for (const p of ['/health', '/calibrate', '/wda/shutdown', '/wda/healthcheck', '/session/ABC/url', '/session/ABC/element', '/session/ABC/wda/pasteboard', '/wda/apps/list/x', '/session/ABC/execute', '/session/ABC/alert/text',
-    '/wda/siri/activate', '/session/ABC/wda/setPasteboard', '/session/ABC/wda/video/start', '/lotus/other', '/session/ABC/wda/performIoHidEvent', '/session/ABC/wda/keyboard/dismiss']) {
+    '/wda/siri/activate', '/session/ABC/wda/setPasteboard', '/session/ABC/wda/video/start', '/lotus/other', '/session/ABC/wda/performIoHidEvent', '/session/ABC/wda/keyboard/dismiss', '/session/ABC/wda/element/E1/keyboardInput', '/wda/getPasteboard']) {
     assert.ok(!re.test(p), `${p} is not served`);
   }
   // no MJPEG server anywhere in what's built

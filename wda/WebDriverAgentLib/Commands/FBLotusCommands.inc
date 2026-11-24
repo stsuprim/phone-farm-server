@@ -19,6 +19,10 @@
  *                         value?, method?, cleared?}; with "clear" it's emptied in one go first (Clear key, then
  *                         Cmd+A and one Delete, then a triple tap and one Delete). A secure field's text never
  *                         leaves the phone, only its length.
+ *   POST /lotus/keys      v5 (2026-11-24): the owner's keyboard, {"keys": [{"usage": HID usage, "n"} (a plain key) or
+ *                         {"key": character or XCUIKeyboardKey name, "modifierFlags", "n"} (a shortcut)]}, played in
+ *                         order with no lookup of the app in front. v5 also serves WDA's own
+ *                         /wda/element/0/keyboardInput (the server's first choice for shortcuts).
  *
  * Coordinates are points of the screen as the record's orientation says (the Mac's server sends portrait points
  * with "orientation": 1, turning a landscape touch onto the panel itself).
@@ -41,6 +45,7 @@
 #import "XCUIElement+FBUtilities.h"
 #import "FBCommandStatus.h"
 #import "FBImageProcessor.h"
+#import "FBKeyboard.h"
 #import "FBLogger.h"
 #import "FBResponsePayload.h"
 #import "FBRoute.h"
@@ -60,7 +65,7 @@
 #pragma clang diagnostic ignored "-Weverything"
 
 /** The version of our changes. The Mac's server installs this build on a phone whose build says another number. */
-static const NSInteger LotusForkVersion = 4;
+static const NSInteger LotusForkVersion = 5;
 static NSString *const LotusUpstreamTag = @"v16.15.3";
 
 /** How long one step of a live move takes on the phone (seconds): about a frame. */
@@ -149,6 +154,7 @@ static BOOL LotusLiveWatching = NO;
     [[FBRoute GET:@"/lotus/shot"].withoutSession.standalone respondWithTarget:self action:@selector(handleLotusShot:)],
     [[FBRoute POST:@"/lotus/selftest"].withoutSession respondWithTarget:self action:@selector(handleLotusSelfTest:)],
     [[FBRoute POST:@"/lotus/field"].withoutSession respondWithTarget:self action:@selector(handleLotusField:)],
+    [[FBRoute POST:@"/lotus/keys"].withoutSession respondWithTarget:self action:@selector(handleLotusKeys:)],
   ];
 }
 
@@ -979,6 +985,63 @@ static BOOL LotusLiveWatching = NO;
   state[@"cleared"] = @(found && [state[@"len"] unsignedIntegerValue] == 0);
   state[@"lotus"] = @(LotusForkVersion);
   return FBResponseWithObject(state);
+}
+
+#pragma mark - The owner's keyboard (v5)
+
+/**
+ POST /lotus/keys {"keys": [...]}: keys in order, answered when the last was played. {"usage", "n"}: a key of the HID
+ keyboard page, pressed n times. {"key", "modifierFlags", "n"}: a key with modifiers as one event record of its own
+ (XCPointerEventPath's typeKey), so nothing is asked of the app in front. Nothing of it is logged.
+ */
++ (id<FBResponsePayload>)handleLotusKeys:(FBRouteRequest *)request
+{
+  id keysArg = request.arguments[@"keys"];
+  if (![keysArg isKindOfClass:NSArray.class] || ((NSArray *)keysArg).count < 1 || ((NSArray *)keysArg).count > 64) {
+    return [self lotus_invalid:@"'keys' must be an array of 1 to 64"];
+  }
+  // a gesture still playing finishes first: its record and ours never overlap
+  NSDate *until = [NSDate dateWithTimeIntervalSinceNow:5.0];
+  while (LotusSynthBusy && until.timeIntervalSinceNow > 0) {
+    [self lotus_spin:0.02];
+  }
+  for (id item in (NSArray *)keysArg) {
+    if (![item isKindOfClass:NSDictionary.class]) {
+      return [self lotus_invalid:@"every key must be an object"];
+    }
+    NSInteger n = (NSInteger)[self lotus_number:item[@"n"] fallback:1 low:1 high:100];
+    id usage = item[@"usage"];
+    id key = item[@"key"];
+    for (NSInteger i = 0; i < n; i++) {
+      if ([usage isKindOfClass:NSNumber.class]) {
+        NSError *error = nil;
+        // page 0x07: kHIDPage_KeyboardOrKeypad
+        if (![[XCUIDevice sharedDevice] fb_performIOHIDEventWithPage:0x07 usage:((NSNumber *)usage).unsignedIntValue duration:0.01 error:&error]) {
+          return FBResponseWithStatus([FBCommandStatus unknownErrorWithMessage:@"XCTest refused the key" traceback:nil]);
+        }
+        continue;
+      }
+      if (![key isKindOfClass:NSString.class] || ((NSString *)key).length < 1) {
+        return [self lotus_invalid:@"every key must have 'usage' or 'key'"];
+      }
+      XCPointerEventPath *path = [[XCPointerEventPath alloc] initForTextInput];
+      if (![path respondsToSelector:@selector(typeKey:modifiers:atOffset:)]) {
+        return FBResponseWithStatus([FBCommandStatus unsupportedOperationErrorWithMessage:@"this XCTest can't press a key with modifiers" traceback:nil]);
+      }
+      NSString *value = (NSString *)key;
+#if __clang_major__ >= 15
+      value = [FBKeyboard keyValueForName:value] ?: value;
+#endif
+      unsigned long long flags = (unsigned long long)[self lotus_number:item[@"modifierFlags"] fallback:0 low:0 high:255];
+      [path typeKey:value modifiers:flags atOffset:0.0];
+      XCSynthesizedEventRecord *record = [[XCSynthesizedEventRecord alloc] initWithName:@"Lotus key"];
+      [record addPointerEventPath:path];
+      if (nil != [self lotus_play:record]) {
+        return FBResponseWithStatus([FBCommandStatus unknownErrorWithMessage:@"XCTest refused the key" traceback:nil]);
+      }
+    }
+  }
+  return FBResponseWithObject(@{@"lotus": @(LotusForkVersion), @"played": @YES});
 }
 
 @end

@@ -2,6 +2,7 @@ import crypto from 'node:crypto';
 import { Box, dragPath, flickMs, flickPath, Rng, seeded, LOTUS_SWIPE_STEP_MS, swipeMs, tapPlan } from './human.js';
 import { FieldState, fieldValueOut, parseTypeRequest, TypeRequest, typeCheck } from './field.js';
 import { InputMeter, InputResult, InputVia } from './inputlog.js';
+import { ClipResult, cutText, isSelectAll, KeyStep, parseClipboard, parseKeyOps, pressCount } from './keys.js';
 import { guessUnit, parseUnit, toPoints, Unit } from './orient.js';
 import { Backend, ButtonName, ControlState, HttpError, PathPoint } from './types.js';
 
@@ -9,6 +10,9 @@ const MAX_WAITING = 50; // actions queued per phone before new ones are refused
 /** 2026-11-18: time allowed for reading the focused field (twice per `type`) and for emptying it. */
 const FIELD_READ_MS = 8000;
 const FIELD_CLEAR_MS = 20000;
+/** 2026-11-24: a copy or cut waits this long for the field's text (the owner's next keys wait behind it), and this long for the app to have cut it. */
+const CLIP_READ_MS = 4000;
+const CUT_SETTLE_MS = 150;
 const MAX_POINTS = 5000;
 const MAX_GESTURE_MS = 60000;
 const TAP_MS = 250; // a still touch lifted sooner than this is a tap
@@ -233,6 +237,25 @@ function within<T>(p: Promise<T>, ms: number, onTimeout: () => Error): Promise<T
   });
 }
 
+/** Keyboard input's failure: what it held never reaches a log or an answer (anything not already said safely is a plain 502). */
+async function quietly<T>(p: Promise<T>): Promise<T> {
+  try {
+    return await p;
+  } catch (err) {
+    if (err instanceof HttpError) throw err;
+    throw new HttpError(502, 'the phone could not take the keys; look at the field before trying again');
+  }
+}
+
+/** Why the field's text can't go to the PC; undefined when it can. */
+function unreadable(f: FieldState | null): string | undefined {
+  if (!f) return 'the focused field could not be read';
+  if (!f.found) return 'no field has the keyboard';
+  if (f.secure) return 'a password field is never read';
+  if (typeof f.value !== 'string') return 'the focused field could not be read';
+  return f.value ? undefined : 'the field is empty';
+}
+
 const round1 = (v: number) => Math.round(v * 10) / 10;
 
 /**
@@ -262,6 +285,8 @@ export class Control {
   private touches = new Map<string, Touch>();
   private acted = new Map<string, number>(); // when each phone last had an action start, end or finish playing
   private checks = new Map<string, Promise<unknown>>(); // a health check running beside each phone's queue
+  private turns = new Map<string, number>(); // how many actions each phone was given so far
+  private selectedAll = new Map<string, number>(); // the turn of a Cmd+A: nothing came after it, so the whole field is selected
   private releaseMs: number;
   private quietMs: number;
   private holdRepeatMs: number;
@@ -396,6 +421,8 @@ export class Control {
           discrete: true, timeoutMs: this.actionTimeoutMs + (req.text.length + 1) * 150 + reads,
         });
       }
+      case 'keyboard':
+        return this.keyboard(udid, msg, tRecv);
       case 'key':
         return this.key(udid, msg.key, tRecv);
       case 'home':
@@ -454,6 +481,92 @@ export class Control {
     out.check = typeCheck(req.text, before, after);
     Object.assign(out, fieldValueOut(after));
     return out;
+  }
+
+  /**
+   * 2026-11-24, the PC keyboard (POST /keyboard, or a `keyboard` message): `ops` in order, one turn in the phone's queue,
+   * the owner's only. Nothing of what's typed is logged, kept or answered.
+   */
+  private async keyboard(udid: string, msg: Record<string, unknown>, tRecv: number): Promise<Result> {
+    if (msg.owner !== true) throw new HttpError(400, 'the keyboard is the owner\'s: "owner" must be true');
+    const steps = parseKeyOps(msg.ops);
+    if (!steps.length) return undefined; // only characters no keyboard has
+    const press = this.backend.keyboard?.bind(this.backend);
+    if (!press) throw new HttpError(501, 'this server cannot press keys on this phone');
+    const turn = this.turn(udid) + 1;
+    const r = await this.run(udid, 'keyboard', tRecv, () => quietly(press(udid, steps)), { discrete: true, timeoutMs: this.keysMs(steps) });
+    if (isSelectAll(steps[steps.length - 1])) this.selectedAll.set(udid, turn);
+    return r;
+  }
+
+  /**
+   * 2026-11-24, POST /clipboard (the owner's only). copy and cut press Cmd+C / Cmd+X on the phone; the phone's own
+   * clipboard can't be read without bringing WebDriverAgent to the front (iOS gives a background app nothing), which
+   * would take the owner's app away, so it's never tried. The text comes from the focused field instead, when it can
+   * be read and isn't a secure one: a cut's is what went missing from it, a copy's is the whole field (`exact` when it
+   * is all selected). paste types `text` into the field (a secure one too), or with none presses Cmd+V.
+   */
+  async clipboard(udid: string, body: Record<string, unknown>): Promise<{ clip: ClipResult; result: Result }> {
+    const tRecv = performance.now();
+    if (body.owner !== true) throw new HttpError(400, 'the clipboard is the owner\'s: "owner" must be true');
+    const { action, text } = parseClipboard(body);
+    const b = this.backend;
+    const press = b.keyboard?.bind(b);
+    if (!press) throw new HttpError(501, 'this server cannot press keys on this phone');
+    const field = async (): Promise<FieldState | null> =>
+      !b.field ? null : within(b.field(udid), CLIP_READ_MS, () => new Error('field')).catch(() => null);
+    const chord = (key: string): KeyStep[] => [{ key, mods: ['cmd'], n: 1 }];
+    let clip: ClipResult = { action, how: 'phone-only' };
+    const turn = this.turn(udid) + 1;
+    const whole = this.selectedAll.get(udid) === turn - 1;
+    const fn = async (): Promise<Result> => {
+      if (action === 'paste') {
+        clip = { action, how: text !== null ? 'typed' : 'phone' };
+        return text !== null ? press(udid, [{ text }], { paste: true }) : press(udid, chord('v'));
+      }
+      if (action === 'cut') {
+        const before = await field();
+        const r = await press(udid, chord('x'));
+        clip.why = unreadable(before);
+        if (clip.why) return r;
+        await sleep(CUT_SETTLE_MS);
+        const after = await field();
+        if (!after?.found || after.secure || typeof after.value !== 'string') return (clip.why = 'the field could not be read after the cut', r);
+        const cut = cutText(before!.value!, after.value);
+        if (cut) clip = { action, how: 'field', text: cut.text, exact: cut.exact };
+        else clip.why = before!.value === after.value ? 'nothing was cut: nothing is selected in the field' : 'the field changed in another way meanwhile';
+        return r;
+      }
+      let r: Result = undefined;
+      let refused: HttpError | null = null;
+      try {
+        r = await press(udid, chord('c'));
+      } catch (err) {
+        // this phone's build can't press it: the field's text can still go to the PC
+        if (!(err instanceof HttpError) || err.status !== 501) throw err;
+        refused = err;
+      }
+      const f = await field();
+      clip.why = unreadable(f);
+      if (!clip.why && f!.value) {
+        clip = { action, how: 'field', text: f!.value, exact: whole, ...(whole ? {} : { why: 'the whole field: iOS does not say what is selected' }) };
+      } else if (refused) throw refused;
+      return r;
+    };
+    const result = await this.run(udid, action, tRecv, () => quietly(fn()), {
+      discrete: true, timeoutMs: this.keysMs(text !== null ? [{ text }] : []) + CLIP_READ_MS * 2 + CUT_SETTLE_MS,
+    });
+    if (action === 'copy' && whole) this.selectedAll.set(udid, turn);
+    return { clip, result };
+  }
+
+  /** How many turns the phone's queue has given (asked for) so far. */
+  private turn(udid: string): number {
+    return this.turns.get(udid) ?? 0;
+  }
+
+  private keysMs(steps: readonly KeyStep[]): number {
+    return this.actionTimeoutMs + pressCount(steps) * 150;
   }
 
   private key(udid: string, key: unknown, tRecv: number): Promise<Result> {
@@ -614,6 +727,7 @@ export class Control {
     if (q.waiting >= MAX_WAITING && !opts.must) return Promise.reject(new HttpError(503, 'too many actions waiting for this phone'));
     const queue = q;
     queue.waiting++;
+    if (!opts.quiet) this.turns.set(udid, this.turn(udid) + 1);
     let hung: Promise<unknown> | null = null; // the action that timed out, still on its way at the phone
     const p = queue.tail.then(async () => {
       if (opts.quiet) return fn();

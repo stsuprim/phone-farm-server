@@ -175,6 +175,8 @@ export interface InputMethods {
   wda_fast: 'yes' | 'no' | 'unknown';
   /** Which WebDriverAgent answers on the phone: the stock one, or our own build (src/fork.ts). */
   wda?: 'stock' | 'fork';
+  /** 2026-11-24, the PC keyboard: "full" (keys and shortcuts too) or "text" (text, Return, Backspace, Tab: an older build of ours). */
+  keys?: 'full' | 'text';
   /** Live touch through our build (a finger held down between requests): ready, or off with why. */
   wda_live?: 'ready' | 'off';
   wda_live_reason?: string | null;
@@ -277,6 +279,11 @@ export interface Backend {
   /** One continuous touch through the points (>= 2), with their timing; used for swipe, path and hold. */
   gesture(udid: string, points: PathPoint[]): Promise<InputResult | void>;
   type(udid: string, text: string): Promise<InputResult | void>;
+  /**
+   * 2026-11-24, the PC keyboard: the steps in order (text, then keys with their modifiers), each sent once only. Never
+   * the text in a log or an error. `paste`: a longer text, at the keyboard's own full speed.
+   */
+  keyboard?(udid: string, steps: import('./keys.js').KeyStep[], opts?: { paste?: boolean }): Promise<InputResult | void>;
   /**
    * The focused field (2026-11-18): read it (null: none could be read; never throws for a read), or with `clear` empty
    * it in one go first (WDA's clear, else select all and one Delete; throws when it can't). A secure field's text never

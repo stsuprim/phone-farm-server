@@ -44,6 +44,8 @@ restarting (attempt N)", "state": "restarting"}`; after the restarts gave up, 50
 | POST | `/phones/:udid/type` | `{text, enter?, clear?}` (`enter: true` presses Return after it; `clear: true` empties the focused field in one go first, and `text` may then be `""`; see [Typing](#typing)) | the report plus `check` (the field read back), `value` (not for a secure field), and with `clear` `cleared`, `clear_method` |
 | POST | `/phones/:udid/clear` | `{}` | empties the focused field in one go: the same as `type` with `{text: "", clear: true}` |
 | POST | `/phones/:udid/key` | `{key}`: `home`, `lock`, `volumeUp`, `volumeDown`, `enter`, `delete` | the report (`lock` locks the phone: the next action wakes it first; `volumeUp` is refused with 403 while `PHONE_SILENT` is on) |
+| POST | `/phones/:udid/keyboard` | `{owner: true, ops: [{text} \| {key, mods, n}]}` (at most 64 ops, 10,000 characters) | `{ok, via, ms}`; see [The PC keyboard](#the-pc-keyboard-2026-11-24) |
+| POST | `/phones/:udid/clipboard` | `{owner: true, action: "copy" \| "cut" \| "paste", text?}` | `{ok, action, how, text?, exact?, why?, via, ms}`; see [The PC keyboard](#the-pc-keyboard-2026-11-24) |
 | POST | `/phones/:udid/home` | `{}` | the report |
 | POST | `/phones/:udid/launch` | `{bundleId}` or `{name}` (as `GET .../apps` lists it: `"Settings"`, `"TikTok"`) | the report; 404 with nearby names when no app has that name |
 | GET | `/phones/:udid/ui` | `?all=1` (every node, hidden ones and containers too), `?max=` (elements, default 400), `?fresh=1` (skip the 300 ms cache), `?settle=1` (wait for the picture to stop changing first) | the screen as an agent reads it, see [AI control](#ai-control-read-the-screen-act-verify) |
@@ -719,6 +721,31 @@ this WDA build has no fast route, `unknown` = not tried yet).
   there the length must grow by exactly the text, which must be inside. `null` when the field couldn't be read. A
   secure field (a password field, or text that is only bullets) gives its length only; anything else adds `value`
   (at most 200 characters). Typed text and secure values are never logged.
+
+### The PC keyboard (2026-11-24)
+
+`src/keys.ts`. The owner's PC keyboard types on the phone he's looking at. Both routes are his only (`owner: true`, else
+400), count as his touch (Lotus pauses on that phone), take one turn in the phone's queue with every other input, and
+answer within 20 s (`pending: true` and a `note` while a long text is still being typed). What's typed or copied is
+never logged, kept or put in an error. `GET /api/settings` says `keyboard: true` on a server that has them;
+`stats.input.methods.keys` says per phone `full`, or `text` (text, Return, Backspace and Tab only) while the phone runs
+our WebDriverAgent before v5.
+
+- **`POST /keyboard`**: `ops` in order. `{text}`, or `{key, mods, n}`: `key` is `enter`, `backspace`, `delete` (forward),
+  `tab`, `escape`, `left`, `right`, `up`, `down`, `home`, `end`, `pageup`, `pagedown`, `space` or one character; `mods` of
+  `cmd`, `shift`, `alt`, `ctrl`; `n` 1-100. `home`/`end` are the line's start and end (Cmd+Left/Right), never the Home
+  button. Text, Return and Backspace next to each other go as one `/wda/keys` request (40 keys a second). Plain keys are
+  HID keypresses (nothing asked of the app in front); shortcuts go through WDA's `keyboardInput`, and while the app in
+  front doesn't answer accessibility (TikTok's feed) through our build's `/lotus/keys` (v5), which doesn't ask it
+  (`WDA_KEYS=record`: always). Each is sent once: a failed one stops the rest. 501 where the phone's build can't yet.
+- **`POST /clipboard`**: `copy` and `cut` press Cmd+C / Cmd+X on the phone. iOS gives a background app no pasteboard, and
+  bringing WebDriverAgent to the front would take the owner's app away, so the phone's clipboard is never read. The
+  text comes from the focused field when it can be read: `how: "field"` with `text` (a cut: what went missing from the
+  field; a copy: the whole field, `exact: true` when it was all selected by Cmd+A right before, else `exact: false`, since
+  iOS doesn't say what's selected). Otherwise `how: "phone-only"` with `why` (no field, a password field, nothing
+  selected...). `paste` with `text` (at most 10,000) types it at 60 keys a second (`how: "typed"`, in a password field
+  too; a newline is Return); without `text` it presses Cmd+V (`how: "phone"`).
+- **A password field's text is never read**; its length stays on the Mac.
 
 ## Live view: WebRTC, H.264, MJPEG
 
