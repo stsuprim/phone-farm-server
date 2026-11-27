@@ -1,6 +1,7 @@
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
+import { systemTurn } from './lifecycle.js';
 
 /**
  * WebDriverAgent re-sign. A free Apple ID's provisioning profile lasts 7 days; after that WDA won't launch on the
@@ -162,6 +163,14 @@ export interface ResignOptions {
   log?: (m: string) => void;
   /** Why it can't run at all (e.g. no team id), shown as lastError. */
   problem?: () => string | null;
+  /**
+   * 2026-11-27 (docs/root-cause.md §11, 13.3c): whether the phone's lease is Free (no viewer, no hand, no other
+   * system work). Each phone's build is system:resign work: it waits for this (and for the actor's leases, src/lifecycle.ts)
+   * up to `freeWaitMs`, else that phone is left for the next check; under 12 h left it goes anyway. None: always Free.
+   */
+  free?: (udid: string) => boolean;
+  /** How long one phone's turn waits for its lease (ms; default 10 min). */
+  freeWaitMs?: number;
 }
 
 export class WdaResigner {
@@ -297,7 +306,7 @@ export class WdaResigner {
   /** Re-sign every online phone now (POST /api/wda/resign); one run at a time. `onlyIf`: asked when its turn comes. */
   resignNow(onlyIf?: () => boolean): Promise<WdaSignStatus> {
     if (this.running) return this.running;
-    const p = exclusive(async () => (onlyIf && !onlyIf() ? this.status() : this.doResign())).finally(() => {
+    const p = exclusive(async () => (onlyIf && !onlyIf() ? this.status() : this.doResign(!onlyIf))).finally(() => {
       this.running = undefined;
     });
     this.running = p;
@@ -310,7 +319,8 @@ export class WdaResigner {
     return this.status();
   }
 
-  private async doResign(): Promise<WdaSignStatus> {
+  /** `manual`: asked for (POST /api/wda/resign): every phone, at once, whatever its lease. */
+  private async doResign(manual = false): Promise<WdaSignStatus> {
     const t = this.now();
     this.rec.lastAttemptAt = t;
     const problem = this.o.problem?.() ?? null;
@@ -334,23 +344,49 @@ export class WdaResigner {
     }
     let good = 0;
     const errors: string[] = [];
+    const deferred: string[] = [];
+    // 2026-11-27: under 12 h left the build goes even on a phone in use (an expired profile stops WDA for good)
+    const expires = expiryOf(this.rec);
+    const urgent = expires !== null && expires - this.now() < URGENT_MS;
     for (const udid of ids) {
       const d = (this.rec.perDevice[udid] ??= { signedAt: null });
-      d.lastAttemptAt = this.now();
-      this.log(`re-signing WDA for ${udid.slice(-8)}`);
-      try {
-        await this.o.prepare?.(udid).catch(() => {});
-        const r = await this.o.run(udid);
-        if (!r.ok) throw new Error(classifyBuildError(r.log));
-        d.signedAt = this.now();
-        d.lastError = null;
+      // a scheduled round that left another phone for later doesn't build (and restart) this one a second time
+      if (!manual && !urgent && d.signedAt && this.now() - d.signedAt < RESIGN_AFTER_MS - DAY_MS) {
         good++;
-        this.o.installed?.(udid);
-      } catch (err) {
-        d.lastError = (err as Error).message.slice(0, 300);
-        errors.push(`${udid.slice(-8)}: ${d.lastError}`);
-        this.log(`re-sign failed for ${udid.slice(-8)}: ${d.lastError}`);
+        continue;
       }
+      // system:resign (src/lifecycle.ts): the phone's lease must be Free; it restarts the phone's runner
+      const turn = await systemTurn(
+        'resign',
+        udid,
+        async () => {
+          d.lastAttemptAt = this.now();
+          this.log(`re-signing WDA for ${udid.slice(-8)}`);
+          try {
+            await this.o.prepare?.(udid).catch(() => {});
+            const r = await this.o.run(udid);
+            if (!r.ok) throw new Error(classifyBuildError(r.log));
+            d.signedAt = this.now();
+            d.lastError = null;
+            good++;
+            this.o.installed?.(udid);
+          } catch (err) {
+            d.lastError = (err as Error).message.slice(0, 300);
+            errors.push(`${udid.slice(-8)}: ${d.lastError}`);
+            this.log(`re-sign failed for ${udid.slice(-8)}: ${d.lastError}`);
+          }
+        },
+        { waitMs: this.o.freeWaitMs ?? 10 * 60_000, force: urgent || manual, free: this.o.free },
+      );
+      if (!turn.ran) {
+        deferred.push(udid);
+        this.log(`re-sign of ${udid.slice(-8)} left for the next check: ${turn.why}`);
+      }
+    }
+    if (deferred.length && !errors.length) {
+      // not a failure: the phones in use are signed on a later check (no 2 h wait)
+      this.save();
+      return this.status();
     }
     if (good === ids.length) {
       this.rec.signedAt = this.now();

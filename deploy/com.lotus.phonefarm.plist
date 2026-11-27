@@ -21,10 +21,17 @@
   <key>ProcessType</key><string>Interactive</string>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
-  <!-- 2026-11-21: a crash is restarted after 10 s (never in a tight loop); a stop waits up to 30 s for the server to end
-       the WDA runners itself (it exits by 20 s); open files raised from launchd's 256 (sockets, pipes, iproxy forwards) -->
+  <!-- 2026-11-21: a crash is restarted after 10 s (never in a tight loop); a stop waits up to 30 s for the server to
+       finish its shutdown (it exits by 20 s); open files raised from launchd's 256 (sockets, pipes, iproxy forwards) -->
   <key>ThrottleInterval</key><integer>10</integer>
   <key>ExitTimeOut</key><integer>30</integer>
+  <!-- 2026-11-27 (docs/root-cause.md §11): the device layer outlives the server. launchd kills every process left in
+       the job's process group when it ends; with this it leaves them, so an update, a crash or `launchctl kickstart -k`
+       restarts the API only and the WDA runners and forwards are adopted by the next start (data/runners.json).
+       The captures (phonecap) still end with the server (they exit when its pipe closes). A full stop of the phones'
+       runners: `launchctl kill SIGUSR2 gui/$(id -u)/com.lotus.phonefarm` (the server ends them, then KeepAlive
+       starts it again with fresh ones). -->
+  <key>AbandonProcessGroup</key><true/>
   <key>SoftResourceLimits</key>
   <dict><key>NumberOfFiles</key><integer>8192</integer></dict>
   <key>HardResourceLimits</key>

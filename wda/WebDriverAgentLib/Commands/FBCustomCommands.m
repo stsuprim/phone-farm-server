@@ -254,6 +254,35 @@
 
 + (id<FBResponsePayload>)handleActiveAppInfo:(FBRouteRequest *)request
 {
+  // LOTUS (phone-farm, fork v7): no accessibility hit test. Upstream asks the element at a screen point which app it
+  // belongs to; an app that never goes idle (TikTok) held the main queue for minutes on it (e8e390e). Here the
+  // system's own list of active apps answers (testmanagerd's bundle id per pid, at most 1 s each), the most recent
+  // first, and `hitTest` says so. LOTUS_APP_HIT_TEST=1 in the runner's launch environment brings upstream's way back.
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Weverything"
+  NSString *hitTestFlag = NSProcessInfo.processInfo.environment[@"LOTUS_APP_HIT_TEST"];
+  if (!([hitTestFlag isEqualToString:@"1"] || [hitTestFlag.lowercaseString isEqualToString:@"true"])) {
+    NSArray<NSDictionary<NSString *, id> *> *infos = [XCUIApplication fb_activeAppsInfo];
+    NSDictionary<NSString *, id> *first = infos.firstObject;
+    NSMutableArray<NSString *> *candidates = [NSMutableArray array];
+    for (NSDictionary<NSString *, id> *info in infos) {
+      id candidate = info[@"bundleId"];
+      if ([candidate isKindOfClass:NSString.class]) {
+        [candidates addObject:(NSString *)candidate];
+      }
+    }
+    id firstBundleId = first[@"bundleId"];
+    NSString *bundleId = [firstBundleId isKindOfClass:NSString.class] ? (NSString *)firstBundleId : @"unknown";
+    return FBResponseWithObject(@{
+      @"pid": first[@"pid"] ?: @0,
+      @"bundleId": bundleId,
+      @"name": bundleId,
+      @"processArguments": @{},
+      @"hitTest": @NO,
+      @"candidates": candidates.copy,
+    });
+  }
+#pragma clang diagnostic pop
   XCUIApplication *app = request.session.activeApplication ?: XCUIApplication.fb_activeApplication;
   // .identifier can be nil if the app stopped answering accessibility requests
   // and accessibilityDeadline aborted the underlying snapshot fetch (#1210).

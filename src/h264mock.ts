@@ -1,4 +1,5 @@
 import { encodeRecord, KIND, ProducerHooks, RecordParser, StartProducer } from './h264.js';
+import { encodePng } from './png.js';
 
 /**
  * A tiny but real H.264 encoder for mock mode, so the client can decode the mock stream (WebCodecs, ffmpeg...).
@@ -251,11 +252,37 @@ export function renderYuv(scene: MockScene): Yuv {
   return f;
 }
 
+/** A YUV 4:2:0 frame as RGB (BT.601, video range), for the mock's stills. */
+export function yuvToRgb(f: Yuv): Uint8Array {
+  const out = new Uint8Array(MOCK_W * MOCK_H * 3);
+  const c = (v: number) => (v < 0 ? 0 : v > 255 ? 255 : Math.round(v));
+  for (let y = 0; y < MOCK_H; y++)
+    for (let x = 0; x < MOCK_W; x++) {
+      const yy = 1.164 * (f.y[y * MOCK_W + x]! - 16);
+      const ci = (y >> 1) * (MOCK_W / 2) + (x >> 1);
+      const u = f.u[ci]! - 128;
+      const v = f.v[ci]! - 128;
+      const o = (y * MOCK_W + x) * 3;
+      out[o] = c(yy + 1.596 * v);
+      out[o + 1] = c(yy - 0.392 * u - 0.813 * v);
+      out[o + 2] = c(yy + 2.017 * u);
+    }
+  return out;
+}
+
+export interface MockProducerOptions {
+  /** 2026-11-27: send the helper's heartbeat (kind 7) like phonecap does (default true), this often (default 500 ms). */
+  beats?: boolean;
+  beatMs?: number;
+}
+
 /**
  * Mock capture helper: renders at `fps`, keyframe every `keySeconds` (2 s) or when asked, and talks the helper's byte framing
  * (serialized, then re-parsed in odd-sized chunks) so the same parser path is exercised as with the real helper.
+ * 2026-11-27: also its heartbeat (kind 7) and stills on request (kind 8, a PNG of the newest picture, stamped with that
+ * picture's own time).
  */
-export function mockProducer(scene: () => MockScene): StartProducer {
+export function mockProducer(scene: () => MockScene, mopts: MockProducerOptions = {}): StartProducer {
   return (want, hooks: ProducerHooks) => {
     const fps = Math.min(want.fps, 30);
     const keyEvery = Math.max(1, Math.round(fps * (want.keySeconds ?? 2)));
@@ -276,12 +303,16 @@ export function mockProducer(scene: () => MockScene): StartProducer {
     let n = 0;
     let encSum = 0;
     let lastStats = 0; // first stats right away
+    let framesIn = 0;
+    let lastFrame = 0;
     emit(KIND.INFO, Date.now(), Buffer.from(JSON.stringify({ width: MOCK_W, height: MOCK_H, fps, scale: 100 })));
     const tick = () => {
       const s = scene();
       const t = Date.now();
       const f = renderYuv(s);
       s.frame++;
+      framesIn++;
+      lastFrame = t;
       const t0 = performance.now();
       const key = wantKey || !prev || frameNum >= keyEvery;
       if (key) {
@@ -309,14 +340,30 @@ export function mockProducer(scene: () => MockScene): StartProducer {
     };
     let timer: NodeJS.Timeout | undefined = setInterval(tick, Math.round(1000 / fps));
     setImmediate(() => timer && tick());
+    let beat: NodeJS.Timeout | undefined;
+    if (mopts.beats !== false) {
+      beat = setInterval(() => {
+        if (!timer) return;
+        emit(KIND.BEAT, Date.now(), Buffer.from(JSON.stringify({ running: true, finding: false, frames_in: framesIn, frames_out: framesIn, last_frame: lastFrame, lanes: 1 })));
+        framesIn = 0;
+      }, mopts.beatMs ?? 500);
+      beat.unref?.();
+    }
     return {
       key: () => {
         wantKey = true;
         setImmediate(() => timer && tick()); // like the real helper: re-encode the current screen as an IDR now
       },
+      still: () => {
+        setImmediate(() => {
+          if (!timer || !prev) return;
+          emit(KIND.STILL, lastFrame, encodePng(MOCK_W, MOCK_H, yuvToRgb(prev)));
+        });
+      },
       stop: () => {
         if (timer) clearInterval(timer);
-        timer = undefined;
+        if (beat) clearInterval(beat);
+        timer = beat = undefined;
       },
     };
   };

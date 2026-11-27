@@ -12,9 +12,10 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import ndc from 'node-datachannel';
 import WebSocket from 'ws';
-import { installGuards, makeShutdown, rotateLog } from '../src/lifecycle.js';
+import { farmFree, installGuards, makeShutdown, phoneFree, releaseDevices, rotateLog, setLeaseProbe, systemTurn } from '../src/lifecycle.js';
 import { MockBackend } from '../src/mock.js';
 import { createServer, streamHeartbeat } from '../src/server.js';
+import { createUpdater, Sh } from '../src/updater.js';
 
 let passed = 0;
 const ok = (name: string) => {
@@ -120,6 +121,212 @@ const SOAK_S = Number(process.env.SOAK_S ?? 20);
   await sleep(20);
   assert.deepEqual(exits3, [0], 'a failing step still exits');
   ok('lifecycle: rejections logged and survived (deduplicated); one shutdown; a deadline; a failing step still exits');
+}
+
+// ---- 2026-11-27 (docs/root-cause.md §11, 13.3e): a restart ends the API only; the updater waits for Free leases ----
+{
+  // the device layer: kept on a restart (detached, or simply left), ended only when asked
+  const layer = (withDetach: boolean) => {
+    const d = { closes: 0, detaches: 0, close: async () => void d.closes++, ...(withDetach ? { detach: async () => void d.detaches++ } : {}) };
+    return d;
+  };
+  const quietLog = () => {};
+  let l = layer(true);
+  assert.equal(await releaseDevices(l, 'keep', quietLog), 'detached');
+  assert.deepEqual([l.closes, l.detaches], [0, 1]);
+  l = layer(false);
+  assert.equal(await releaseDevices(l, 'keep', quietLog), 'left');
+  assert.equal(l.closes, 0, 'no detach(): the runners are left as they are, never ended');
+  assert.equal(await releaseDevices(l, 'stop', quietLog), 'closed');
+  assert.equal(l.closes, 1);
+
+  // system work waits for the phone's lease, gives up with who holds it, or goes when forced
+  let held = true;
+  setLeaseProbe(() => [{ udid: 'A', busy: held, who: 'owner' }, { udid: 'B', busy: false }]);
+  try {
+    assert.deepEqual(farmFree(), { free: false, who: ['owner on A'] });
+    assert.equal(phoneFree('B'), true);
+    const gaveUp = await systemTurn('resign', 'A', async () => 1, { waitMs: 60, pollMs: 10 });
+    assert.deepEqual(gaveUp, { ran: false, why: 'the phone is in use (owner)' });
+    setTimeout(() => (held = false), 50);
+    const waited = await systemTurn('resign', 'A', async () => farmFree().who, { waitMs: 2000, pollMs: 10 });
+    assert.deepEqual(waited, { ran: true, value: ['system:resign on A'] }, 'ran once Free, and was said while it ran');
+    held = true;
+    assert.equal((await systemTurn('selftest', 'A', async () => 2, { force: true })).ran, true, 'forced: goes whatever the lease');
+    setLeaseProbe(() => {
+      throw new Error('actor gone');
+    });
+    assert.equal(phoneFree('A'), false, 'a probe that fails never reads as Free');
+  } finally {
+    setLeaseProbe(null);
+  }
+  ok('restart: the device layer is detached or left, never ended (only on "stop"); system work waits for a Free lease');
+
+  // a fake checkout: the updater's git and npm, with a build or a gate that can fail
+  const C = (n: number) => n.toString(16).padEnd(40, '0'); // a short hash of its own each (1000000, 2000000...)
+  const repo = (start: string) => {
+    const r = { head: start, remote: start, buildFails: new Set<string>(), gateFails: new Set<string>(), builds: [] as string[], gates: [] as string[], checkouts: [] as string[] };
+    const sh: Sh = async (cmd, args) => {
+      const c = `${cmd} ${args.join(' ')}`;
+      if (c.startsWith('git ls-remote')) return `${r.remote}\trefs/heads/main`;
+      if (c === 'git rev-parse HEAD') return r.head;
+      if (c === 'git rev-parse origin/main') return r.remote;
+      if (c.startsWith('git fetch') || c.startsWith('git branch') || c.startsWith('npm install')) return '';
+      if (c.startsWith('git diff')) return 'src/server.ts';
+      if (c.startsWith('git checkout')) {
+        r.head = args.at(-1)!;
+        r.checkouts.push(r.head);
+        return '';
+      }
+      if (c === 'npm run build') {
+        r.builds.push(r.head);
+        if (r.buildFails.has(r.head)) throw Object.assign(new Error('Command failed: npm run build'), { stderr: 'error TS2322: nope' });
+        return '';
+      }
+      if (c === 'npm run regress') {
+        r.gates.push(r.head);
+        if (r.gateFails.has(r.head)) throw Object.assign(new Error('Command failed: npm run regress'), { stdout: 'not ok - a tap was lost' });
+        return '';
+      }
+      throw new Error(`unexpected: ${c}`);
+    };
+    return { r, sh };
+  };
+  // the server's process: its restart is the real shutdown (makeShutdown + releaseDevices), the phones' runners counted
+  const proc = () => {
+    const devices = layer(true);
+    const p = { restarts: 0, devices, exits: [] as number[] };
+    const shutdown = makeShutdown(async () => void (await releaseDevices(devices, 'keep', quietLog)), { exit: (c) => void p.exits.push(c), log: quietLog });
+    return { p, onRestart: () => (p.restarts++, shutdown(0)) };
+  };
+  const STEP = 10_000; // the poller's interval
+  const drive = async (u: ReturnType<typeof createUpdater>, clock: { t: number }, untilMs: number, each?: (t: number) => void) => {
+    while (clock.t < untilMs) {
+      each?.(clock.t);
+      await u.tick();
+      clock.t += STEP;
+    }
+    await sleep(600); // a restart goes 500 ms after it's decided
+  };
+
+  // 5 pushes in 10 minutes while a phone is in use: builds in the background, no restart at all; one when it's Free
+  {
+    const { r, sh } = repo(C(1));
+    const { p, onRestart } = proc();
+    const clock = { t: Date.parse('2026-11-27T14:00:00Z') };
+    let inUse = true;
+    const logs: string[] = [];
+    const u = createUpdater(onRestart, { sh, now: () => clock.t, quietStartHour: null, hasScript: () => true, log: (m) => void logs.push(m), free: () => (inUse ? { free: false, who: ['owner on A'] } : { free: true, who: [] }) });
+    const start = clock.t;
+    const pushes = [0, 2.5, 5, 7.5, 9.5].map((m) => start + m * 60_000);
+    await drive(u, clock, start + 10 * 60_000, (t) => {
+      const due = pushes.filter((at) => at <= t).length;
+      if (due) r.remote = C(1 + due);
+    });
+    assert.equal(r.remote, C(6), 'all five pushes landed');
+    assert.equal(p.restarts, 0, 'no restart while a phone is in use');
+    assert.deepEqual([p.devices.closes, p.devices.detaches], [0, 0], 'no runner or capture touched');
+    assert.ok(r.builds.length <= 4 && r.builds.every((b, i, a) => i === 0 || a[i - 1] !== b), `built in the background, never two in a row of the same: ${r.builds.length}`);
+    for (const b of r.builds) assert.ok(r.gates.includes(b), 'every build went through the gate');
+    const st = await u.status();
+    assert.ok(st.state === 'pending' || st.state === 'ready', `waiting: ${st.state}`);
+    // the phone is Free: one restart, into the newest commit, the device layer kept
+    inUse = false;
+    await drive(u, clock, clock.t + 4 * 60_000);
+    assert.equal(p.restarts, 1, 'exactly one restart');
+    assert.equal(r.head, C(6), 'into the newest commit');
+    assert.deepEqual([p.devices.closes, p.devices.detaches, p.exits], [0, 1, [0]], 'the API went; the runners were detached, never ended');
+    assert.equal((await u.status()).state, 'restarting');
+    assert.ok(logs.some((m) => /waiting for the phones to be free: owner on A/.test(m)), 'the log says what it waits for');
+  }
+
+  // pushes 90 s apart, phones Free: the debounce builds once, after the last
+  {
+    const { r, sh } = repo(C(1));
+    const { p, onRestart } = proc();
+    const clock = { t: Date.parse('2026-11-27T14:00:00Z') };
+    const u = createUpdater(onRestart, { sh, now: () => clock.t, quietStartHour: null, hasScript: () => true, log: quietLog, free: () => ({ free: true, who: [] }) });
+    const start = clock.t;
+    await drive(u, clock, start + 10 * 60_000, (t) => {
+      const n = Math.min(5, Math.floor((t - start) / 90_000) + 1);
+      r.remote = C(1 + n);
+    });
+    assert.deepEqual(r.builds, [C(6)], 'one build, of the last push, once pushes settled');
+    assert.deepEqual([p.restarts, p.devices.closes], [1, 0]);
+  }
+
+  // the PRE-RELEASE GATE fails: the old build keeps running, dist/ goes back to it, nothing restarts, the log says why
+  {
+    const { r, sh } = repo(C(1));
+    const { p, onRestart } = proc();
+    const clock = { t: Date.parse('2026-11-27T14:00:00Z') };
+    const logs: string[] = [];
+    const u = createUpdater(onRestart, { sh, now: () => clock.t, quietStartHour: null, hasScript: () => true, log: (m) => void logs.push(m), free: () => ({ free: true, who: [] }) });
+    r.remote = C(2);
+    r.gateFails.add(C(2));
+    await drive(u, clock, clock.t + 3 * 60_000);
+    assert.equal(p.restarts, 0, 'never restarted into a build that failed the gate');
+    assert.equal(r.head, C(1), 'the running commit is checked out again');
+    assert.deepEqual(r.builds, [C(2), C(1)], 'and rebuilt, so dist/ is what runs');
+    let st = await u.status();
+    assert.deepEqual([st.state, st.failedCommit, st.gate?.ok, st.gate?.ran], ['idle', C(2), false, true]);
+    assert.match(st.lastError ?? '', /pre-release gate \(npm run regress\) failed: .*a tap was lost.*kept 1000000 running/);
+    assert.ok(logs.some((m) => /gate: npm run regress/.test(m)) && logs.some((m) => /rolling back/.test(m)));
+    // not tried again by the poller...
+    await drive(u, clock, clock.t + 3 * 60_000);
+    assert.deepEqual(r.builds, [C(2), C(1)]);
+    // ...until a newer commit
+    r.remote = C(3);
+    await drive(u, clock, clock.t + 3 * 60_000);
+    assert.deepEqual([p.restarts, r.head, p.devices.closes], [1, C(3), 0]);
+    st = await u.status();
+    assert.deepEqual([st.gate?.commit, st.gate?.ok, st.lastError], [C(3), true, null]);
+  }
+
+  // a build that fails is refused the same way; a commit with no `regress` script passes the gate with a warning
+  {
+    const { r, sh } = repo(C(1));
+    const { p, onRestart } = proc();
+    const clock = { t: Date.parse('2026-11-27T14:00:00Z') };
+    const logs: string[] = [];
+    const u = createUpdater(onRestart, { sh, now: () => clock.t, quietStartHour: null, hasScript: () => false, log: (m) => void logs.push(m), free: () => ({ free: true, who: [] }) });
+    r.remote = C(2);
+    r.buildFails.add(C(2));
+    await drive(u, clock, clock.t + 3 * 60_000);
+    assert.deepEqual([p.restarts, r.head], [0, C(1)]);
+    assert.match((await u.status()).lastError ?? '', /build of 2000000 failed: error TS2322/);
+    r.remote = C(3);
+    await drive(u, clock, clock.t + 3 * 60_000);
+    const st = await u.status();
+    assert.deepEqual([p.restarts, st.gate?.ran, st.gate?.ok], [1, false, true]);
+    assert.ok(logs.some((m) => /no "regress" script/.test(m)), 'the warning is logged');
+    assert.deepEqual(r.gates, [], 'nothing to run');
+  }
+
+  // POST /update/now: no debounce; while a phone is in use it waits (unless forced); a quiet hour lets it go
+  {
+    const { r, sh } = repo(C(1));
+    const { p, onRestart } = proc();
+    const clock = { t: Date.parse('2026-11-27T14:00:00') };
+    const u = createUpdater(onRestart, { sh, now: () => clock.t, quietStartHour: null, hasScript: () => true, log: quietLog, free: () => ({ free: false, who: ['hand:post on A'] }) });
+    r.remote = C(2);
+    const res = await u.now();
+    assert.equal(res.started, false);
+    assert.match(res.reason ?? '', /built 2000000; the restart waits until no phone is in use \(hand:post on A\)/);
+    assert.deepEqual([(await u.status()).state, (await u.status()).waitingFor], ['ready', ['hand:post on A']]);
+    assert.equal((await u.now({ force: true })).started, true);
+    await sleep(600);
+    assert.deepEqual([p.restarts, p.devices.closes], [1, 0]);
+
+    const q = repo(C(1));
+    const q2 = proc();
+    const night = { t: new Date(2026, 10, 28, 3, 30).getTime() };
+    const v = createUpdater(q2.onRestart, { sh: q.sh, now: () => night.t, quietStartHour: 3, hasScript: () => true, log: quietLog, free: () => ({ free: false, who: ['owner on A'] }) });
+    q.r.remote = C(2);
+    await drive(v, night, night.t + 3 * 60_000);
+    assert.equal(q2.p.restarts, 1, 'at the quiet hour a ready build restarts even with a lease held');
+  }
+  ok('updater: pushes settle before a build, built and gated in the background, restarted into only when every phone is Free; 5 pushes in 10 min: 0 runner restarts; a failed gate keeps the old build');
 }
 
 // ---- the log's rotation ----
@@ -243,12 +450,16 @@ try {
       await new Promise((r) => control.once('open', r));
       const ctl = () => inbox.filter((m) => m.type === 'control');
       await until('the first control message', () => ctl().length === 1);
-      assert.deepEqual(ctl()[0], { type: 'control', udid, control: 'ready', controlDown: null, needsReplug: false, restarting: null });
+      // 2026-11-27: the old fields as they were, and the state machines' own beside them (additive: an old client ignores them)
+      const old = (m: any) => ({ type: m.type, udid: m.udid, control: m.control, controlDown: m.controlDown, needsReplug: m.needsReplug, restarting: m.restarting });
+      assert.deepEqual(old(ctl()[0]), { type: 'control', udid, control: 'ready', controlDown: null, needsReplug: false, restarting: null });
+      assert.deepEqual([ctl()[0].state, ctl()[0].onPhone, ctl()[0].lease], ['ready', null, { kind: 'free' }]);
       await sleep(200);
       assert.equal(ctl().length, 1, 'nothing more while nothing changes');
       fake = { control: 'recovering', restarting: { attempt: 1, of: 4, since: 1 } };
       await until('recovering pushed', () => ctl().length === 2);
-      assert.deepEqual(ctl()[1], { type: 'control', udid, control: 'recovering', controlDown: null, needsReplug: false, restarting: { attempt: 1, of: 4, since: 1 } });
+      assert.deepEqual(old(ctl()[1]), { type: 'control', udid, control: 'recovering', controlDown: null, needsReplug: false, restarting: { attempt: 1, of: 4, since: 1 } });
+      assert.equal(ctl()[1].state, 'restarting');
       fake = { control: 'down', controlDown: 'XCTest is jammed', needsReplug: true, restarting: null };
       await until('needs replug pushed', () => ctl().length === 3);
       assert.equal(ctl()[2].needsReplug, true);

@@ -13,6 +13,8 @@ import path from 'node:path';
 import { PassThrough } from 'node:stream';
 import { fileURLToPath } from 'node:url';
 import type { Config } from '../src/config.js';
+import { BEAT_FORK_VERSION, EXPERIMENT_ENV, forkExperimentEnv, readBeat, readCapabilities, readShotTiming } from '../src/fork.js';
+import { setLeaseProbe, setSystemClaim, systemWork } from '../src/lifecycle.js';
 import { FORK_ROUTES, ForkInstaller, LIVE_GAPPED, LIVE_SEGMENTED, usableLiveMode, forkPort, ForkTokens, launchPlan, parsePorts, readForkMeta, retryAfter, RETRY_AFTER_MS, STOCK_MJPEG_PORT, STOCK_WDA_PORT, TOKEN_ENV, TOKEN_HEADER, WdaFlavor } from '../src/fork.js';
 import { Control } from '../src/control.js';
 import { curvePath, seeded } from '../src/human.js';
@@ -768,6 +770,184 @@ const fakeSpawn = ((cmd: string, args: string[], opts: { env?: NodeJS.ProcessEnv
   for (const k of ['NSPhotoLibraryAddUsageDescription', 'UIFileSharingEnabled', 'LSSupportsOpeningDocumentsInPlace', 'CFBundleDisplayName']) assert.ok(rp.includes(`put ${k} `), `${k} goes into the runner's Info.plist`);
   assert.ok(rp.indexOf('codesign --force') > rp.indexOf('put UIFileSharingEnabled') && rp.includes('--preserve-metadata=identifier,entitlements'), 'and it is signed again');
   ok('sources: the licence, the version, the token check before any route, the bare refusal, the route list, no MJPEG, the build script');
+}
+
+// ---- v7 (2026-11-27, docs/root-cause.md 13.4): the beat, the shot's timing, no hit test, the guarded off-main gesture ----
+{
+  const wda = path.join(ROOT, 'wda');
+  const read = (...p: string[]) => fs.readFileSync(path.join(wda, ...p), 'utf8');
+  const meta = readForkMeta(ROOT)!;
+  assert.ok(meta.version >= BEAT_FORK_VERSION, 'LOTUS_FORK.json is at v7 or later');
+  assert.deepEqual([meta.appHitTest, meta.offMainGesture], [false, false], 'both experiments are off in the repo');
+  const inc = read('WebDriverAgentLib', 'Commands', 'FBLotusCommands.inc');
+  const method = (sig: string) => {
+    const at = inc.indexOf(sig);
+    assert.ok(at > 0, `${sig} is there`);
+    const end = inc.indexOf('\n}\n', at);
+    return inc.slice(at, end);
+  };
+  // the beat and the off-main gesture run off the main queue (standalone routes)
+  assert.ok(inc.includes('[[FBRoute GET:@"/lotus/beat"].withoutSession.standalone respondWithTarget:self action:@selector(handleLotusBeat:)]'));
+  assert.ok(inc.includes('[[FBRoute POST:@"/lotus/gesture/offmain"].withoutSession.standalone respondWithTarget:self action:@selector(handleLotusGestureOffMain:)]'));
+  const beat = method('+ (id<FBResponsePayload>)handleLotusBeat:');
+  assert.ok(beat.includes('dispatch_async(dispatch_get_main_queue()') && beat.includes('if (LotusBeatQueuedAt <= 0)'), 'one no-op of ours waits on the main queue at a time');
+  assert.ok(beat.includes('low:50 high:30000') && /answer\[@"(main|mainMs|pendingMs|waitedMs|capabilities)"\][\s\S]*answer\[@"capabilities"\]/.test(beat), 'a bounded wait, and what the server reads');
+  assert.ok(beat.indexOf('@synchronized (FBLotusCommands.class)') > 0 && !beat.includes('LotusSynthBusy'), 'only its own state, under a lock (it runs on another queue)');
+  // the off-main gesture: off unless asked for, refused before anything is built or played, one at a time on its own queue
+  const off = method('+ (id<FBResponsePayload>)handleLotusGestureOffMain:');
+  assert.ok(off.indexOf('lotus_flag:@"LOTUS_OFFMAIN_GESTURE"') > 0 && off.indexOf('lotus_flag:@"LOTUS_OFFMAIN_GESTURE"') < off.indexOf('lotus_gestureRecord:'), 'the switch is checked first');
+  assert.ok(off.indexOf('lotus_flag:@"LOTUS_OFFMAIN_GESTURE"') < off.indexOf('synthesizeEvent:'));
+  assert.ok(off.includes('request.parameters[@"n"]') && off.indexOf('request.parameters[@"n"]') < off.indexOf('synthesizeEvent:'), 'each request names itself (identical standalone requests share one answer)');
+  assert.ok(off.includes('DISPATCH_QUEUE_SERIAL') && off.includes('dispatch_sync(LotusOffMainQueue') && !off.includes('dispatch_get_main_queue'), 'a private serial queue, never the main one');
+  assert.ok(off.includes('dispatch_semaphore_wait(done, dispatch_time(DISPATCH_TIME_NOW'), 'XCTest is waited for, at most a bound');
+  assert.ok(!off.includes('LotusGestureQueue') && !off.includes('lotus_pump'), 'never mixed with /lotus/gesture\'s queue');
+  // /lotus/gesture builds its record the same way as before (one helper for both)
+  const gesture = method('+ (id<FBResponsePayload>)handleLotusGesture:');
+  assert.ok(gesture.includes('lotus_gestureRecord:request.arguments why:&why') && gesture.includes('[self lotus_pump];') && gesture.includes('@"gap"'));
+  const rec = method('+ (XCSynthesizedEventRecord *)lotus_gestureRecord:');
+  assert.ok(rec.includes('initForTouchAtPoint:point offset:offset') && rec.includes('liftUpAtOffset:offset + hold') && rec.includes('hold = 0.05') && !rec.includes('Lotus' + 'GestureQueue'));
+  // the shot's own timing
+  const shot = method('+ (id<FBResponsePayload>)handleLotusShot:');
+  for (const k of ['@"ms"', '@"takeMs"', '@"waited"', '@"mainBusy"']) assert.ok(shot.includes(k), `/lotus/shot says ${k}`);
+  assert.ok(shot.includes('dispatch_semaphore_wait(mainRan, DISPATCH_TIME_NOW)'), 'the main-queue probe never blocks the shot');
+  // capabilities in /lotus/info and /lotus/beat; the flags from the launch environment
+  assert.ok(method('+ (id<FBResponsePayload>)handleLotusInfo:').includes('@"capabilities": [self lotus_capabilities]'));
+  const caps = method('+ (NSDictionary *)lotus_capabilities');
+  for (const k of ['beat', 'shotTiming', 'appHitTest', 'offMainGesture']) assert.ok(caps.includes(`@"${k}"`), `capability ${k}`);
+  assert.ok(caps.includes(`lotus_flag:@"${EXPERIMENT_ENV.appHitTest}"`) && caps.includes(`lotus_flag:@"${EXPERIMENT_ENV.offMainGesture}"`));
+  // /wda/activeAppInfo: no hit test unless asked for (FBCustomCommands.m), kept clear of -Werror
+  const cc = read('WebDriverAgentLib', 'Commands', 'FBCustomCommands.m');
+  const info = cc.slice(cc.indexOf('+ (id<FBResponsePayload>)handleActiveAppInfo:'), cc.indexOf('\n}\n', cc.indexOf('+ (id<FBResponsePayload>)handleActiveAppInfo:')));
+  assert.ok(info.indexOf(`environment[@"${EXPERIMENT_ENV.appHitTest}"]`) > 0 && info.indexOf(`environment[@"${EXPERIMENT_ENV.appHitTest}"]`) < info.indexOf('fb_activeApplication'), 'the switch comes before the hit test');
+  const noHit = info.slice(0, info.indexOf('#pragma clang diagnostic pop'));
+  assert.ok(noHit.includes('fb_activeAppsInfo') && noHit.includes('@"hitTest": @NO') && !/fb_activeApplication\b|FBActiveAppDetectionPoint|axElement/.test(noHit), 'the default path has no accessibility hit test');
+  assert.ok(noHit.includes('#pragma clang diagnostic ignored "-Weverything"'));
+  assert.ok(read('LOTUS.md').includes('`GET /lotus/beat?wait=`') && read('LOTUS.md').includes('"offMainGesture": true'), 'LOTUS.md says the routes and the switches');
+  ok('v7 sources: /lotus/beat on the main queue, the shot\'s timing, activeAppInfo without a hit test, the off-main gesture guarded and alone');
+
+  // the launch: no experiment by default (the env is exactly v6's), each one only when on
+  const cfg = { wdaProject: '/stock/wda', wdaDerivedData: '/stock/build', wdaBasePort: 8100, mjpegBasePort: 9100 };
+  const base = { project: '/repo/wda', derivedData: '/fork/build', port: 28100, token: 'T'.repeat(43) };
+  assert.deepEqual(Object.keys(launchPlan(cfg, 'U', 0, base).env).sort(), ['TEST_RUNNER_LOTUS_WDA_TOKEN', 'TEST_RUNNER_USE_PORT']);
+  assert.deepEqual(Object.keys(launchPlan(cfg, 'U', 0, { ...base, experiments: { appHitTest: false, offMainGesture: false } }).env).length, 2);
+  const on = launchPlan(cfg, 'U', 0, { ...base, experiments: { offMainGesture: true } }).env;
+  assert.equal(on.TEST_RUNNER_LOTUS_OFFMAIN_GESTURE, '1');
+  assert.equal(on.TEST_RUNNER_LOTUS_APP_HIT_TEST, undefined);
+  assert.deepEqual(forkExperimentEnv({ appHitTest: true, offMainGesture: true }), { TEST_RUNNER_LOTUS_APP_HIT_TEST: '1', TEST_RUNNER_LOTUS_OFFMAIN_GESTURE: '1' });
+  const inst = (experiments?: { appHitTest?: boolean; offMainGesture?: boolean }) =>
+    new ForkInstaller({ meta: { version: 7, upstream: 'v16.15.3' }, enabled: true, tokens: new ForkTokens(), project: '/repo/wda', derivedData: '/fork/build', port: () => 28100,
+      build: async () => ({ ok: true, log: '' }), switchTo: async () => ({ ok: true }), devices: async () => [], tickMs: 0, log: () => {}, experiments });
+  assert.equal(inst().launch('A').experiments, undefined);
+  assert.equal(inst({ appHitTest: false }).launch('A').experiments, undefined);
+  assert.deepEqual(inst({ appHitTest: true }).launch('A').experiments, { appHitTest: true });
+  // LOTUS_FORK.json's two new switches
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'pf-fork-v7-'));
+  fs.mkdirSync(path.join(tmp, 'wda'));
+  fs.writeFileSync(path.join(tmp, 'wda', 'LOTUS_FORK.json'), JSON.stringify({ version: 7, upstream: 'v1.2.3', offMainGesture: true, appHitTest: 'yes' }));
+  assert.deepEqual(readForkMeta(tmp), { version: 7, upstream: 'v1.2.3', enabled: true, liveTouch: 'auto', offMainGesture: true }, 'only a real boolean counts');
+  ok('v7 launch: no experiment unless on, each one its own variable; LOTUS_FORK.json can turn them on from afar');
+
+  // what the server reads from the beat and the shot (older builds: null)
+  assert.deepEqual(readBeat({ lotus: 7, main: true, mainMs: 3.4, waitedMs: 4, capabilities: { beat: true, shotTiming: true, appHitTest: false, offMainGesture: true } }), {
+    version: 7, main: true, mainMs: 3.4, waitedMs: 4, pendingMs: null, capabilities: { beat: true, shotTiming: true, appHitTest: false, offMainGesture: true },
+  });
+  assert.deepEqual(readBeat({ lotus: 7, main: false, waitedMs: 5001, pendingMs: 61000 }), {
+    version: 7, main: false, mainMs: null, waitedMs: 5001, pendingMs: 61000, capabilities: { beat: false, shotTiming: false, appHitTest: false, offMainGesture: false },
+  });
+  assert.equal(readBeat({ lotus: 6, mjpeg: false }), null, 'an older build has no beat');
+  assert.equal(readBeat(null), null);
+  assert.deepEqual(readShotTiming({ lotus: 7, jpeg: 'x', ms: 920, takeMs: 900, waited: true, mainBusy: true }), { ms: 920, takeMs: 900, waited: true, mainBusy: true });
+  assert.equal(readShotTiming({ lotus: 6, jpeg: 'x' }), null);
+  assert.deepEqual(readCapabilities(undefined), { beat: false, shotTiming: false, appHitTest: false, offMainGesture: false });
+  assert.equal(FORK_ROUTES.beat, '/lotus/beat');
+  ok('v7 answers: the beat (ran or still waiting, and for how long), the shot\'s timing, the capabilities');
+}
+
+// ---- system work (2026-11-27, root cause 13.3c): installs, self-tests and re-signs wait for a Free lease, one phone at a time ----
+{
+  const calls: string[] = [];
+  const logs: string[] = [];
+  const busy = new Set<string>(['A']);
+  const claims: string[] = [];
+  setLeaseProbe(() => [...busy].map((udid) => ({ udid, busy: true, who: 'hand:post' })));
+  setSystemClaim((udid, op) => {
+    claims.push(`take ${op} ${udid}`);
+    return () => void claims.push(`give ${op} ${udid}`);
+  });
+  try {
+    const seenRunning: string[] = [];
+    const f = new ForkInstaller({
+      meta: { version: 7, upstream: 'v16.15.3' }, enabled: true, tokens: new ForkTokens(), project: '/repo/wda', derivedData: '/fork/build', port: () => 28100,
+      build: async (u) => (calls.push(`build ${u}`), seenRunning.push(...systemWork().map((w) => `${w.op} ${w.udid}`)), { ok: true, log: '' }),
+      switchTo: async (u, fl) => (calls.push(`switch ${u} ${fl}`), { ok: true }),
+      selftest: async (u) => (calls.push(`selftest ${u}`), { tested: true, mode: 1 }),
+      devices: async () => ['A', 'B'],
+      busy: (u) => busy.has(u) && false, // the actor's leases (above) are what count here
+      tickMs: 0, log: (m) => void logs.push(m),
+    });
+    await f.tick();
+    assert.deepEqual([...calls], ['build B', 'switch B fork', 'selftest B'], 'the phone in use is left alone; the free one gets its install');
+    assert.deepEqual(seenRunning, ['fork-install B'], 'the work is said while it runs');
+    assert.deepEqual(claims, ['take fork-install B', 'give fork-install B'], "the actor's System lease is taken and given back");
+    assert.ok(logs.some((l) => /A: system:fork-install waits: the phone is in use \(hand:post\)/.test(l)));
+    assert.equal(f.status().perDevice.A?.state ?? 'stock', 'stock', 'nothing was even built for it');
+    calls.length = 0;
+    await f.tick();
+    assert.deepEqual([...calls], [], 'still in use: still waits (and says so once)');
+    assert.equal(logs.filter((l) => /A: system:fork-install waits/.test(l)).length, 1);
+    busy.delete('A');
+    await f.tick();
+    assert.deepEqual([...calls], ['build A', 'switch A fork', 'selftest A'], 'Free again: installed');
+    assert.deepEqual(systemWork(), []);
+    // an install's own `busy` (the server's word) holds it back too
+    const g = new ForkInstaller({
+      meta: { version: 8, upstream: 'v16.15.3' }, enabled: true, tokens: new ForkTokens(), project: '/repo/wda', derivedData: '/fork/build', port: () => 28100,
+      build: async (u) => (calls.push(`build8 ${u}`), { ok: true, log: '' }), switchTo: async () => ({ ok: true }), devices: async () => ['C'],
+      busy: () => true, tickMs: 0, log: () => {},
+    });
+    await g.tick();
+    assert.ok(!calls.includes('build8 C'));
+    // a refused System lease (the actor saw an owner arrive first) holds it back as well
+    setSystemClaim(() => null);
+    const h = new ForkInstaller({
+      meta: { version: 9, upstream: 'v16.15.3' }, enabled: true, tokens: new ForkTokens(), project: '/repo/wda', derivedData: '/fork/build', port: () => 28100,
+      build: async (u) => (calls.push(`build9 ${u}`), { ok: true, log: '' }), switchTo: async () => ({ ok: true }), devices: async () => ['D'], tickMs: 0, log: () => {},
+    });
+    await h.tick();
+    assert.ok(!calls.includes('build9 D'));
+    setSystemClaim(null);
+    ok('system work: an install waits for a Free lease (the actor\'s and the server\'s word), takes the System lease, one phone at a time');
+
+    // the re-sign: a phone in use is left for the next check, not failed; the next round signs only it
+    busy.add('B');
+    let now = Date.parse('2026-11-27T10:00:00Z');
+    const runs: string[] = [];
+    const installed: string[] = [];
+    const r = new WdaResigner({
+      run: async (u) => (runs.push(u), { ok: true, log: '' }), devices: async () => ['A', 'B'], liveViewers: () => 0, installed: (u) => void installed.push(u),
+      tickMs: 0, now: () => now, quietStartHour: new Date(now).getHours(), freeWaitMs: 30, log: () => {},
+    });
+    assert.equal(await r.tick(), true);
+    assert.deepEqual(runs, ['A'], 'B is in use: only A built');
+    assert.equal(r.status().state === 'failed', false, 'waiting for a phone is no failure');
+    assert.equal(r.status().signedAt, null, 'the round is not over');
+    busy.delete('B');
+    now += 15 * 60_000;
+    assert.equal(await r.tick(), true);
+    assert.deepEqual(runs, ['A', 'B'], 'the next check signs B, and does not build (and restart) A again');
+    assert.deepEqual(installed, ['A', 'B']);
+    assert.equal(r.status().state, 'ok');
+    // expiring (under 12 h left): it goes even on a phone in use
+    busy.add('A');
+    now = Date.parse(r.status().expiresAt!) - 6 * 3600_000;
+    runs.length = 0;
+    await r.tick();
+    assert.ok(runs.includes('A'), 'an expiring profile goes whatever the lease');
+    ok('re-sign: system:resign per phone, a phone in use waits (no failure, no 2 h wait), one already signed is not rebuilt; expiring goes anyway');
+  } finally {
+    setLeaseProbe(null);
+    setSystemClaim(null);
+  }
 }
 
 process.stdout.write(`${os.EOL}all ${passed} fork checks passed${os.EOL}`);

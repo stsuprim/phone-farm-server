@@ -21,7 +21,7 @@ they agree).
 | `WebDriverAgentLib/Routing/FBWebServer.m` | The MJPEG server is never started; its code is gone. |
 | `WebDriverAgentLib/Utilities/FBMjpegServer.{h,m}` | Deleted, and taken out of `WebDriverAgent.xcodeproj`. Nothing ever listens on 9100. |
 | `WebDriverAgentLib/Commands/FBLotusCommands.inc` | New. Our routes (below). Included by `FBCustomCommands.m`, so it needs no entry in the Xcode project. |
-| `WebDriverAgentLib/Commands/FBCustomCommands.m` | One line: the include. |
+| `WebDriverAgentLib/Commands/FBCustomCommands.m` | One line: the include. v7: `/wda/activeAppInfo` without the accessibility hit test (below), unless `LOTUS_APP_HIT_TEST=1`. |
 | `WebDriverAgentLib/Commands/FBLotusFiles.inc` | New, v6: the files routes, included at the end of `FBLotusCommands.inc`. Photos, AVFoundation and ImageIO link by themselves (modules). |
 | `WebDriverAgentLib/Routing/FBWebServer.m` (v6) | `/lotus/files/put` gets the request's raw bytes, and no files request is ever in the verbose log. |
 | the runner's `Info.plist` (v6) | Not a source: Xcode makes the runner app itself. The repo's `scripts/lotus-runner-plist.sh` (run by `build-wda.sh` after each fork build) adds `NSPhotoLibraryAddUsageDescription`, `UIFileSharingEnabled`, `LSSupportsOpeningDocumentsInPlace` and the name "Lotus", and signs the app again as `embed-runner-icon.sh` does. When that fails the runner is left as Xcode made it: all else works and `can` says why Photos and Files don't. |
@@ -41,6 +41,10 @@ The port is not a source change: upstream reads `USE_PORT`. The server gives eac
 | `POST /lotus/field` | v4 (2026-11-18). `{clear: bool}` -> `{found, secure, len, value?, method?, cleared?}`: the field with the keyboard (the app in front's element with keyboard focus). With `clear` it's emptied in one go first, each way only while the field still holds something: the keyboard's Clear key (one HID keypress), then Cmd+A (`typeKey`, Xcode 15+) and one Delete, then a triple tap and one Delete; never a Delete per letter. A secure field (`XCUIElementTypeSecureTextField`, or text that is only bullets) gives its length only, and always gets the Cmd+A step (a web view's password field can read empty when it isn't). Waits for a gesture still playing first. The server reads the field before and after `type` with it (README, "Typing"). Not compiled where it was written: the Mac's build is the check (a failed build keeps v3 running, and the server then answers a clear with 501). |
 | `POST /lotus/keys` | v5 (2026-11-24). `{keys: [{usage, n} \| {key, modifierFlags, n}]}` -> `{played}`: the owner's keyboard. `usage`: a HID keypress of the keyboard page; `key`: a character or an XCUIKeyboardKey name with XCUIKeyModifierFlags, as an event record of its own (no lookup of the app in front). v5 also serves upstream's `/session/:id/wda/element/0/keyboardInput` (element 0 only), the server's first choice for shortcuts. **To see on the Mac:** it compiles; Ctrl+A, C, X, V and arrows on the Phones page act in Notes and in TikTok's comment box. A failed build keeps v4 running, and the server then answers shortcuts with 501. |
 
+| `GET /lotus/beat?wait=` | v7 (2026-11-27). The main queue's heartbeat (docs/root-cause.md P3). Standalone (off the main queue): it sends a no-op to the main queue and waits for it at most `wait` ms (50-30000, 5000 by default). `{lotus, main, mainMs \| pendingMs, waitedMs, capabilities}`: `main` whether the no-op ran, `mainMs` its wait on the main queue, else `pendingMs` how long it has waited so far. One no-op of ours waits there at a time, so a hung main queue never fills up. With `/status` (the process) it tells busy, hung and dead apart. `capabilities`: `{beat, shotTiming, appHitTest, offMainGesture}` (also in `/lotus/info`). |
+| `GET /lotus/shot` (v7) | Also `{ms, takeMs, waited, mainBusy}`: the route's own time, the screenshot call's (through testmanagerd), `waited` when that took over 250 ms, and `mainBusy` when a no-op sent to the main queue as the shot began hadn't run by its end (the shot came while a read held the main queue). |
+| `POST /lotus/gesture/offmain?n=` | v7 **experiment**, off unless the runner is launched with `LOTUS_OFFMAIN_GESTURE=1` (else `unsupported operation`). The body of `/lotus/gesture`, given to XCTest from a private serial queue instead of the main queue, answered once XCTest calls back: `{completed, played, ms, error?}`. `n` must differ per request (identical standalone requests in flight share one answer). Never mixed with `/lotus/gesture`'s queue. The question it answers: may `synthesizeEvent:` be called off the main queue while a `/source` hangs there (root cause §12)? |
+| `GET /wda/activeAppInfo` (v7) | No accessibility hit test: the system's list of active apps (testmanagerd's bundle id per pid, at most 1 s each), the most recent first: `{pid, bundleId, name: bundleId, processArguments: {}, hitTest: false, candidates}`. `LOTUS_APP_HIT_TEST=1` brings upstream's way back (it held the main queue for minutes in TikTok, e8e390e). |
 | `GET /lotus/files/can`, `POST /lotus/files/{ask,begin,put,land,dir,drop}` | v6 (2026-11-24), `FBLotusFiles.inc`: files from the PC. `begin`, `put` (raw bytes, `?id=&offset=`) and `drop` keep an unfinished file in the runner's own tmp; `land` checks size and SHA-256, then adds it to Photos (PhotoKit, add-only, `shouldMoveFile`, the file's own bytes) or moves it into the runner's Documents, which Files shows as "Lotus", under a free name. Standalone (off the main queue) but `ask`, which brings the runner to the front once for iOS's Photos prompt and goes Home after the answer. Nothing is read from the library, logged, shared or overwritten. |
 
 ### Live touch and its self-test
@@ -120,6 +124,16 @@ the real check:
    Allow, the photo is in Photos with its date. A video, a PDF and a folder. A re-sign (reinstall) keeps the folder's
    files. A drag while a 2 GB file is on its way is as quick as before. A photo sent while the phone is locked.
 
+6. **v7, the beat and the experiments.** It compiles; `GET /lotus/beat` answers `main: true` with a `mainMs` of a few
+   ms on the Home Screen, and `main: false` with a growing `pendingMs` while a `/source` of TikTok is in flight (then
+   `main: true` again once it ends, never two no-ops waiting); `GET /lotus/shot` carries `takeMs` and `mainBusy`
+   (time 50 shots with TikTok in front, with and without a `/source` in flight: root cause §12); `/wda/activeAppInfo`
+   answers `hitTest: false` with TikTok's bundle id first while TikTok is in front (if SpringBoard comes first, say
+   so: the order of the system's list is the open question). With `"offMainGesture": true` pushed (or
+   `WDA_OFFMAIN_GESTURE=on` in .env) and the runner restarted: `POST /lotus/gesture/offmain?n=1` with a tap's body
+   answers `completed`/`played`, and a tap sent that way while a `/source` hangs lands at once (the experiment);
+   a crash of the runner there means XCTest refuses it off the main queue: turn it off again.
+
 ## Turning it off from afar
 
 The Mac pulls this repo by itself, so `LOTUS_FORK.json` is also a switch that needs nobody at the Mac. Push a
@@ -130,6 +144,8 @@ commit that changes it:
 | `"enabled": false` | Every phone goes back to the stock WebDriverAgent (the server restarts on the pull and starts each runner as stock). `true` again installs ours again. |
 | `"liveTouch": "off"` | Our build stays, but live touch through it is not used: a drag is played whole on release. `"auto"` uses it again (with the mode the self-test found). |
 | `"liveTouch": "segmented"` | Also uses a segmented finding (modes 4-5) for the owner's drags. Off by default since 2026-11-17 (below). |
+| `"appHitTest": true` | v7: `/wda/activeAppInfo` runs upstream's accessibility hit test again (`LOTUS_APP_HIT_TEST=1` at each runner's next start). `WDA_APP_HIT_TEST=off` in .env wins. |
+| `"offMainGesture": true` | v7: serves the `/lotus/gesture/offmain` experiment (`LOTUS_OFFMAIN_GESTURE=1` at each runner's next start). `WDA_OFFMAIN_GESTURE=off` in .env wins. |
 
 ## Updating to a newer upstream
 

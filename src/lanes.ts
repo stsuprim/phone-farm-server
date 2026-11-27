@@ -1,7 +1,7 @@
 import { ChildProcess, spawn } from 'node:child_process';
 import { REMOTE_CEILING_BPS, REMOTE_KEY_SECONDS, REMOTE_LONG_SIDE, REMOTE_MAX_FPS, REMOTE_START_BPS } from './congestion.js';
 import { AUDIO_KIND } from './audio.js';
-import { bitrateFor, CAPTURING_LINE, H264Settings, helperArgs, KIND, Producer, ProducerHooks, RecordParser, StartProducer } from './h264.js';
+import { bitrateFor, CAPTURING_LINE, CaptureState, CaptureStill, H264Settings, H264Source, helperArgs, KIND, Producer, ProducerHooks, RecordParser, StartProducer } from './h264.js';
 import type { H264Want } from './types.js';
 
 /**
@@ -60,7 +60,8 @@ export function profileFor(want: H264Want, dfltBps: number, longSidePx: number |
   return {
     key: `remote:${fps}:${scale}`,
     remote: true,
-    settings: { fps, scale, bitrate: Math.min(ceiling, REMOTE_START_BPS), maxBitrate: ceiling, adaptFps: true, keySeconds: REMOTE_KEY_SECONDS },
+    // 2026-11-27: its picture also shrinks on a thin link (src/h264.ts scaleFor) rather than freezing
+    settings: { fps, scale, bitrate: Math.min(ceiling, REMOTE_START_BPS), maxBitrate: ceiling, adaptFps: true, adaptScale: true, keySeconds: REMOTE_KEY_SECONDS },
   };
 }
 
@@ -80,6 +81,8 @@ export const AUDIO_BACKOFF_MS = 10 * 60_000;
 /** The longest a hold keeps a capture nobody watches open (the phone's volume going back down). */
 export const HOLD_MOST_MS = 30_000;
 const realSpawn: Spawn = (bin, args) => spawn(bin, args, { stdio: ['pipe', 'pipe', 'pipe'] });
+/** 2026-11-27: the longest a new phonecap waits for the previous one to exit (it's SIGKILLed after 1.5 s). */
+export const HOST_EXIT_WAIT_MS = 3_000;
 
 /**
  * One phonecap process for one phone, shared by its lanes. The first lane starts the process (its settings on the
@@ -105,6 +108,14 @@ export class PhonecapHost {
   /** 2026-11-22: when the capture last started and ended (ms since the epoch; null: never), for the record of how a WDA runner ended. */
   startedAt: number | null = null;
   stoppedAt: number | null = null;
+  // 2026-11-27, Stopping before Starting (docs/root-cause.md 3): kill() dropped the process at once but SIGKILL came
+  // 1.5 s later, so a new open could spawn a second phonecap on a screen device the first still held. Now a process
+  // told to stop is `dying` until it has exited, and a start meanwhile waits for it (its lines queued).
+  private dying?: { p: ChildProcess; done: Promise<void> };
+  private pendingSpawn?: H264Settings;
+  private pendingLines: string[] = [];
+  private exits = new WeakMap<ChildProcess, Promise<void>>();
+  private laneWant = new Map<number, { fps: number; scale: number; bps: number; key: number }>();
 
   constructor(
     private bin: string,
@@ -115,7 +126,11 @@ export class PhonecapHost {
   ) {}
 
   get running(): boolean {
-    return !!this.proc;
+    return !!this.proc || !!this.pendingSpawn;
+  }
+  /** 2026-11-27: a stopped phonecap hasn't exited yet (a new one waits for it). */
+  get stopping(): boolean {
+    return !!this.dying;
   }
   get laneCount(): number {
     return this.lanes.size;
@@ -126,10 +141,17 @@ export class PhonecapHost {
 
   private open(want: H264Settings, hooks: ProducerHooks): Producer {
     let id = 0;
-    // a capture held open after its last lane is taken up again (its lane 0 still runs)
+    // a capture held open after its last lane is taken up again (its lane 0 still runs, with its encoder: 2026-11-27,
+    // a keyframe is asked at once, else the re-added lane had no picture until the next interval)
     if (this.closing) (clearTimeout(this.closing), (this.closing = undefined));
-    if (!this.proc) {
-      this.spawn(want);
+    const held = !!this.proc && !this.lanes.size;
+    if (!this.proc && !this.pendingSpawn) {
+      if (this.dying) {
+        // the previous phonecap hasn't exited yet: this one starts once it has (never two on one screen device)
+        this.pendingSpawn = want;
+        const wait = this.dying.done;
+        void wait.then(() => this.spawnPending());
+      } else this.spawn(want);
     } else {
       id = -1;
       for (let i = 0; i < MAX_LANES; i++) {
@@ -140,40 +162,62 @@ export class PhonecapHost {
       }
       if (id < 0) throw new Error(`all ${MAX_LANES} encoder lanes are in use`);
       this.write(`lane ${id} ${want.fps} ${want.scale} ${Math.round(want.bitrate)} ${want.keySeconds ?? 2}`);
+      if (held) this.write(`key ${id}`);
     }
     this.lanes.set(id, hooks);
-    const proc = this.proc;
+    this.laneWant.set(id, { fps: want.fps, scale: want.scale, bps: Math.round(want.bitrate), key: want.keySeconds ?? 2 });
     let stopped = false;
-    const mine = () => !stopped && this.proc === proc && this.lanes.get(id) === hooks;
+    // a lane is this producer's while its hooks are the lane's (an exit, a kill or a restart clears them)
+    const mine = () => !stopped && this.lanes.get(id) === hooks;
     if (this.live) hooks.capturing?.(); // a lane added to a running capture: its first keyframe is due from now
+    const lw = () => this.laneWant.get(id)!;
     return {
       reportsCapturing: true,
       key: () => {
         if (mine()) this.write(`key ${id}`);
       },
       bitrate: (bps) => {
-        if (mine()) this.write(`bitrate ${id} ${Math.round(bps)}`);
+        if (!mine()) return;
+        lw().bps = Math.round(bps);
+        this.write(`bitrate ${id} ${Math.round(bps)}`);
       },
       fps: (f) => {
-        if (mine()) this.write(`fps ${id} ${Math.round(f)}`);
+        if (!mine()) return;
+        lw().fps = Math.round(f);
+        this.write(`fps ${id} ${Math.round(f)}`);
+      },
+      // 2026-11-27: a far lane's picture follows its link ("lane" again with the new scale: a new encoder and a key)
+      scale: (pct) => {
+        if (!mine()) return;
+        const w = lw();
+        w.scale = Math.max(10, Math.min(100, Math.round(pct)));
+        this.write(`lane ${id} ${w.fps} ${w.scale} ${w.bps} ${w.key}`);
+      },
+      still: (longSide) => {
+        if (mine()) this.write(longSide ? `still ${Math.round(longSide)}` : 'still');
       },
       stop: () => {
         if (!mine()) return;
         stopped = true;
         this.lanes.delete(id);
-        if (this.lanes.size) this.write(`unlane ${id}`);
-        else this.kill();
+        if (this.lanes.size) {
+          this.write(`unlane ${id}`);
+          return;
+        }
+        // the last lane: settles once the process has exited (the source is Stopping until then)
+        return this.kill();
       },
       // 2026-11-23: this lane got no picture in time (src/h264.ts H264Source's watchdog). A process that never gave
       // any lane a picture runs a capture session that hands over no frames (iPhone-2 after a replug): it's ended
       // (every lane hears it and starts it again, a new session); one that gives pictures only loses this lane.
-      restart: (why) => {
+      // 2026-11-27: `whole` (its heartbeat stopped: the process hung) always ends the process.
+      restart: (why, whole) => {
         if (!mine()) return;
-        if (this.gotPicture) {
+        if (this.gotPicture && !whole) {
           stopped = true;
           this.lanes.delete(id);
           if (this.lanes.size) this.write(`unlane ${id}`);
-          else this.kill();
+          else void this.kill();
           return;
         }
         console.log(`[phonecap ${this.label}] ${why}`);
@@ -213,8 +257,49 @@ export class PhonecapHost {
   }
 
   private write(line: string): void {
+    if (!this.proc && this.pendingSpawn) {
+      this.pendingLines.push(line); // said once the waiting process starts
+      return;
+    }
     const stdin = this.proc?.stdin;
     if (stdin?.writable) stdin.write(`${line}\n`);
+  }
+
+  /** The previous process has exited: the start that waited for it runs now (unless every lane left meanwhile). */
+  private spawnPending(): void {
+    const w = this.pendingSpawn;
+    if (!w || this.proc || (this.dying && !this.settled(this.dying.p))) return;
+    this.pendingSpawn = undefined;
+    const lines = this.pendingLines;
+    this.pendingLines = [];
+    if (!this.lanes.size) return;
+    this.spawn(w);
+    for (const l of lines) this.write(l);
+  }
+
+  private settled(p: ChildProcess): boolean {
+    return p.exitCode !== null && p.exitCode !== undefined ? true : !!p.signalCode;
+  }
+
+  /** Tell a process to end; it's `dying` until it has exited (at most HOST_EXIT_WAIT_MS). */
+  private end(p: ChildProcess): Promise<void> {
+    if (p.stdin?.writable) p.stdin.write('quit\n');
+    p.kill('SIGTERM');
+    const exited = this.exits.get(p) ?? Promise.resolve();
+    let done = false;
+    void exited.then(() => (done = true));
+    setTimeout(() => !done && p.kill('SIGKILL'), 1500).unref();
+    let t: NodeJS.Timeout | undefined;
+    const cap = new Promise<void>((r) => {
+      t = setTimeout(r, HOST_EXIT_WAIT_MS);
+      t.unref?.();
+    });
+    const all: Promise<void> = Promise.race([exited, cap]).then(() => {
+      if (t) clearTimeout(t);
+      if (this.dying?.done === all) this.dying = undefined;
+    });
+    this.dying = { p, done: all };
+    return all;
   }
 
   /**
@@ -225,9 +310,7 @@ export class PhonecapHost {
     const p = this.proc;
     if (!p) return;
     this.died(p, why);
-    if (p.stdin?.writable) p.stdin.write('quit\n');
-    p.kill('SIGTERM');
-    setTimeout(() => p.kill('SIGKILL'), 1500).unref();
+    void this.end(p);
   }
 
   /** Turn the picture `deg` (0, 90, 180, 270) clockwise before encoding; kept for the helper's next start too. */
@@ -245,6 +328,13 @@ export class PhonecapHost {
     const sound = !!this.sink && Date.now() >= this.noAudioUntil;
     const p = this.spawnFn(this.bin, [...this.args, ...helperArgs(want), ...(sound ? ['--audio'] : [])]);
     this.proc = p;
+    this.exits.set(
+      p,
+      new Promise<void>((resolve) => {
+        p.once('exit', () => resolve());
+        p.once('error', () => resolve());
+      }),
+    );
     this.startedAt = Date.now();
     this.withAudio = sound;
     this.gotPicture = false;
@@ -267,6 +357,11 @@ export class PhonecapHost {
         return;
       }
       if (r.kind === KIND.KEY || r.kind === KIND.DELTA) this.gotPicture = true;
+      // 2026-11-27: the heartbeat and stills are the whole capture's: every lane hears them
+      if (r.kind === KIND.BEAT || r.kind === KIND.STILL) {
+        for (const h of [...this.lanes.values()]) h.record(r);
+        return;
+      }
       this.lanes.get(r.lane ?? 0)?.record(r);
     });
     p.stdout?.on('data', (c: Buffer) => {
@@ -313,13 +408,19 @@ export class PhonecapHost {
     for (const h of hooks) h.exit(why);
   }
 
-  private kill(): void {
+  /** Ends the process (or keeps it for a hold); settles once it has exited (undefined: nothing to wait for). */
+  private kill(): Promise<void> | undefined {
     this.lanes.clear();
+    // a start still waiting for the previous process: nothing of it ran
+    if (this.pendingSpawn) {
+      this.pendingSpawn = undefined;
+      this.pendingLines = [];
+    }
     // held open (the phone's volume going back down while its sound is still on the Mac): closed on the release
     if (this.holds > 0 && this.proc && !this.closing) {
       this.closing = setTimeout(() => {
         this.closing = undefined;
-        if (!this.lanes.size) this.kill();
+        if (!this.lanes.size) void this.kill();
       }, HOLD_MOST_MS);
       this.closing.unref?.();
       return;
@@ -327,18 +428,185 @@ export class PhonecapHost {
     if (this.closing) return;
     const p = this.proc;
     this.proc = undefined;
-    if (!p) return;
+    if (!p) return this.dying?.done;
     this.stoppedAt = Date.now();
     this.sink?.ended();
-    if (p.stdin?.writable) p.stdin.write('quit\n');
-    p.kill('SIGTERM');
-    setTimeout(() => p.kill('SIGKILL'), 1500).unref();
+    return this.end(p);
   }
 
   /** Stops the process now (the phone was unplugged, the server stops); its sources are closed by the caller. */
   close(): void {
     this.holds = 0;
     if (this.closing) (clearTimeout(this.closing), (this.closing = undefined));
-    this.kill();
+    void this.kill();
   }
+}
+
+// ---- 2026-11-27: the capture kept on while anyone works on a phone, and its stills (docs/root-cause.md 13.3b) ----
+
+/** What acquireCapture needs of the server's backend (src/types.ts Backend has it). */
+export interface CaptureBackend {
+  h264(udid: string, want: H264Want): H264Source | string;
+}
+/** An acquired capture stays on this long after its last handle is released (an agent's look, act, look again). */
+export const ACQUIRE_GRACE_MS = 15_000;
+/** The lane an acquired capture runs: a cheap thumbnail lane (stills come from the full captured picture anyway). */
+export const ACQUIRE_WANT: H264Want = { fps: THUMB_MIN_FPS, scale: 100, quality: null, tier: 'thumb' };
+/** A failed acquire (no backend yet, the capture gave up) is tried again this often while handles want it. */
+export const ACQUIRE_RETRY_MS = 30_000;
+
+/** One holder's claim on a phone's capture (acquireCapture). */
+export interface CaptureHandle {
+  readonly udid: string;
+  readonly reason: string;
+  readonly since: number;
+  readonly released: boolean;
+  /** The capture's state now ("Unavailable": no source could be had: see why()). */
+  state(): CaptureState | 'Unavailable';
+  /** Why it's Unavailable or in a bad state, else null. */
+  why(): string | null;
+}
+
+interface Acquired {
+  handles: Set<Handle>;
+  src?: H264Source;
+  release?: () => void;
+  grace?: NodeJS.Timeout;
+  retry?: NodeJS.Timeout;
+  error: string | null;
+}
+
+let captureBackend: CaptureBackend | null = null;
+const acquired = new Map<string, Acquired>();
+const seen = new Map<string, Set<H264Source>>();
+
+class Handle implements CaptureHandle {
+  released = false;
+  readonly since = Date.now();
+  constructor(readonly udid: string, readonly reason: string) {}
+  state(): CaptureState | 'Unavailable' {
+    const e = acquired.get(this.udid);
+    return e?.src ? e.src.captureState() : 'Unavailable';
+  }
+  why(): string | null {
+    const e = acquired.get(this.udid);
+    return e?.src ? e.src.stateWhy() : (e?.error ?? 'released');
+  }
+}
+
+/**
+ * Where acquireCapture gets a phone's capture from: the server's backend (call once at start, src/index.ts or
+ * src/server.ts). Handles taken before it's set start their capture now.
+ */
+export function setCaptureBackend(b: CaptureBackend | null): void {
+  captureBackend = b;
+  for (const [udid, e] of acquired) if (e.handles.size && !e.src) bind(udid, e);
+}
+
+/** A source this phone's capture runs on (a live view's lane): latestFrame may read it. */
+export function noteSource(udid: string, src: H264Source): void {
+  let set = seen.get(udid);
+  if (!set) seen.set(udid, (set = new Set()));
+  set.add(src);
+}
+
+function bind(udid: string, e: Acquired): void {
+  if (e.retry) clearTimeout(e.retry);
+  e.retry = undefined;
+  if (!captureBackend) {
+    e.error = 'no capture backend yet (setCaptureBackend is called at the server start)';
+    return;
+  }
+  let s: H264Source | string;
+  try {
+    s = captureBackend.h264(udid, ACQUIRE_WANT);
+  } catch (err) {
+    s = (err as Error).message;
+  }
+  if (typeof s === 'string') {
+    e.error = s;
+    e.retry = setTimeout(() => e.handles.size && !e.src && bind(udid, e), ACQUIRE_RETRY_MS);
+    e.retry.unref?.();
+    return;
+  }
+  e.error = null;
+  e.src = s;
+  noteSource(udid, s);
+  e.release = s.hold('acquired');
+}
+
+/**
+ * 2026-11-27: keep the phone's capture on while `reason` (an agent's hand, a client) works on the phone, viewers or
+ * not. Ref-counted: the capture stays on until every handle is released, then ACQUIRE_GRACE_MS more, then it stops
+ * like any (Stopping, then Off). Never wakes or unlocks the phone and never calls WebDriverAgent; a locked phone's
+ * capture waits in WaitingUnlock.
+ */
+export function acquireCapture(udid: string, reason: string): CaptureHandle {
+  let e = acquired.get(udid);
+  if (!e) acquired.set(udid, (e = { handles: new Set(), error: null }));
+  if (e.grace) clearTimeout(e.grace);
+  e.grace = undefined;
+  const h = new Handle(udid, reason);
+  e.handles.add(h);
+  if (!e.src) bind(udid, e);
+  return h;
+}
+
+/** Ends a handle's claim (twice is harmless). The last one leaves the capture on for `graceMs` (ACQUIRE_GRACE_MS). */
+export function releaseCapture(handle: CaptureHandle, graceMs = ACQUIRE_GRACE_MS): void {
+  if (!(handle instanceof Handle) || handle.released) return;
+  handle.released = true;
+  const e = acquired.get(handle.udid);
+  if (!e || !e.handles.delete(handle) || e.handles.size) return;
+  if (e.grace) clearTimeout(e.grace);
+  e.grace = setTimeout(() => {
+    if (e.handles.size || acquired.get(handle.udid) !== e) return;
+    if (e.retry) clearTimeout(e.retry);
+    e.release?.();
+    acquired.delete(handle.udid);
+  }, graceMs);
+  e.grace.unref?.();
+}
+
+/** Who holds the phone's capture on now (their reasons and since when). */
+export function captureHolders(udid: string): { reason: string; since: number }[] {
+  return [...(acquired.get(udid)?.handles ?? [])].map((h) => ({ reason: h.reason, since: h.since }));
+}
+
+/** The phone was unlocked: its captures waiting for that (WaitingUnlock) try again now. */
+export function noteUnlocked(udid: string): void {
+  for (const s of sourcesOf(udid)) s.unlocked();
+}
+
+function sourcesOf(udid: string): H264Source[] {
+  const a = acquired.get(udid)?.src;
+  const rest = [...(seen.get(udid) ?? [])].filter((s) => s !== a);
+  return a ? [a, ...rest] : rest;
+}
+
+/**
+ * 2026-11-27: a decoded still (JPEG; PNG from the mock) of the phone's newest captured picture, no older than
+ * maxAgeMs (on a still screen: as confirmed by the helper's heartbeat), or null (no capture Live or Still, or none
+ * in time). For reads that must never use WebDriverAgent's screenshots. It starts nothing: acquireCapture first.
+ */
+export async function latestFrame(udid: string, maxAgeMs: number, timeoutMs = 1500): Promise<CaptureStill | null> {
+  for (const s of sourcesOf(udid)) {
+    const st = s.captureState();
+    if (st !== 'Live' && st !== 'Still') continue;
+    const got = await s.still(maxAgeMs, timeoutMs);
+    if (got) return got;
+  }
+  return null;
+}
+
+/** Tests: forget every handle, source and backend. */
+export function resetCaptureRegistry(): void {
+  for (const e of acquired.values()) {
+    if (e.grace) clearTimeout(e.grace);
+    if (e.retry) clearTimeout(e.retry);
+    e.release?.();
+  }
+  acquired.clear();
+  seen.clear();
+  captureBackend = null;
 }

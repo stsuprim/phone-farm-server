@@ -11,10 +11,14 @@ import { PassThrough } from 'node:stream';
 import { fileURLToPath } from 'node:url';
 import WebSocket from 'ws';
 import { Control } from '../src/control.js';
+import { IdleLock } from '../src/idle.js';
+import { ActorBusy, actorsFor, PhoneActor } from '../src/phone/actor.js';
+import { Budgeted, isVideoApp } from '../src/phone/look.js';
 import { HidHost, hidTypable, iosMajor, toHid } from '../src/hid.js';
 import { InputMeter } from '../src/inputlog.js';
 import { MockBackend } from '../src/mock.js';
 import { createServer } from '../src/server.js';
+import { HttpError } from '../src/types.js';
 import type { Backend, PathPoint } from '../src/types.js';
 // @ts-expect-error a plain .mjs script (no types)
 import { isPatched, patchSource, unpatch } from '../scripts/patch-wda.mjs';
@@ -456,6 +460,192 @@ function fakeSidecar(answer: (m: Record<string, unknown>, out: PassThrough) => v
   server.close();
   await backend.close();
   ok('server: acks/answers carry via + ms; GET /phones/:udid/input; stats.input in GET /phones');
+}
+
+// ---- the phone's actor (2026-11-27, docs/root-cause.md 13.3c): one typed queue, the lease, deadlines ----
+{
+  const log: string[] = [];
+  const a = new PhoneActor('A1', { ownerQuietMs: 120, ownerWaitMs: 400, reserveMs: 0, log: () => {} });
+  const job = (kind: 'input' | 'look' | 'power' | 'system', label: string, ms: number, extra: Record<string, unknown> = {}) =>
+    a.submit({
+      kind, label, ...extra,
+      run: async () => {
+        log.push(`${label} start`);
+        await sleep(ms);
+        log.push(`${label} end`);
+        return label;
+      },
+    });
+  // a look already on the phone never holds an input back (input never waits behind a look)
+  const look = job('look', 'look1', 150);
+  await sleep(10);
+  const tap = job('input', 'tap1', 10);
+  await tap;
+  assert.ok(log.includes('tap1 end') && !log.includes('look1 end'), `the input went beside the look: ${log.join(', ')}`);
+  await look;
+  // looks (and power) wait for every queued input; power goes before looks
+  log.length = 0;
+  const i1 = job('input', 'tap2', 60);
+  const l2 = job('look', 'look2', 5);
+  const p2 = job('power', 'lock', 5);
+  const i3 = job('input', 'tap3', 30);
+  await Promise.all([i1, l2, p2, i3]);
+  assert.deepEqual(log, ['tap2 start', 'tap2 end', 'tap3 start', 'tap3 end', 'lock start', 'lock end', 'look2 start', 'look2 end']);
+  ok('actor: input never waits behind a look; looks and power wait for queued input; power before looks');
+
+  // deadlines: one that can't start in time is refused at once, busy; one that runs past its deadline is a 504
+  const long = job('input', 'long', 200);
+  await assert.rejects(job('input', 'late', 5, { startWithinMs: 50 }), (e: HttpError) => e instanceof ActorBusy && e.status === 503 && e.extra?.state === 'busy');
+  await assert.rejects(job('input', 'past', 5, { deadlineEpoch: Date.now() - 1 }), (e: HttpError) => e.status === 503 && /deadline had passed/.test(e.message));
+  await long;
+  await assert.rejects(job('input', 'hung', 500, { timeoutMs: 50 }), (e: HttpError) => e.status === 504 && /got no answer/.test(e.message));
+  // a job inside a job of the same phone is part of its turn (it would wait on itself if queued)
+  const nested = await a.submit({ kind: 'input', label: 'outer', run: () => a.submit({ kind: 'power', label: 'inner', run: async () => 'inner ran' }) });
+  assert.equal(nested, 'inner ran');
+  ok('actor: refused at once when it cannot start in time (503 busy) or its deadline passed; 504 past its deadline; nested jobs run in their turn');
+}
+
+// ---- the lease: the owner pre-empts a hand; system work waits for Free ----
+{
+  const a = new PhoneActor('A2', { ownerQuietMs: 150, ownerWaitMs: 400, reserveMs: 0, handIdleMs: 100, log: () => {} });
+  assert.deepEqual(a.lease(), { kind: 'free' });
+  a.ownerInput();
+  assert.equal(a.lease().kind, 'owner');
+  // a hand's input waits until the owner has been quiet ownerQuietMs
+  const t0 = performance.now();
+  await a.submit({ kind: 'input', label: 'hand tap', who: { hand: 'poster' }, run: async () => {} });
+  assert.ok(performance.now() - t0 >= 120, `the hand paused for the owner (${Math.round(performance.now() - t0)} ms)`);
+  assert.deepEqual([a.lease().kind, (a.lease() as { id?: string }).id], ['hand', 'poster']);
+  // the owner keeps touching: the hand gives up after ownerWaitMs (409, nothing done)
+  const keep = setInterval(() => a.ownerInput(), 30);
+  a.ownerInput();
+  let ran = false;
+  await assert.rejects(a.submit({ kind: 'input', label: 'hand tap', who: { hand: 'poster' }, run: async () => void (ran = true) }), (e: HttpError) => e.status === 409);
+  clearInterval(keep);
+  assert.equal(ran, false);
+  // the owner's own input never waits for anyone
+  const t1 = performance.now();
+  await a.submit({ kind: 'input', label: 'owner tap', who: { owner: true }, run: async () => {} });
+  assert.ok(performance.now() - t1 < 50);
+  // system work: not while anyone drives the phone; once Free, it holds the lease
+  assert.equal(a.trySystem('resign'), null, 'the owner was just here');
+  const sys = a.acquireSystem('resign', 2000);
+  await sleep(50);
+  assert.notEqual(a.lease().kind, 'system');
+  const release = await sys;
+  assert.deepEqual([a.lease().kind, (a.lease() as { op?: string }).op], ['system', 'resign']);
+  assert.equal(a.trySystem('fork'), null, 'one system op at a time');
+  release();
+  assert.deepEqual(a.lease(), { kind: 'free' });
+  // a hand holding the phone (a batch) keeps it Hand, and system work waits
+  const hold = a.holdHand('poster');
+  assert.equal(a.lease().kind, 'hand');
+  await assert.rejects(a.acquireSystem('selftest', 100), (e: HttpError) => e instanceof ActorBusy);
+  hold();
+  await sleep(120);
+  assert.ok(a.trySystem('selftest'));
+  ok('lease: Free, Owner, Hand(id), System(op); the owner pre-empts a hand (409 when he keeps on); system waits for Free');
+}
+
+// ---- the idle lock takes the system lease: a phone someone drives is never locked under them ----
+{
+  const calls: string[] = [];
+  const b = {
+    mock: true,
+    list: async () => [],
+    lock: async () => void calls.push('lock'),
+    unlock: async (_u: string, o?: { explicit?: boolean }) => void calls.push(`unlock explicit=${!!o?.explicit}`),
+    isLocked: async () => null,
+  } as unknown as Backend;
+  let now = 1_000_000;
+  const idle = new IdleLock(b, () => 1, { tickMs: 0, log: () => {}, now: () => now, devices: async () => ['P'] });
+  await idle.tick();
+  now += 2 * 60_000;
+  const actor = actorsFor(b).of('P');
+  const release = actor.holdHand('poster');
+  assert.deepEqual(await idle.tick(), [], 'an agent drives it: not locked');
+  release();
+  actor.tune({ handIdleMs: 0 });
+  assert.deepEqual(await idle.tick(), ['P'], 'Free: locked');
+  assert.deepEqual(calls, ['lock']);
+  assert.equal(idle.state('P').power?.state, 'locked');
+  // a picture's wake (automatic) on a phone that can't say: never the explicit unlock, never a guess
+  calls.length = 0;
+  idle.power.forget('P');
+  await idle.wakeForPicture('P', true);
+  assert.deepEqual(calls, ['unlock explicit=false']);
+  // the owner's own wake (POST /wake): explicit
+  calls.length = 0;
+  await idle.wake('P');
+  assert.deepEqual(calls, ['unlock explicit=true']);
+  idle.close();
+  ok('idle lock: takes the system lease (skipped while a hand drives the phone); automatic wakes are never explicit');
+}
+
+// ---- looks: single-flight, coalesced, budgeted on a video app, cancellable ----
+{
+  let reads = 0;
+  let video = false;
+  const looks = new Budgeted<number>(async () => (await sleep(40), ++reads), { gapMs: () => (video ? 300 : 0) });
+  const [a1, a2, a3] = await Promise.all([looks.get('P'), looks.get('P'), looks.get('P')]);
+  assert.equal(reads, 1, 'single-flight: three askers, one read');
+  assert.deepEqual([a1!.value, a2!.value, a3!.value], [1, 1, 1]);
+  assert.equal((await looks.get('P', { maxAgeMs: 1000 }))!.value, 1, 'coalesced: a fresh enough read is given again');
+  assert.equal(reads, 1);
+  video = true;
+  assert.equal((await looks.get('P'))!.value, 1, 'a video app: the read 40 ms ago is within the gap, so it is given (stale)');
+  await sleep(320);
+  assert.equal((await looks.get('P'))!.value, 2);
+  const stale = await looks.get('P', { waitMs: 0 });
+  assert.deepEqual([stale!.value, stale!.stale, reads], [2, true, 2], 'over the budget: the last read, marked stale');
+  const t0 = performance.now();
+  assert.equal((await looks.get('P', { waitMs: 1000 }))!.value, 3, 'or it waits for the budget');
+  assert.ok(performance.now() - t0 >= 200);
+  // a caller that gives up stops waiting, and a read nobody waits for is never sent
+  video = false;
+  const ac = new AbortController();
+  let started = 0;
+  const slow = new Budgeted<number>(async (_u, signal) => {
+    await sleep(30);
+    if (signal.aborted) return -1;
+    started++;
+    return 1;
+  }, { gapMs: () => 0 });
+  const gone = slow.get('P', { signal: ac.signal });
+  ac.abort();
+  assert.equal(await gone, null);
+  await sleep(50);
+  assert.equal(started, 0, 'cancelled before it reached the phone');
+  assert.ok(isVideoApp('com.zhiliaoapp.musically') && isVideoApp('com.burbn.instagram') && !isVideoApp('com.apple.mobilenotes'));
+  ok('looks: single-flight, coalesced, at most one per gap on a video app (else the last, stale), cancellable');
+}
+
+// ---- Control: nothing in an input's turn but the input (no probe, no heal), and the client's deadline ----
+{
+  const calls: string[] = [];
+  const b = {
+    mock: true,
+    screen: () => ({ width: 390, height: 844, scale: 3 }),
+    tap: async (_u: string, x: number) => {
+      calls.push(`tap ${x}`);
+      if (x === 99) await sleep(300);
+      return { via: 'wda' as const };
+    },
+  } as unknown as Backend;
+  const c = new Control(b, undefined, { actionTimeoutMs: 100, minGapMs: 0, idleProbeMs: 0 });
+  const heals: string[] = [];
+  c.onHeal = async (_u, why) => void heals.push(why);
+  await c.handle('P', { type: 'tap', x: 1, y: 1, unit: 'pt' });
+  await assert.rejects(c.handle('P', { type: 'tap', x: 99, y: 1, unit: 'pt' }), (e: HttpError) => e.status === 504 && /nothing was restarted/.test(e.message));
+  assert.deepEqual(heals, [], 'no probe before a quiet phone\'s first action, no heal after a hung one');
+  // a client's deadline it can't meet: refused at once (the hung tap still holds the line a moment)
+  await assert.rejects(c.handle('P', { type: 'tap', x: 2, y: 1, unit: 'pt', deadlineAt: Date.now() + 30 }), (e: HttpError) => e.status === 503 && e.extra?.state === 'busy');
+  await sleep(300);
+  assert.equal(calls.filter((x) => x === 'tap 2').length, 0, 'never sent late');
+  // the lease follows who sent it
+  await c.handle('P', { type: 'tap', x: 3, y: 1, unit: 'pt', owner: true });
+  assert.equal(c.actor('P').lease().kind, 'owner');
+  ok('control: no probe or heal in an input\'s turn; a 504 says nothing was restarted; deadlineAt refused at once when it cannot be met; owner input takes the lease');
 }
 
 console.log(`\nall ${passed} input checks passed`);

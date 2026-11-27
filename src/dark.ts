@@ -123,42 +123,66 @@ export interface WakeOps {
   sleep?(ms: number): Promise<void>;
   log?(m: string): void;
   /**
-   * 2026-11-18: the live view's capture gave no picture (a screen that's on always gives one): a screen that can't
-   * be told (no screenshot came) counts as dark, so it gets Home, a moment, Home, rather than being left off.
+   * The owner asked for this wake (POST /wake, the Unlock button): WDA's own unlock goes also when the phone doesn't
+   * say whether it's locked (WDA's unlock checks the lock itself). An automatic wake unlocks only a phone that says so.
+   */
+  explicit?: boolean;
+  /**
+   * 2026-11-18 to 2026-11-27: a live view without a picture pressed Home on a screen that couldn't be looked at. That
+   * sent a posting hand's app to the Home Screen (docs/root-cause.md section 6). Kept for callers; it no longer
+   * presses anything on a screen that couldn't be looked at.
    */
   force?: boolean;
+  /** What was seen (2026-11-27, src/phone/power.ts): "dark", "on", "locked" as the wake learns it. */
+  observed?(screen: 'on' | 'dark' | 'locked'): void;
+}
+
+/** What a wake did: `pressed` Home presses sent (always on an observed dark screen), `unknown` when it couldn't look. */
+export interface WakeResult {
+  pressed: number;
+  screen: 'on' | 'dark' | 'unknown';
 }
 
 /**
- * Wake and unlock. A phone that says it's locked (or doesn't say) gets WDA's unlock. Then the screen itself is looked
- * at: one still dark (a phone without a passcode never says "locked": its screen is just off after a lock or iOS's
- * Auto-Lock, and WDA's unlock did nothing) gets what WDA's unlock does, Home (the screen comes on), a moment, Home
- * again (past the lock screen), twice at most. Home is never pressed on a screen that shows something (it would leave
- * the app in front), nor when the screen can't be told. Throws when it stays dark.
+ * Wake and unlock (2026-11-27: from observations only, docs/root-cause.md 13.3d). A phone that says it's locked (or,
+ * for an explicit wake, doesn't say) gets WDA's unlock. Then the screen itself is looked at: one observed dark (a
+ * phone without a passcode never says "locked": its screen is just off after a lock or iOS's Auto-Lock, and WDA's
+ * unlock did nothing) gets what WDA's unlock does, Home (the screen comes on), a moment, Home again (past the lock
+ * screen), twice at most. Home is never pressed on a screen that shows something (it would leave the app in front),
+ * nor on one that couldn't be looked at (a busy WDA), whatever `force` says. Throws when it stays dark.
  */
-export async function wakeScreen(ops: WakeOps): Promise<void> {
+export async function wakeScreen(ops: WakeOps): Promise<WakeResult> {
   const sleep = ops.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
   const locked = await ops.locked();
-  if (locked !== false) {
+  if (locked === true) ops.observed?.('locked');
+  if (locked === true || (locked === null && ops.explicit)) {
     try {
       await ops.unlock();
     } catch (err) {
       if (locked === true) throw err;
     }
   }
+  let pressed = 0;
   for (let n = 0; n < 2; n++) {
     const dark = await ops.dark();
-    if (dark === false) return;
-    if (dark === null && !(ops.force && n === 0)) return;
-    ops.log?.(
-      dark === null
-        ? 'the live view has no picture and the screen could not be looked at: pressing Home'
-        : `the screen is dark${locked === false ? ' (the phone says it is not locked)' : ''}: pressing Home`,
-    );
+    if (dark === false) {
+      ops.observed?.('on');
+      return { pressed, screen: 'on' };
+    }
+    if (dark === null) {
+      if (ops.force || n === 0) ops.log?.('the screen could not be looked at (its WebDriverAgent is busy): nothing was pressed');
+      return { pressed, screen: 'unknown' };
+    }
+    ops.observed?.('dark');
+    ops.log?.(`the screen is dark${locked === false ? ' (the phone says it is not locked)' : ''}: pressing Home`);
     await ops.home().catch(() => {});
     await sleep(WAKE_PRESS_GAP_MS);
     await ops.home().catch(() => {});
     await sleep(WAKE_SETTLE_MS);
+    pressed += 2;
   }
-  if ((await ops.dark()) === true) throw new Error('the screen stayed dark after two wakes');
+  const last = await ops.dark();
+  if (last === true) throw new Error('the screen stayed dark after two wakes');
+  if (last === false) ops.observed?.('on');
+  return { pressed, screen: last === false ? 'on' : 'unknown' };
 }

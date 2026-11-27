@@ -17,7 +17,7 @@ import { AddressInfo } from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 import { PassThrough } from 'node:stream';
-import { LaneBusy, LaneRun, routeLabel, routePriority, WdaLane } from '../src/lane.js';
+import { LaneBusy, LaneCancelled, LaneOutcome, LaneRun, RequestJournal, routeLabel, routePriority, routeQueue, WdaLane } from '../src/lane.js';
 import { HttpError } from '../src/types.js';
 import { exchange, HOLD_MS, LANE_WAIT_MS, QUIET_WAIT_MS, WdaError, WdaManager } from '../src/wda.js';
 
@@ -65,6 +65,60 @@ assert.deepEqual([HOLD_MS, LANE_WAIT_MS, QUIET_WAIT_MS], [60_000, 8000, 2000]);
       end: () => end(),
     };
   };
+  /**
+   * A request like the server's (src/wda.ts exchange): `outcome` says how it ended, `cancel` stops it, `late` says
+   * whether a late answer came. `timeout()`: the Mac stops waiting; `late()`: the phone's answer after that.
+   */
+  const wired = (log: string[], name: string) => {
+    let answer!: (v: string) => void;
+    let fail!: (e: Error) => void;
+    let end!: () => void;
+    let how!: (o: LaneOutcome) => void;
+    let lateIs!: (v: boolean) => void;
+    const started = { yes: false };
+    const make = (): LaneRun<string> => {
+      started.yes = true;
+      log.push(`start ${name}`);
+      const result = new Promise<string>((a, b) => {
+        answer = a;
+        fail = b;
+      });
+      result.catch(() => {});
+      const ended = new Promise<void>((a) => (end = a));
+      const outcome = new Promise<LaneOutcome>((a) => (how = a));
+      const late = new Promise<boolean>((a) => (lateIs = a));
+      return {
+        result, ended, outcome, late,
+        cancel: (err) => {
+          log.push(`cancel ${name}`);
+          fail(err);
+          how('cancelled');
+          end();
+        },
+      };
+    };
+    return {
+      make, started,
+      answer: (v = name) => {
+        answer(v);
+        how('answered');
+        lateIs(false);
+        end();
+      },
+      fail: () => {
+        fail(new Error('ECONNREFUSED'));
+        how('failed');
+        lateIs(false);
+        end();
+      },
+      timeout: () => {
+        fail(new Error('timeout'));
+        how('timeout');
+        end();
+      },
+      late: () => lateIs(true),
+    };
+  };
   const log: string[] = [];
   const lane = new WdaLane(() => 'iPhone-1');
 
@@ -78,7 +132,7 @@ assert.deepEqual([HOLD_MS, LANE_WAIT_MS, QUIET_WAIT_MS], [60_000, 8000, 2000]);
   const p3 = lane.run('read', 'GET /wda/locked', 5000, r3.make);
   const pt = lane.run('input', 'POST /lotus/gesture', 5000, t1.make);
   assert.deepEqual(log, ['start read1'], 'only one on its way');
-  assert.deepEqual(lane.state(), { inFlight: 'GET /source', since: lane.state().since, abandoned: false, waiting: 3, beside: null });
+  assert.deepEqual(lane.state(), { inFlight: 'GET /source', since: lane.state().since, abandoned: false, waiting: 3, beside: null, onPhone: 1, held: null, heldSince: null });
   r1.answer();
   assert.equal(await p1, 'read1');
   await sleep(0);
@@ -95,48 +149,178 @@ assert.deepEqual([HOLD_MS, LANE_WAIT_MS, QUIET_WAIT_MS], [60_000, 8000, 2000]);
   assert.equal(lane.idle, true);
   ok('lane: one request on its way at a time, first come first served, a touch before the reads that wait');
 
-  // 1b. 2026-11-22: a request that yields (a read of the app in front) lets the owner's touches go beside
-  //     it at once, one at a time and in their order; reads still wait for it; an input that reads the app itself
-  //     (the focused field) never goes beside it
+  // 1b. 2026-11-27: no touch goes "beside" anything any more. A touch has the reserved slot at the head: a read on its
+  //     way that can be stopped (a GET) is stopped at once (its caller hears LaneCancelled, never waited for), the
+  //     journal keeps it ("the phone may still be on it"), the touch goes at once; reads wait until the phone is known
+  //     done with it (its late answer, or a later answer on its queue); an input never waits for the journal
   {
     const ylog: string[] = [];
     const yl = new WdaLane(() => 'iPhone-1');
-    const stuck = manual(ylog, 'appread');
-    const ta = manual(ylog, 'tapA');
-    const tb = manual(ylog, 'tapB');
-    const rd = manual(ylog, 'read');
-    const fld = manual(ylog, 'field');
-    const ps0 = yl.run('read', 'GET /wda/activeAppInfo', 5000, stuck.make, undefined, { yields: true });
+    const rd = wired(ylog, 'appread');
+    const ta = wired(ylog, 'tapA');
+    const tb = wired(ylog, 'tapB');
+    const r2 = wired(ylog, 'read2');
+    const ps0 = yl.run('read', 'GET /wda/activeAppInfo', 5000, rd.make, undefined, { cancellable: true });
+    await sleep(0);
+    assert.deepEqual(yl.state(), { inFlight: 'GET /wda/activeAppInfo', since: yl.state().since, abandoned: false, waiting: 0, beside: null, onPhone: 1, held: null, heldSince: null });
     const pta = yl.run('input', 'POST /lotus/gesture', 5000, ta.make);
     const ptb = yl.run('input', 'POST /lotus/gesture', 5000, tb.make);
-    const prd = yl.run('read', 'GET /wda/locked', 5000, rd.make);
-    assert.deepEqual(ylog, ['start appread', 'start tapA'], 'the first touch went beside the stuck read at once');
-    assert.deepEqual(yl.state().beside, 'POST /lotus/gesture');
+    const pr2 = yl.run('read', 'GET /wda/locked', 5000, r2.make);
+    await assert.rejects(ps0, (err: Error) => err instanceof LaneCancelled && err instanceof LaneBusy && (err as LaneCancelled).extra?.cancelled === true && /was stopped on its way \(not waited for\)/.test(err.message));
+    assert.deepEqual(ylog, ['start appread', 'cancel appread', 'start tapA'], 'the read was stopped, the touch went at once');
+    await sleep(0);
+    assert.deepEqual(yl.journal.entries().map((j) => [j.label, j.state, j.why]), [
+      ['GET /wda/activeAppInfo', 'abandoned', 'cancelled for an input'],
+      ['POST /lotus/gesture', 'on-wire', null],
+    ]);
+    assert.equal(yl.state().held, 'GET /wda/activeAppInfo', 'the state says the phone may still be on it');
     ta.answer();
     await pta;
     await sleep(0);
-    assert.deepEqual(ylog, ['start appread', 'start tapA', 'start tapB'], 'the next one followed it, in order');
+    assert.deepEqual(ylog.slice(3), ['start tapB'], 'the next touch followed it, in order (the journal is no reason for an input to wait)');
+    // (tapA went within PROOF_MARGIN_MS of the read: its answer proves nothing of it; sockets may race)
+    assert.deepEqual(yl.journal.entries().map((j) => j.label), ['GET /wda/activeAppInfo', 'POST /lotus/gesture']);
     tb.answer();
     await ptb;
     await sleep(0);
-    stuck.abandon(); // its caller gave up; the phone still holds it
-    await assert.rejects(ps0, /timeout/);
-    const pf = yl.run('input', 'POST /lotus/field', 5000, fld.make, undefined, { beside: false });
-    await sleep(10);
-    assert.deepEqual(ylog, ['start appread', 'start tapA', 'start tapB'], 'the read and the field read wait for the stuck one');
-    stuck.end();
+    assert.deepEqual(ylog.slice(4), [], 'the read waits: the phone may still be on the stopped one');
+    rd.late(); // the stopped read's late answer: the phone is done with it
     await sleep(0);
-    assert.deepEqual(ylog.slice(3), ['start field'], 'then the field (input first), then the read');
-    fld.answer();
-    await pf;
-    await sleep(0);
-    rd.answer();
-    await prd;
+    assert.deepEqual(ylog.slice(4), ['start read2'], 'then the read');
+    r2.answer();
+    await pr2;
     assert.equal(yl.idle, true);
-    ok('lane: touches go beside a request that yields (a read of the app in front), in order; reads still wait');
+    assert.equal(yl.journal.count(), 0);
+
+    // a read held back by a request the Mac stopped waiting for: it goes once the late answer comes
+    const zlog: string[] = [];
+    const zl = new WdaLane(() => 'iPhone-1');
+    const slowRead = wired(zlog, 'slow');
+    const tap = wired(zlog, 'tap');
+    const after = wired(zlog, 'after');
+    const ps = zl.run('read', 'GET /source', 5000, slowRead.make, undefined, { cancellable: false });
+    slowRead.timeout();
+    await assert.rejects(ps, /timeout/);
+    await sleep(0);
+    assert.deepEqual([zl.state().inFlight, zl.state().held], [null, 'GET /source'], 'the lane is free; the journal holds it');
+    const pa = zl.run('read', 'GET /wda/locked', 5000, after.make);
+    const pt = zl.run('input', 'POST /lotus/gesture', 5000, tap.make);
+    await sleep(0);
+    assert.deepEqual(zlog, ['start slow', 'start tap'], 'the touch went; the read waits for the phone');
+    tap.fail(); // the tap's connection failed (it never reached the phone): proves nothing
+    await assert.rejects(pt);
+    await sleep(0);
+    assert.deepEqual(zlog, ['start slow', 'start tap'], 'still held');
+    slowRead.late(); // the phone's late answer
+    await sleep(0);
+    assert.deepEqual(zlog, ['start slow', 'start tap', 'start after']);
+    after.answer();
+    await pa;
+    assert.equal(zl.journal.count(), 0);
+    ok('lane: a touch stops a read on its way (never waits for it) and goes at once; the journal keeps it until the phone is known done; reads wait for that');
   }
 
-  // 2. a caller that stopped waiting (no answer in its time) still holds the lane until the request is over
+  // 1c. deadlines: refused at once when it can't be done in time, dropped unsent at its last start, and the time left
+  //     is given to the request (never on the wire past it)
+  {
+    const now = 1_000_000;
+    const dl = new WdaLane(() => 'iPhone-1', { now: () => now });
+    const dlog: string[] = [];
+    const never = wired(dlog, 'never');
+    await assert.rejects(dl.run('read', 'GET /source', 5000, never.make, undefined, { deadlineAt: now + 100 }), (err: HttpError) => err instanceof LaneBusy && err.extra?.reason === 'deadline' && /its deadline leaves no time/.test(err.message));
+    assert.equal(never.started.yes, false, 'never sent');
+    let budget: number | undefined;
+    const b = wired(dlog, 'budget');
+    const pb = dl.run('input', 'POST /lotus/gesture', 5000, (ms) => ((budget = ms), b.make()), undefined, { deadlineAt: now + 900, minMs: 100 });
+    await sleep(0);
+    assert.equal(budget, 900, 'the request gets the time left to its deadline');
+    // a read waiting behind it past deadlineAt - minMs is dropped unsent (its timer runs on the real clock)
+    const late = wired(dlog, 'late');
+    const pl = dl.run('read', 'GET /wda/locked', 5000, late.make, undefined, { deadlineAt: now + 60, minMs: 10 });
+    await assert.rejects(pl, (err: HttpError) => err instanceof LaneBusy && /was not sent/.test(err.message));
+    assert.equal(late.started.yes, false);
+    b.answer();
+    await pb;
+    // refuse: a hung link answers at once, never queued
+    const hung = new WdaLane(() => 'iPhone-1', { refuse: (prio) => (prio === 'input' ? new HttpError(503, 'hung') : null) });
+    await assert.rejects(hung.run('input', 'POST /lotus/gesture', 5000, wired(dlog, 'x').make), /hung/);
+    assert.equal(hung.idle, true);
+    ok('lane: a request whose deadline leaves no time is refused at once; one that waited past its last start is dropped unsent; the time left goes with it');
+  }
+
+  // 1d. looks (a still, the tree) come last, one at a time (the same one asked again joins it), and never right after
+  //     an input (its guard)
+  {
+    const llog: string[] = [];
+    const ll = new WdaLane(() => 'iPhone-1', { lookGuardMs: 40 });
+    const r = wired(llog, 'read');
+    const l1 = wired(llog, 'look1');
+    const l2 = wired(llog, 'look2');
+    const src = wired(llog, 'src');
+    const pr = ll.run('read', 'GET /wda/locked', 5000, r.make);
+    const pl1 = ll.run('look', 'GET /lotus/shot', 5000, l1.make, 'shot');
+    const pl2 = ll.run('look', 'GET /lotus/shot', 5000, l2.make, 'shot'); // the same: joins
+    const ps = ll.run('look', 'GET /source', 5000, src.make, 'src');
+    const r2 = wired(llog, 'read2');
+    const pr2 = ll.run('read', 'GET /wda/activeAppInfo', 5000, r2.make);
+    r.answer();
+    await pr;
+    await sleep(0);
+    assert.deepEqual(llog, ['start read', 'start read2'], 'a read before the looks that waited');
+    r2.answer();
+    await pr2;
+    await sleep(0);
+    assert.deepEqual(llog.slice(2), ['start look1']);
+    l1.answer('S');
+    assert.deepEqual(await Promise.all([pl1, pl2]), ['S', 'S']);
+    assert.equal(l2.started.yes, false, 'asked once');
+    await sleep(0);
+    src.answer();
+    await ps;
+    // right after an input: a look waits out the guard
+    const t = wired(llog, 'tap');
+    const pt = ll.run('input', 'POST /lotus/gesture', 5000, t.make);
+    t.answer();
+    await pt;
+    const l3 = wired(llog, 'look3');
+    const t0 = Date.now();
+    const pl3 = ll.run('look', 'GET /lotus/shot', 5000, l3.make, 'shot');
+    assert.ok(await until(() => l3.started.yes, 1000));
+    assert.ok(Date.now() - t0 >= 30, `the look waited out the input's guard (${Date.now() - t0} ms)`);
+    l3.answer();
+    await pl3;
+    ok('lane: looks go last, one at a time (the same look joins), and wait a moment after an input');
+  }
+
+  // 1e. the journal by itself: first in, first out per queue (an answer proves what was sent before it), a still past
+  //     its cap aged out, a restart flushes all
+  {
+    let now = 10_000;
+    const j = new RequestJournal(() => now);
+    const cleared: string[] = [];
+    j.on({ cleared: (e, how) => void cleared.push(`${e.label} ${how}`) });
+    const a = j.add({ label: 'A', prio: 'read', queue: 'main', appBound: false, sentAt: now, deadlineAt: now + 1000 });
+    now += 100;
+    const sd = j.add({ label: 'S', prio: 'look', queue: 'side', appBound: false, sentAt: now, deadlineAt: now + 1000 });
+    now += 100;
+    const b = j.add({ label: 'B', prio: 'input', queue: 'main', appBound: false, sentAt: now, deadlineAt: now + 1000 });
+    j.abandon(a.id, 'no answer within 1.0 s');
+    j.abandon(sd.id, 'no answer within 1.0 s');
+    assert.deepEqual([j.count(), j.count('main'), j.held().length, j.held('main').length, j.oldest('main')!.label], [3, 2, 2, 1, 'A']);
+    assert.deepEqual(j.inDeadline(now + 850).map((e) => e.label), ['S', 'B']);
+    j.done(b.id); // B answered: A (sent before it on main) is over too; the still (side) isn't
+    assert.deepEqual(cleared, ['B answered', 'A proved']);
+    now += 40_000;
+    j.age('side', 30_000);
+    assert.equal(cleared.at(-1), 'S aged');
+    j.add({ label: 'C', prio: 'read', queue: 'main', appBound: false, sentAt: now, deadlineAt: now + 1000 });
+    j.flush();
+    assert.deepEqual([cleared.at(-1), j.count()], ['C flushed', 0]);
+    ok('journal: an answer proves what went before it on its queue, a still past its cap is aged out, a restart flushes all');
+  }
+
+  // 2. a hand-made request without an outcome whose caller stopped waiting still holds the lane until it's over, and
+  //    the state says so (`abandoned`); the server's own requests (an outcome) free it at once (1b)
   log.length = 0;
   const slow = manual(log, 'shot');
   const after = manual(log, 'tap');
@@ -204,16 +388,21 @@ assert.deepEqual([HOLD_MS, LANE_WAIT_MS, QUIET_WAIT_MS], [60_000, 8000, 2000]);
   assert.equal(await d, true);
   ok('lane: a read that waited too long is dropped unsent; a quiet read never piles on; a restart answers what waits');
 
-  // 6. whose turn: touches, keys, typing, launches, locks and lifts are input; looks and the session's housekeeping are reads
+  // 6. whose turn: touches, keys, typing, launches, locks and lifts are input; a still and the tree are looks; the
+  //    session's housekeeping is a read. Which of WDA's queues: /status, stills and /lotus/info answer off the main one
   assert.deepEqual(
     [
       ['POST', '/lotus/gesture'], ['POST', '/session/S1/wda/tap'], ['POST', '/wda/keys'], ['POST', '/wda/lock'], ['DELETE', '/session/S1/actions'],
       ['GET', '/lotus/shot?scale=50'], ['GET', '/source?format=json'], ['POST', '/session'], ['POST', '/session/S1/appium/settings'], ['DELETE', '/session/S1'],
     ].map(([m, p]) => routePriority(m!, p!)),
-    ['input', 'input', 'input', 'input', 'input', 'read', 'read', 'read', 'read', 'read'],
+    ['input', 'input', 'input', 'input', 'input', 'look', 'look', 'read', 'read', 'read'],
+  );
+  assert.deepEqual(
+    [['GET', '/status'], ['GET', '/screenshot'], ['GET', '/lotus/shot?scale=50'], ['GET', '/session/S1/lotus/info'], ['GET', '/source'], ['POST', '/lotus/gesture'], ['GET', '/wda/locked']].map(([m, p]) => routeQueue(m!, p!)),
+    ['side', 'side', 'side', 'side', 'main', 'main', 'main'],
   );
   assert.equal(routeLabel('GET', '/session/abc-123/orientation?x=1'), 'GET /session/:id/orientation');
-  ok('lane: input or read by the route; a request named without its session id or query');
+  ok('lane: input, read or look by the route, main or side queue; a request named without its session id or query');
 }
 
 // ---- one exchange: a late answer is waited for (held), one never answered is given up at its hold ----
@@ -255,22 +444,48 @@ assert.deepEqual([HOLD_MS, LANE_WAIT_MS, QUIET_WAIT_MS], [60_000, 8000, 2000]);
     const z = exchange({ port, method: 'GET', path: '/z', headers: {}, agent, timeout: 50, holdMs: 0, resend: true, onAnswer: () => answers++ });
     assert.deepEqual(await z.result, { status: 200, text: '{"value":1}' });
     await z.ended;
+    assert.deepEqual([await z.outcome, await z.late], ['answered', true]);
+
+    // 2026-11-27, `lateMs`: the exchange ends at its timeout (the lane is free) and the socket hears the late answer
+    wait = 200;
+    const t2 = Date.now();
+    const l = exchange({ port, method: 'GET', path: '/l', headers: {}, agent, timeout: 50, holdMs: 0, lateMs: 1000, resend: true, onAnswer: () => answers++ });
+    await assert.rejects(l.result, (err: Error & { code?: string }) => err.code === 'TIMEOUT');
+    await l.ended;
+    assert.ok(Date.now() - t2 < 150, 'ended at its timeout');
+    assert.equal(await l.outcome, 'timeout');
+    const before = answers;
+    assert.equal(await l.late, true, 'the late answer was heard');
+    assert.equal(answers, before + 1, 'and counts as an answer');
+    // cancelled (for an input): the same
+    const c = exchange({ port, method: 'GET', path: '/c', headers: {}, agent, timeout: 1000, holdMs: 0, lateMs: 1000, resend: true, onAnswer: () => answers++ });
+    await sleep(20);
+    c.cancel(new Error('stopped'));
+    await assert.rejects(c.result, /stopped/);
+    assert.deepEqual([await c.outcome, await c.late], ['cancelled', true]);
+    // never answered: given up at lateMs
+    wait = Infinity;
+    const n = exchange({ port, method: 'GET', path: '/n', headers: {}, agent, timeout: 30, holdMs: 0, lateMs: 80, resend: true, onAnswer: () => answers++ });
+    await assert.rejects(n.result);
+    assert.equal(await n.late, false);
   } finally {
     agent.destroy();
     server.closeAllConnections();
     server.close();
   }
-  ok('exchange: the caller hears at its timeout, the request is held for the late answer (an answer), given up at its hold');
+  ok('exchange: the caller hears at its timeout; a held request (holdMs) or one listening late (lateMs, the lane already free) hears the late answer; given up at its cap');
 }
 
 // ---- a phone's WDA through the lane: the evidence of 2026-11-21, played on a fake WDA ----
 type Fake = {
   current: string; made: number; port: number; hits: string[]; open: number; most: number; statusDuring: number;
-  shotMs: number; shotFail: boolean; sourceMs: number; tapMs: number; hangShot: boolean; close(): void;
+  /** Reads on WDA's main queue open at once (not touches, not stills or /status): never two. */
+  reads: number; mostReads: number;
+  shotMs: number; shotFail: boolean; sourceMs: number; tapMs: number; hangShot: boolean; launchMs: number; close(): void;
 };
 const fakeWda = async (): Promise<Fake> => {
   const w: Fake = {
-    current: '', made: 0, port: 0, hits: [], open: 0, most: 0, statusDuring: 0, shotMs: 0, shotFail: false, sourceMs: 0, tapMs: 0, hangShot: false,
+    current: '', made: 0, port: 0, hits: [], open: 0, most: 0, statusDuring: 0, reads: 0, mostReads: 0, shotMs: 0, shotFail: false, sourceMs: 0, tapMs: 0, hangShot: false, launchMs: 0,
     close: () => {
       server.closeAllConnections();
       server.close();
@@ -284,12 +499,15 @@ const fakeWda = async (): Promise<Fake> => {
       const json = (status: number, v: unknown, wait = 0) => {
         // /status answers off WDA's main queue: never counted as one of its requests at once
         const counted = p !== '/status';
+        const read = counted && req.method === 'GET' && p !== '/screenshot';
         if (counted) {
           w.open++;
           w.most = Math.max(w.most, w.open);
         } else if (w.open > 0) w.statusDuring++;
+        if (read) w.mostReads = Math.max(w.mostReads, ++w.reads);
         const done = () => {
           if (counted) w.open--;
+          if (read) w.reads--;
         };
         res.on('close', done);
         if (!Number.isFinite(wait)) return;
@@ -313,6 +531,7 @@ const fakeWda = async (): Promise<Fake> => {
       }
       if (p.startsWith('/source')) return json(200, { value: { type: 'Application' } }, w.sourceMs);
       if (p === '/wda/locked') return json(200, { value: false });
+      if (p === '/wda/apps/launch') return json(200, { value: null }, w.launchMs);
       if (p === '/wda/activeAppInfo') return json(200, { value: { bundleId: 'com.apple.springboard' } });
       if (p === '/wda/device/info') return json(200, { value: {} });
       const m = /^\/session\/([^/]+)(\/.*)?$/.exec(p);
@@ -348,11 +567,12 @@ const xcodes = () => spawned.filter((c) => c === 'xcodebuild').length;
   console.log = (...a: unknown[]) => void logs.push(a.join(' '));
   const w = await fakeWda();
   const cfg = { wdaBasePort: w.port, mjpegBasePort: w.port + 1, wdaProject: '/x', wdaDerivedData: '/y' } as unknown as import('../src/config.js').Config;
-  // quick clocks: a touch gets 250 ms, a probe 150 ms; a request never answered holds the lane 400 ms more; a turn
-  // waits 600 ms at most; /status 100 ms, asked 3 times 100 ms apart before anything is restarted
+  // quick clocks: a touch gets 250 ms, a probe 150 ms; a request never answered is checked 400 ms on (hold); a turn
+  // waits 600 ms at most; /status 100 ms, asked 3 times 100 ms apart before anything is restarted; a still the phone
+  // never answered leaves the journal after 1.2 s (sideCap)
   const m = new WdaManager(cfg, () => 'iPhone-1', fakeSpawn, {
     input: 250, launch: 1000, probe: 150, restart: 3000, status: 100, probes: 3, probeEvery: 100, backoff: [50, 100, 200],
-    sessionWait: 500, recoverWait: 3000, hold: 400, laneWait: 600,
+    sessionWait: 500, recoverWait: 3000, hold: 400, laneWait: 600, sideCap: 1200,
   });
   try {
     m.start('U1');
@@ -360,10 +580,12 @@ const xcodes = () => spawned.filter((c) => c === 'xcodebuild').length;
     const runners = xcodes();
     const sessions = w.made;
     w.most = 0;
+    w.mostReads = 0;
 
     // 1. everything at once (what the server did while the owner watched and touched iPhone-1): the orientation
     //    poll, the card's reads, the watch's lock check, a still, a UI read and two taps. The phone gets them one
-    //    at a time, never two at once, and every one is answered
+    //    at a time, never two reads at once (2026-11-27: a touch stops a read on its way and goes at once: the phone
+    //    may have that read and the touch together, never more), and every one is answered or said stopped
     w.shotMs = 120;
     w.sourceMs = 80;
     const all = await Promise.allSettled([
@@ -375,52 +597,61 @@ const xcodes = () => spawned.filter((c) => c === 'xcodebuild').length;
       m.tap('U1', 10, 10),
       m.tap('U1', 20, 20),
     ]);
-    assert.equal(w.most, 1, `one request at a time reached the phone (most at once: ${w.most})`);
-    assert.deepEqual(all.filter((r) => r.status === 'rejected').map((r) => String((r as PromiseRejectedResult).reason?.message)), []);
-    ok('WDA: the server\'s many callers reach the phone one request at a time, all of them answered');
+    assert.equal(w.mostReads, 1, `never two reads at once on the phone (most at once: ${w.mostReads})`);
+    assert.ok(w.most <= 2, `a touch and the read it stopped at most (most at once: ${w.most})`);
+    const rejected = all.filter((r) => r.status === 'rejected').map((r) => (r as PromiseRejectedResult).reason);
+    assert.ok(rejected.every((err) => /was stopped on its way \(not waited for\)/.test(err?.message)), `only reads stopped for a touch: ${rejected.map((e) => e?.message)}`);
+    assert.equal(all[5]!.status, 'fulfilled');
+    assert.equal(all[6]!.status, 'fulfilled');
+    ok('WDA: the server\'s many callers reach the phone one request at a time (a touch only beside the read it stopped), all answered or stopped');
 
-    // 2. the touch goes before the reads that wait (a still on its way finishes first)
+    // 2. the touch goes before the reads that wait; 2026-11-27: a still on its way is stopped for it (never waited
+    //    for: its caller hears so at once and asks again), and the touch goes right then
     w.hits.length = 0;
     w.shotMs = 200;
     const first = m.callNoSession('U1', 'GET', '/screenshot', undefined, 2000);
     await sleep(30); // the still is on its way
     const order = [m.source('U1'), m.callSoft('U1', 'GET', '/wda/locked', undefined, 2000)];
     await sleep(10); // the two reads wait their turn
+    const tt = Date.now();
     const tap = m.tap('U1', 30, 30);
-    await Promise.all([first, ...order, tap]);
+    await assert.rejects(first, (err: HttpError) => err.status === 503 && err.extra?.cancelled === true && /GET \/screenshot was stopped on its way \(not waited for\)/.test(err.message));
+    await tap;
+    assert.ok(Date.now() - tt < 150, `the touch went at once, not after the still (${Date.now() - tt} ms)`);
+    await Promise.all(order);
     const seq = w.hits.filter((h) => !h.startsWith('GET /status')).map((h) => (h.includes('/wda/tap') ? 'tap' : h.split(' ')[1]!.split('?')[0]));
     assert.deepEqual(seq.slice(0, 2), ['/screenshot', 'tap'], 'the touch went before the reads that waited');
     assert.deepEqual(new Set(seq.slice(2)), new Set(['/source', '/wda/locked']));
-    ok('WDA: a touch goes before the reads that wait its turn');
+    assert.ok(await until(() => m.journal('U1').length === 0, 1000), "the stopped still's late answer cleared it from the journal");
+    ok('WDA: a touch stops a still on its way and goes at once, before the reads that wait');
 
-    // 3. a slow still (8 s on the phone, scaled here): its caller hears "no answer" at its timeout, the touch behind it
-    //    waits its turn and is sent only once the phone answered the still (never on top of it). Nothing is recovered,
-    //    nothing restarted, the session kept: slow is not dead
+    // 3. a slow still (8 s on the phone, scaled here): its caller hears "no answer" at its timeout; nothing is
+    //    recovered, nothing restarted, the session kept: slow is not dead. 2026-11-27: the lane is free at once (the
+    //    journal keeps the still until the phone's late answer), and a touch never waits for it
     w.shotMs = 500;
     const heals = m.healStats('U1').heals;
     const t0 = Date.now();
-    const shot = m.callNoSession('U1', 'GET', '/screenshot', undefined, 200);
-    await sleep(10);
-    const tap2 = m.tap('U1', 40, 40);
-    await assert.rejects(shot, (err: WdaError) => err.status === 502 && /^iPhone-1 did not answer in time \(no answer within 0s\): its WebDriverAgent is busy or stuck, nothing was restarted/.test(err.message));
-    await tap2;
-    assert.ok(Date.now() - t0 >= 480, `the touch went after the still's late answer (${Date.now() - t0} ms)`);
-    assert.equal(w.most, 1, 'never two at once');
+    await assert.rejects(m.callNoSession('U1', 'GET', '/screenshot', undefined, 200), (err: WdaError) => err.status === 502 && /^iPhone-1 did not answer in time \(no answer within 0s\): its WebDriverAgent is busy or stuck, nothing was restarted/.test(err.message));
+    assert.deepEqual([m.linkHealth('U1')!.lane.inFlight, m.linkHealth('U1')!.lane.held], [null, 'GET /screenshot'], 'the lane is free; the journal holds the still');
+    await m.tap('U1', 40, 40);
+    assert.ok(Date.now() - t0 < 450, `the touch went before the still's late answer (${Date.now() - t0} ms)`);
+    assert.ok(await until(() => m.journal('U1').length === 0, 1000), "the still's late answer cleared it");
     assert.deepEqual([xcodes(), w.made, m.healStats('U1').heals, m.state('U1'), m.linkHealth('U1')!.recoveries], [runners, sessions, heals, 'ready', 0]);
-    ok('WDA: a slow still never recovers or restarts anything; the touch behind it waits its turn instead of piling on');
+    ok('WDA: a slow still never recovers or restarts anything, never holds the lane, and a touch never waits for it');
 
-    // 4. a touch that would wait too long behind a slow request is dropped unsent, with why (a 503 "busy", the phone's
-    //    name and what it was busy with), never sent late
-    w.shotMs = 1500;
-    const long = m.callNoSession('U1', 'GET', '/screenshot', undefined, 3000);
+    // 4. a touch that would wait too long behind a slow request that can't be stopped (a launch, an input itself) is
+    //    dropped unsent, with why (a 503 "busy", the phone's name and what it was busy with), never sent late
+    w.launchMs = 1500;
+    const long = m.callNoSession('U1', 'POST', '/wda/apps/launch', JSON.stringify({ bundleId: 'com.example' }), 3000);
     await sleep(10);
     const taps = w.hits.filter((h) => h.includes('/wda/tap')).length;
-    await assert.rejects(m.tap('U1', 50, 50), (err: HttpError) => err.status === 503 && err.extra?.state === 'busy' && /^iPhone-1 is busy: its WebDriverAgent is still working on an earlier request \(GET \/screenshot, [\d.]+ s so far\), so POST \/session\/:id\/wda\/tap was not sent/.test(err.message));
+    await assert.rejects(m.tap('U1', 50, 50), (err: HttpError) => err.status === 503 && err.extra?.state === 'busy' && /^iPhone-1 is busy: its WebDriverAgent is still working on an earlier request \(POST \/wda\/apps\/launch, [\d.]+ s so far\), so POST \/session\/:id\/wda\/tap was not sent/.test(err.message));
     // ...and a background read (the card) is skipped at once
     const t1 = Date.now();
     assert.equal(await m.peek('U1', '/wda/activeAppInfo'), null);
     assert.ok(Date.now() - t1 < 100, 'skipped at once');
     await long;
+    w.launchMs = 0;
     assert.equal(w.hits.filter((h) => h.includes('/wda/tap')).length, taps, 'the dropped touch never reached the phone');
     ok('WDA: a touch that would wait too long is dropped unsent with a clear "busy"; background reads skipped');
 
@@ -435,27 +666,30 @@ const xcodes = () => spawned.filter((c) => c === 'xcodebuild').length;
     await m.tap('U1', 10, 10);
     ok('WDA: XCTest\'s own failed still (a 500) is WDA answering: said as it is, never a recovery or a restart');
 
-    // 6. a still the phone never answers at all (not even late): its hold runs out, then WDA is checked. /status (on
-    //    its own connection, never stuck behind the lane) answers and the session still does: nothing is restarted
+    // 6. a still the phone never answers at all (not even late): it stays on the journal (the lane is free), and once
+    //    `hold` passed without an answer WDA is checked. /status (on its own connection, never stuck behind the lane)
+    //    answers and the session still does: nothing is restarted. The still is aged out of the journal at its cap
     w.hangShot = true;
     await assert.rejects(m.callNoSession('U1', 'GET', '/screenshot', undefined, 150), /did not answer in time/);
-    assert.equal(m.linkHealth('U1')!.lane.abandoned, true, 'the still holds the lane while the phone may still answer');
-    assert.ok(await until(() => m.linkHealth('U1')!.recoveries === 1 && !m.linkHealth('U1')!.lane.inFlight, 3000), 'checked once its hold ran out');
+    assert.deepEqual(m.journal('U1').map((j) => [j.label, j.state, j.queue]), [['GET /screenshot', 'abandoned', 'side']], 'the journal says the phone may still be on it');
+    assert.equal(m.linkHealth('U1')!.lane.inFlight, null, 'nothing holds the lane');
+    assert.ok(await until(() => m.linkHealth('U1')!.recoveries === 1, 3000), 'checked once its hold ran out');
     w.hangShot = false;
     assert.ok(await until(() => logs.some((l) => /\[wda U1\] recovered/.test(l))), 'recovered: WDA is there');
     assert.match(m.healStats('U1').lastHeal!.reason, /^recovering: no answer within [\d.]+ s to GET \/screenshot, not even late$/);
     assert.deepEqual([xcodes(), w.made, m.state('U1')], [runners, sessions, 'ready'], 'nothing restarted, the session kept');
     await m.tap('U1', 10, 10);
+    assert.ok(await until(() => m.journal('U1').length === 0, 3000), 'the hung still aged out at its cap');
     ok('WDA: a request never answered at all has WDA checked after its hold; /status answers, so nothing is restarted');
 
     // 7. /status is never stuck behind the lane: while a request the phone is slow with holds it, /status is asked
     //    on a connection of its own and answered at once (it used to wait for one of six sockets, all taken by
     //    requests the phone was slow with: busy:6, "/status never answered", a restart). A recover asked meanwhile
-    //    waits for the phone to finish (its late answer says WDA is there) and restarts nothing
+    //    restarts nothing
     w.shotMs = 700;
     const held = m.callNoSession('U1', 'GET', '/screenshot', undefined, 100).catch(() => {});
     await sleep(150);
-    assert.equal(m.linkHealth('U1')!.lane.inFlight, 'GET /screenshot');
+    assert.equal(m.linkHealth('U1')!.lane.held, 'GET /screenshot');
     const entry = (m as unknown as { entries: Map<string, unknown> }).entries.get('U1');
     const ping = (m as unknown as { ping(e: unknown, ms: number): Promise<{ ok: boolean }> }).ping.bind(m);
     const t2 = Date.now();
@@ -465,6 +699,7 @@ const xcodes = () => spawned.filter((c) => c === 'xcodebuild').length;
     assert.equal(await m.recoverNow('U1'), 'ready');
     await held;
     assert.deepEqual([xcodes(), w.made, m.state('U1')], [runners, sessions, 'ready']);
+    assert.ok(await until(() => m.journal('U1').length === 0, 2000), "the still's late answer cleared it");
     w.shotMs = 0;
     ok('WDA: /status goes past the lane on its own connection; a recover while the phone is busy restarts nothing');
 
@@ -489,4 +724,4 @@ const xcodes = () => spawned.filter((c) => c === 'xcodebuild').length;
 
 console.log(`\nall ${passed} lane checks passed`);
 // 2026-11-21 (2): the app in front that doesn't answer accessibility (test/stall.ts, run from here: it ends the run)
-await import('./stall.js');
+if (process.env.LANE_ONLY !== '1') await import('./stall.js'); // (LANE_ONLY=1: this file alone)

@@ -1,5 +1,6 @@
 import { ChildProcess, execFile, spawn } from 'node:child_process';
 import fs from 'node:fs';
+import { EventEmitter } from 'node:events';
 import http from 'node:http';
 import path from 'node:path';
 import { Config } from './config.js';
@@ -8,10 +9,11 @@ import { isNamed, KeyPress, modFlags, NAMED } from './keys.js';
 import { FILES_FORK_VERSION, FILES_ROUTES, FilesTarget, NEEDS_UPDATE, PhoneAway } from './phonefiles.js';
 import { FIELD_FORK_VERSION, FORK_ROUTES, ForkLaunch, KEYS_FORK_VERSION, launchPlan, LIVE_GAPPED, LIVE_SEGMENTED, TOKEN_ENV, TOKEN_HEADER, usableLiveMode, WdaFlavor } from './fork.js';
 import { isLandscape, Orientation, orientationFromWda, uprightSize, uprightToPanel } from './orient.js';
-import { LaneBusy, LanePrio, LaneState, routeLabel, routePriority, WdaLane } from './lane.js';
+import { JournalEntry, LaneBusy, LaneOutcome, LanePrio, LaneState, PROOF_MARGIN_MS, RequestJournal, routeLabel, routePriority, routeQueue, WdaLane } from './lane.js';
 import { knownScreen, pickScreen, saneSize, ScreenPick } from './screens.js';
 import { Segmenter } from './segments.js';
-import { ButtonName, ControlState, HttpError, PathPoint, ScreenInfo, StreamSettings } from './types.js';
+import { trace } from './trace.js';
+import { ButtonName, ControlState, HttpError, PathPoint, PhoneState, ScreenInfo, StreamSettings } from './types.js';
 
 export type WdaStatus = 'starting' | 'ready' | 'failed' | 'stopped';
 
@@ -46,6 +48,8 @@ export class WdaError extends HttpError {
 
 interface Entry {
   udid: string;
+  /** 2026-11-27: when something on the phone's main queue last answered (ms since the epoch): HELD_STUCK_MS. */
+  mainMovedAt: number;
   wdaPort: number;
   mjpegPort: number;
   status: WdaStatus;
@@ -189,6 +193,26 @@ interface Entry {
   spawnTurn?: () => void;
   /** The runner ended while the phone was off the USB list for a moment: started again once it's back (setPresent). */
   awaitingUsb?: string;
+  /** 2026-11-27: the control link's state machine (ControlLink), fed by /status, the beat and the lane's journal. */
+  link: ControlLink;
+  /** The beat on its way now (one at a time), and the watch that runs while something of ours is on the phone. */
+  beatP?: Promise<void>;
+  watchP?: Promise<void>;
+  /** An automatic restart the cap refused: tried again when the cap allows. */
+  capTimer?: NodeJS.Timeout;
+  /** The control is down only because the cap refused a restart (cleared when the phone answers again). */
+  capped: boolean;
+  /** 2026-11-27: this runner was adopted from data/runners.json (an earlier server process started it, detached). */
+  adopted: boolean;
+  /** 2026-11-27: timed-out requests whose socket is still open for a late answer (LATE_PER_PHONE at most). */
+  lateOpen: number;
+  /** 2026-11-27: the /status ask out now (shared), and the last one's answer. */
+  pingP?: { epoch: number; p: Promise<{ ok: boolean; sessionId?: string; why?: string; conn?: boolean }> };
+  lastPing?: { epoch: number; at: number; r: { ok: boolean; sessionId?: string; why?: string; conn?: boolean } };
+  /** Stops reading the detached runner's log. */
+  untail?: () => void;
+  /** The runner's forwards: which slot, the Mac port and the phone's (to start one again, and for RUNNERS_FILE). */
+  fwdPlan?: { slot: 0 | 1; local: number; remote: number }[];
 }
 
 /**
@@ -279,6 +303,18 @@ export interface WdaTimeouts {
   spawnHold?: number;
   /** A restart attempt waits this long at most for a phone that's off the USB list for a moment (ms; default USB_WAIT_MS). */
   usbWait?: number;
+  /** 2026-11-27, the control link (ControlLink): something of ours on the phone this long is "busy" (ms; default BUSY_MS)... */
+  busy?: number;
+  /** ...the main queue silent this long beyond what it owes is "hung" (ms; default HUNG_MS)... */
+  hung?: number;
+  /** ...and this long, with nothing of ours still in its deadline, has the runner restarted (ms; default HUNG_MAX_MS). */
+  hungMax?: number;
+  /** Automatic runner restarts per phone per hour at most (default RESTARTS_PER_HOUR). */
+  restartCap?: number;
+  /** A look doesn't start this soon after an input (ms; default LOOK_GUARD_MS in src/lane.ts). */
+  lookGuard?: number;
+  /** A still the Mac stopped waiting for counts as over on the phone after this long (ms; default SIDE_CAP_MS). */
+  sideCap?: number;
 }
 export const DEFAULT_TIMEOUTS: WdaTimeouts = { input: 8000, launch: 20000, probe: 3000, restart: 90000 };
 /**
@@ -344,6 +380,8 @@ export const USB_WAIT_MS = 20_000;
  * anything else (it's skipped).
  */
 export const HOLD_MS = 60_000;
+/** 2026-11-27: at most this many timed-out requests per phone keep their socket open for a late answer (HOLD_MS). */
+export const LATE_PER_PHONE = 2;
 export const LANE_WAIT_MS = 8000;
 export const QUIET_WAIT_MS = 2000;
 /**
@@ -421,6 +459,337 @@ const FRESH_ORIENT_WAIT_MS = 4000;
 /** A launched runner's WDA gets this long (by the clock) to answer /status before the runner is given up on. */
 const START_MS = 180_000;
 
+// ---- 2026-11-27: the control link's state, from what's observed (docs/root-cause.md §10, §13.3a) ----
+
+/**
+ * Before: health was guessed from timeouts on the same serial channel (R2). /status answers off WDA's main queue, so
+ * "busy", "main queue hung for good" and "process gone" looked the same: the server first restarted too eagerly, then
+ * (after 11-21) never restarted a hung main queue at all ("recovered" while every request kept failing).
+ *
+ * Now two observed signals per phone: the process (/status, off the main queue) and the main queue itself (the beat:
+ * our build's GET /lotus/beat, which answers from the main queue; on a stock or older build GET /wda/locked stands in,
+ * a flag read routed through the same queue). Any answer from the main queue counts as a beat, and since that queue is
+ * first in, first out, it also proves everything of ours sent before it done (src/lane.ts's journal).
+ *
+ *   Absent ──start──▶ Starting ──/status ok + a main-queue answer──▶ Ready
+ *   Ready ──ours on the phone > BUSY_MS──▶ Busy(op, since) ──answered──▶ Ready
+ *   Busy ──main queue silent > HUNG_MS past what it owes──▶ Hung ──an answer──▶ Ready
+ *   Hung ──silent > HUNG_MAX_MS, nothing of ours in its deadline──▶ Restarting
+ *   Up ──/status unanswered `probes` times in a row──▶ Dead ──▶ Restarting(n) ──▶ Starting | NeedsReplug
+ *
+ * Automatic restarts are capped (RESTARTS_PER_HOUR per phone) and never begin while another phone's runner is starting.
+ */
+export type LinkState = 'absent' | 'starting' | 'ready' | 'busy' | 'hung' | 'dead' | 'restarting' | 'needs-replug';
+export type { PhoneState };
+/** Something of ours on the phone this long makes the link "busy" (ms). */
+export const BUSY_MS = 2000;
+/** The main queue silent this long beyond what it owes (the deadlines of what's on it) makes it "hung" (ms). */
+export const HUNG_MS = 20_000;
+/** Hung this long, with nothing of ours on the phone still in its deadline: the runner is restarted (ms). */
+export const HUNG_MAX_MS = 90_000;
+/** Automatic runner restarts per phone in any hour at most (an explicit recover starts the count afresh). */
+export const RESTARTS_PER_HOUR = 6;
+const HOUR_MS = 3_600_000;
+/** Our build's main-queue beat (wda/, fork v7), and what stands in for it on a stock or older build. */
+export const BEAT_ROUTE = '/lotus/beat';
+export const STAND_IN_BEAT_ROUTE = '/wda/locked';
+/** A still the Mac stopped waiting for counts as over on the phone after this long (XCTest's own still timeout is 20 s). */
+export const SIDE_CAP_MS = 30_000;
+/** With nothing else to learn from, the main queue is beaten this often while the phone is up (ms; its latency for the stats). */
+export const BEAT_IDLE_MS = 30_000;
+/** How long our build's beat waits on the phone for its no-op to run before it answers "still waiting" (ms). */
+export const BEAT_WAIT_MS = 5000;
+/** A request of ours held on the main queue, and nothing answered there for this long: nothing more is sent to it (ms). */
+export const HELD_STUCK_MS = 10_000;
+
+export interface LinkConfig {
+  busyMs: number;
+  hungMs: number;
+  hungMaxMs: number;
+  /** /status unanswered this many times in a row: dead. */
+  deadProbes: number;
+  restartCap: number;
+  capWindowMs: number;
+}
+
+export interface LinkSnapshot {
+  state: LinkState;
+  /** When it entered this state (ms since the epoch), and why (restarting, dead, needs replug, hung). */
+  since: number;
+  why: string | null;
+  /** What of ours holds the phone now (the oldest on it), and since when it was sent. */
+  op: string | null;
+  opSince: number | null;
+  /** How long the main queue has been silent beyond what it owes (ms; null when nothing is owed). */
+  quietMs: number | null;
+  beat: { route: string | null; outstandingSince: number | null; lastAt: number | null; lastMs: number | null; p95Ms: number | null };
+  status: { lastOkAt: number | null; fails: number };
+  restarts: { lastHour: number; cap: number; nextAllowedAt: number | null };
+  attempt: number;
+}
+
+type LinkBase = 'absent' | 'starting' | 'up' | 'dead' | 'restarting' | 'needs-replug';
+
+/**
+ * One phone's control link as a state machine (pure: its clock is given, it sets no timers). The WdaManager tells it
+ * what it observes (/status answers, beats, the lifecycle) and asks it what follows (dead? hung long enough to restart?
+ * is a restart allowed?). The journal (src/lane.ts) tells it what of ours is on the phone and every answer.
+ */
+export class ControlLink {
+  private base: LinkBase = 'absent';
+  private why: string | null = null;
+  private shown: LinkState = 'absent';
+  private shownSince: number;
+  private attempt = 0;
+  private statusOkAt: number | null = null;
+  private fails: { at: number; end: number; why: string; conn: boolean }[] = [];
+  private beatOut: number | null = null;
+  private beatRoute: string | null = null;
+  private beatLastAt: number | null = null;
+  private beatLastMs: number | null = null;
+  private beatMs: number[] = [];
+  private restartsAt: number[] = [];
+
+  constructor(
+    private journal: RequestJournal,
+    private cfg: LinkConfig,
+    private now: () => number = Date.now,
+    private onChange?: (to: LinkState, from: LinkState, s: LinkSnapshot) => void,
+  ) {
+    this.shownSince = now();
+    journal.on({
+      answer: (queue, sentAt, at) => (queue === 'main' ? this.mainAnswered(sentAt, at) : this.alive()),
+      change: () => this.update(),
+    });
+  }
+
+  get state(): LinkState {
+    return this.update();
+  }
+
+  // -- the lifecycle (the manager) --
+
+  /** A runner is being started (or adopted): up once /status and the main queue both answered. */
+  setStarting(): void {
+    this.base = 'starting';
+    this.why = null;
+    this.fails = [];
+    this.beatOut = null;
+    this.beatRoute = null;
+    this.update();
+  }
+  /** Up: /status and the main queue answered (a runner start or a restart that worked). */
+  setUp(): void {
+    this.base = 'up';
+    this.why = null;
+    this.attempt = 0;
+    this.update();
+  }
+  setRestarting(attempt: number, why: string): void {
+    this.base = 'restarting';
+    this.attempt = attempt;
+    this.why = why;
+    this.update();
+  }
+  setDead(why: string): void {
+    this.base = 'dead';
+    this.why = why;
+    this.update();
+  }
+  setNeedsReplug(why: string): void {
+    this.base = 'needs-replug';
+    this.why = why;
+    this.update();
+  }
+  setAbsent(why: string | null = null): void {
+    this.base = 'absent';
+    this.why = why;
+    this.beatOut = null;
+    this.update();
+  }
+
+  // -- what's observed --
+
+  /** A /status ask, from `at` to now: answered (`ok`), or how it failed (`conn`: refused or reset). */
+  status(ok: boolean, conn: boolean, why: string | null, at: number): void {
+    if (ok) {
+      this.statusOkAt = this.now();
+      this.fails = [];
+    } else {
+      this.fails.push({ at, end: this.now(), why: why ?? 'no answer', conn });
+      if (this.fails.length > 20) this.fails.shift();
+    }
+    this.update();
+  }
+
+  /** WDA answered something (its process is there): /status failures in a row so far don't count any more. */
+  alive(): void {
+    if (this.fails.length) this.fails = [];
+  }
+
+  /** A beat was sent on `route` at `at` (the main queue owes it an answer from then, unless it already owed one). */
+  beatSent(route: string, at: number): void {
+    if (this.beatOut === null) this.beatOut = at;
+    this.beatRoute = route;
+    this.update();
+  }
+  /** Our build says its no-op has been waiting on the main queue since `since` (it hasn't run yet). */
+  beatWaiting(since: number): void {
+    this.beatOut = this.beatOut === null ? since : Math.min(this.beatOut, since);
+    this.update();
+  }
+  /** The beat ran on the main queue after waiting `ms` there: the queue moves. */
+  beatRan(ms: number): void {
+    this.beatOut = null;
+    this.beatLastAt = this.now();
+    this.beatLastMs = Math.max(0, Math.round(ms));
+    this.beatMs.push(this.beatLastMs);
+    if (this.beatMs.length > 50) this.beatMs.shift();
+    this.alive();
+    if (this.base === 'starting') this.base = 'up';
+    this.update();
+  }
+  /** The beat's request ended without telling (its connection ended, or it timed out): nothing learned. */
+  beatLost(): void {
+    this.beatOut = null;
+    this.update();
+  }
+  /** The beat's route as found (our build without /lotus/beat: the stand-in). */
+  useBeatRoute(route: string): void {
+    this.beatRoute = route;
+  }
+  beatRouteNow(): string | null {
+    return this.beatRoute;
+  }
+  /** A beat is on its way now (sent at). */
+  beatPending(): number | null {
+    return this.beatOut;
+  }
+
+  private mainAnswered(sentAt: number, at: number): void {
+    void sentAt;
+    void at;
+    this.alive();
+    if (this.base === 'starting') this.base = 'up';
+  }
+
+  // -- what follows --
+
+  /** How long the main queue has been silent beyond what it owes (ms), or null when nothing is waiting on it. */
+  quiet(now = this.now()): number | null {
+    const main = this.journal.entries().filter((e) => e.queue === 'main');
+    const sent = main.map((e) => e.sentAt);
+    if (this.beatOut !== null) sent.push(this.beatOut);
+    if (!sent.length) return null;
+    // it owes an answer since the oldest thing still on it, which may take until its own deadline (first in, first out:
+    // the oldest is what holds the queue; a later request's deadline never pushes that out, or taps sent one after
+    // another would keep a queue that never moves from ever counting as hung)
+    // (2026-11-27: one the wire gave up on is owed since then, never past it: a main queue that never answers is said
+    // hung HUNG_MS after the wire timed out, not after a longer deadline its caller had)
+    const first = main[0];
+    const due = first ? (Number.isFinite(first.deadlineAt) ? first.deadlineAt : first.sentAt) : -Infinity;
+    const owed = Math.max(Math.min(...sent), first?.abandonedAt != null ? Math.min(due, first.abandonedAt) : due);
+    return now - owed;
+  }
+
+  /** /status went unanswered `deadProbes` times in a row: how (said in the restart's reason), else null. */
+  deadWhy(): string | null {
+    const n = Math.max(1, this.cfg.deadProbes);
+    if (this.fails.length < n) return null;
+    const last = this.fails.slice(-n);
+    const counts = new Map<string, number>();
+    for (const f of last) counts.set(f.why, (counts.get(f.why) ?? 0) + 1);
+    const how = [...counts].map(([f, c]) => (c > 1 ? `${f} x${c}` : f)).join(', ');
+    return `/status asked ${n} times over ${((last[n - 1]!.end - last[0]!.at) / 1000).toFixed(1)} s, never answered (${how})`;
+  }
+
+  /** /status asks that failed in a row (the last few). */
+  statusFails(): number {
+    return this.fails.length;
+  }
+
+  /** The restarts in the last hour against the cap, and when the next is allowed (null: now). */
+  cap(now = this.now()): { ok: boolean; lastHour: number; nextAllowedAt: number | null } {
+    this.restartsAt = this.restartsAt.filter((t) => now - t < this.cfg.capWindowMs);
+    const ok = this.restartsAt.length < this.cfg.restartCap;
+    return { ok, lastHour: this.restartsAt.length, nextAllowedAt: ok ? null : this.restartsAt[0]! + this.cfg.capWindowMs };
+  }
+  /** An automatic restart attempt was made now (counted against the cap). */
+  noteRestart(at = this.now()): void {
+    this.restartsAt.push(at);
+  }
+  /** Someone asked for a recover: the cap's count starts afresh. */
+  clearRestarts(): void {
+    this.restartsAt = [];
+  }
+
+  /**
+   * Hung past HUNG_MAX_MS, with nothing of ours on the phone still within its deadline (only what we stopped waiting
+   * for), and a restart allowed by the cap: why to restart it now; else null.
+   */
+  restartDue(now = this.now()): string | null {
+    if (this.update() !== 'hung') return null;
+    const quiet = this.quiet(now) ?? 0;
+    if (quiet <= this.cfg.hungMaxMs) return null;
+    if (this.journal.inDeadline(now).length) return null;
+    if (!this.cap(now).ok) return null;
+    const op = this.journal.oldest('main');
+    const on = op ? `; on it: ${op.label}, sent ${((now - op.sentAt) / 1000).toFixed(0)} s ago` : this.beatOut !== null ? '; on it: only our beat' : '';
+    return `the phone's main queue has not answered for ${(quiet / 1000).toFixed(0)} s past what it owed, while /status answers (hung${on})`;
+  }
+
+  /** The state now (time moves busy to hung); tells `onChange` when it changed. */
+  update(): LinkState {
+    const now = this.now();
+    let s: LinkState;
+    switch (this.base) {
+      case 'up': {
+        const quiet = this.quiet(now);
+        const oldest = this.journal.oldest();
+        if (quiet !== null && quiet > this.cfg.hungMs) s = 'hung';
+        else if (oldest && now - oldest.sentAt > this.cfg.busyMs) s = 'busy';
+        else s = 'ready';
+        break;
+      }
+      default:
+        s = this.base;
+    }
+    if (s !== this.shown) {
+      const from = this.shown;
+      this.shown = s;
+      this.shownSince = now;
+      try {
+        this.onChange?.(s, from, this.snapshot());
+      } catch {
+        /* a listener never breaks the link */
+      }
+    }
+    return s;
+  }
+
+  snapshot(): LinkSnapshot {
+    const now = this.now();
+    const oldest = this.journal.oldest();
+    const sorted = [...this.beatMs].sort((a, b) => a - b);
+    const cap = this.cap(now);
+    const why =
+      this.shown === 'hung'
+        ? `its main queue has not answered for ${((this.quiet(now) ?? 0) / 1000).toFixed(0)} s past what it owed${oldest ? ` (on it: ${oldest.label})` : ''}`
+        : this.why;
+    return {
+      state: this.shown, since: this.shownSince, why,
+      op: oldest?.label ?? null, opSince: oldest?.sentAt ?? null, quietMs: this.quiet(now),
+      beat: {
+        route: this.beatRoute, outstandingSince: this.beatOut, lastAt: this.beatLastAt, lastMs: this.beatLastMs,
+        p95Ms: sorted.length ? sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * 0.95))]! : null,
+      },
+      status: { lastOkAt: this.statusOkAt, fails: this.fails.length },
+      restarts: { lastHour: cap.lastHour, cap: this.cfg.restartCap, nextAllowedAt: cap.nextAllowedAt },
+      attempt: this.attempt,
+    };
+  }
+}
+
 /**
  * What the server does to the Mac's processes and the phone's device link around a runner (real mode only; tests
  * that give their own spawn get none of it unless they hand in their own).
@@ -438,6 +807,8 @@ export interface WdaSys {
   alive(pid: number): boolean;
   /** The pids listening on a local TCP port, with their command lines. */
   listeners(port: number): Promise<{ pid: number; command: string }[]>;
+  /** 2026-11-27: a pid's command line ('' when it's gone or can't be read); used to check a runner before adopting it. */
+  command?(pid: number): Promise<string>;
 }
 
 const runCmd = (cmd: string, args: string[], timeoutMs: number): Promise<{ ok: boolean; out: string }> =>
@@ -486,6 +857,9 @@ export const REAL_SYS: WdaSys = {
     const pids = [...new Set(r.out.split(/\s+/).map(Number).filter((n) => Number.isInteger(n) && n > 1))];
     return Promise.all(pids.map(async (pid) => ({ pid, command: (await runCmd('ps', ['-o', 'command=', '-p', String(pid)], 3000)).out.trim() })));
   },
+  async command(pid) {
+    return (await runCmd('ps', ['-o', 'command=', '-p', String(pid)], 3000)).out.trim();
+  },
 };
 
 /** Tests with their own spawn: no real processes, nothing run, nothing killed but the fakes themselves. */
@@ -497,6 +871,112 @@ export const NO_SYS: WdaSys = {
   alive: () => false,
   listeners: async () => [],
 };
+
+// ---- 2026-11-27: detached runners, adopted by the next server process (docs/root-cause.md §11, P6) ----
+
+/**
+ * Before: every pushed commit restarted the server within ~10 s, and its shutdown killed every phone's WDA runner and
+ * forwards (restarting runners is the very thing that jams XCTest), whatever was running. Now (real mode) xcodebuild
+ * and iproxy are spawned detached, their output going to data/runner-logs/ instead of a pipe (a pipe to a server that
+ * exited would end them), and each phone's runner is written to RUNNERS_FILE: its pids, ports, flavor and our build's
+ * token (the file is the server's own, mode 0600, never logged). A server that starts adopts a runner whose processes
+ * are still there and whose WDA answers, instead of killing it and starting another; shutdown() leaves them running.
+ * WDA_DETACHED=0 turns all of it off (the runners are the server's children again, ended with it).
+ */
+export const RUNNERS_FILE = path.join('data', 'runners.json');
+const RUNNER_LOGS = path.join('data', 'runner-logs');
+/** An adopted runner's WDA gets this long to answer /status before it's ended and a new one started (ms). */
+export const ADOPT_WAIT_MS = 10_000;
+/** How often an adopted process (not our child: no exit event) is checked for being gone (ms). */
+const ADOPT_POLL_MS = 1000;
+
+/** One phone's runner as written to RUNNERS_FILE. */
+export interface RunnerRecord {
+  udid: string;
+  flavor: WdaFlavor;
+  /** The Mac port of WDA's forward (and of MJPEG's, stock only). */
+  port: number;
+  mjpegPort: number | null;
+  /** Our build's token (undefined on a stock WDA). */
+  token?: string;
+  /** xcodebuild's pid, and each forward's pid with its ports (slot 0: WDA, 1: MJPEG). */
+  xcode: number;
+  fwd: { slot: 0 | 1; pid: number; local: number; remote: number }[];
+  startedAt: number;
+  /** When its WDA first answered (absent: it was still starting when this was written). */
+  upAt?: number;
+}
+
+/** The runners written by this or an earlier server process ({} when none or unreadable). */
+export function readRunners(file = RUNNERS_FILE): Record<string, RunnerRecord> {
+  try {
+    const j = JSON.parse(fs.readFileSync(file, 'utf8'));
+    return j && typeof j === 'object' && j.runners && typeof j.runners === 'object' ? (j.runners as Record<string, RunnerRecord>) : {};
+  } catch {
+    return {};
+  }
+}
+
+function writeRunners(all: Record<string, RunnerRecord>, file = RUNNERS_FILE): void {
+  try {
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    const tmp = `${file}.${process.pid}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify({ version: 1, runners: all }, null, 2), { mode: 0o600 });
+    fs.renameSync(tmp, file);
+  } catch (err) {
+    console.log(`[wda] could not write ${file}: ${(err as Error).message}`);
+  }
+}
+
+/**
+ * A process this server didn't start (adopted): a ChildProcess as far as the manager uses one (pid, kill, exit), its
+ * end found by polling (no exit event comes for a process that isn't our child).
+ */
+function adoptedProc(sys: WdaSys, pid: number): ChildProcess & { unwatch(): void } {
+  const p = new EventEmitter() as ChildProcess & EventEmitter & { unwatch(): void };
+  const t = setInterval(() => {
+    if (sys.alive(pid)) return;
+    clearInterval(t);
+    p.emit('exit', null, null);
+  }, ADOPT_POLL_MS);
+  t.unref?.();
+  Object.assign(p, {
+    pid, exitCode: null, signalCode: null, stdout: null, stderr: null,
+    kill: (sig: NodeJS.Signals = 'SIGTERM') => sys.signal(pid, sig),
+    unwatch: () => clearInterval(t),
+  });
+  return p;
+}
+
+/** Reads the lines added to `file` (from `fromEnd` bytes before its end), every `everyMs`; returns the stop. */
+function tailFile(file: string, onLines: (lines: string[]) => void, fromEnd = 0, everyMs = 500): () => void {
+  let pos = -1;
+  let rest = '';
+  const read = () => {
+    try {
+      const size = fs.statSync(file).size;
+      if (pos < 0) pos = Math.max(0, size - fromEnd);
+      if (size < pos) pos = 0; // started afresh
+      if (size === pos) return;
+      const fd = fs.openSync(file, 'r');
+      try {
+        const buf = Buffer.alloc(Math.min(size - pos, 1 << 20));
+        fs.readSync(fd, buf, 0, buf.length, pos);
+        pos += buf.length;
+        const lines = (rest + buf.toString('utf8')).split(/\r?\n/);
+        rest = lines.pop() ?? '';
+        if (lines.length) onLines(lines);
+      } finally {
+        fs.closeSync(fd);
+      }
+    } catch {
+      /* not there yet */
+    }
+  };
+  const t = setInterval(read, everyMs);
+  t.unref?.();
+  return () => clearInterval(t);
+}
 
 /** `p`, or `onTimeout()`'s error after `ms` (`p` still runs; its end is ignored). */
 function within<T>(p: Promise<T>, ms: number, onTimeout: () => Error): Promise<T> {
@@ -534,22 +1014,39 @@ interface Via {
    * app in front (appBound) without it is never sent, by anyone: the server never reads that app on its own.
    */
   explicit?: boolean;
+  /** 2026-11-27: when the caller stops waiting (ms since the epoch): the lane refuses what can't start in time. */
+  deadlineAt?: number;
+  /** The least time on the phone that's of use (ms; default src/lane.ts MIN_SEND_MS with a deadline). */
+  minMs?: number;
 }
 
-/** What a caller outside may say of a call: Lotus asked for it (a read of the app in front may then go). */
-export type CallVia = { explicit?: boolean };
+/**
+ * What a caller outside may say of a call: Lotus asked for it (a read of the app in front may then go), and
+ * (2026-11-27) when its caller stops waiting (`deadlineAt`, ms since the epoch: refused at once when it can't be done
+ * in time, never sent late, never on the wire past it).
+ */
+export type CallVia = { explicit?: boolean; deadlineAt?: number };
+
+/** What a caller outside says, as the request carries it. */
+const viaOf = (via: CallVia): Via => ({ ...(via.explicit ? { explicit: true } : {}), ...(via.deadlineAt !== undefined ? { deadlineAt: via.deadlineAt } : {}) });
 
 /**
  * One HTTP exchange with WDA. `result`: the answer, or a TIMEOUT error after `timeout` (or the error it failed with);
- * `ended`: once the exchange is really over. After a timeout the request is kept open `holdMs` more for the phone's
- * late answer (it still runs there; `onAnswer` is told when it comes, as for any answer); with none by then it's
- * destroyed and `onStuck` is told. A request that failed on a reused keep-alive connection the other side had already closed is sent once
- * more on a fresh one (unless `resend` is false: typing), so a stale socket never looks like WDA being down.
+ * `ended`: once the exchange is really over on the Mac. `outcome` (2026-11-27): `answered` (the phone is done with it),
+ * `failed` (the connection failed: it never ran there), `timeout` or `cancelled` (the Mac stopped waiting; the phone may
+ * still be working on it: the lane's journal keeps it). `cancel(err)` stops it now (`result` rejects with `err`).
+ * `holdMs` (before 2026-11-27, the server kept a timed-out request open that long for the phone's late answer; the
+ * server passes 0 now, the journal says what's still on the phone): after a timeout the request is kept open `holdMs`
+ * more (`onAnswer` is told if the answer comes); with none by then it's destroyed and `onStuck` is told. A request that
+ * failed on a reused keep-alive connection the other side had already closed is sent once more on a fresh one (unless
+ * `resend` is false: typing), so a stale socket never looks like WDA being down. `lateMs` (2026-11-27): after a
+ * timeout or a cancel the exchange still ends at once (the lane is free), but its socket stays open that long more to hear a late
+ * answer: `late` resolves true when one came (the phone is done with it: the journal clears it), false when not.
  */
 export function exchange(o: {
   port: number; method: string; path: string; body?: string; headers: Record<string, string | number>; agent: http.Agent;
-  timeout: number; holdMs: number; resend: boolean; onAnswer: () => void; onStuck?: (ms: number) => void;
-}): { result: Promise<Resp>; ended: Promise<void> } {
+  timeout: number; holdMs: number; resend: boolean; onAnswer: () => void; onStuck?: (ms: number) => void; lateMs?: number;
+}): { result: Promise<Resp>; ended: Promise<void>; outcome: Promise<LaneOutcome>; cancel: (err: Error) => void; late: Promise<boolean> } {
   let tellOk!: (r: Resp) => void;
   let tellErr!: (e: Error) => void;
   const result = new Promise<Resp>((a, b) => {
@@ -558,6 +1055,19 @@ export function exchange(o: {
   });
   let endNow!: () => void;
   const ended = new Promise<void>((a) => (endNow = a));
+  let setOutcome!: (o: LaneOutcome) => void;
+  const outcome = new Promise<LaneOutcome>((a) => (setOutcome = a));
+  let setLate!: (v: boolean) => void;
+  const late = new Promise<boolean>((a) => (setLate = a));
+  /** Listening for a late answer after the timeout (the exchange itself is over). */
+  let lateTimer: NodeJS.Timeout | undefined;
+  const lateEnd = (v: boolean) => {
+    if (lateTimer) clearTimeout(lateTimer);
+    lateTimer = undefined;
+    setLate(v);
+  };
+  /** How it ended, as soon as that's known (the first word wins: a timeout stays a timeout when its socket then breaks). */
+  let how: LaneOutcome | null = null;
   const t0 = Date.now();
   let told = false;
   let over = false;
@@ -575,11 +1085,36 @@ export function exchange(o: {
     over = true;
     clearTimeout(timer);
     if (hold) clearTimeout(hold);
+    setOutcome(how ?? 'failed');
     endNow();
+    if (!lateTimer) setLate(how === 'answered');
+  };
+  /** Over for the caller and the lane; its socket stays open `lateMs` more for the late answer (false: none). */
+  const listenLate = (): boolean => {
+    if ((o.lateMs ?? 0) <= 0 || !live) return false;
+    const req = live;
+    lateTimer = setTimeout(() => {
+      lateTimer = undefined;
+      setLate(false);
+      if (live === req) req.destroy(Object.assign(new Error('given up'), { code: 'ABANDONED' }));
+    }, o.lateMs);
+    lateTimer.unref?.();
+    end();
+    return true;
+  };
+  const cancel = (err: Error) => {
+    if (over) return;
+    how ??= 'cancelled';
+    tell(err);
+    if (listenLate()) return;
+    if (live) live.destroy(Object.assign(new Error('cancelled'), { code: 'CANCELLED' }));
+    end();
   };
   const timer = setTimeout(() => {
     const err = Object.assign(new Error('timeout'), { code: 'TIMEOUT' });
+    how ??= 'timeout';
     tell(err);
+    if (o.holdMs <= 0 && listenLate()) return;
     if (o.holdMs <= 0 || !live) return void live?.destroy(err);
     // the phone still works on it: the lane stays taken until it answers (or this cap)
     hold = setTimeout(() => {
@@ -593,8 +1128,13 @@ export function exchange(o: {
       const chunks: Buffer[] = [];
       res.on('data', (c: Buffer) => chunks.push(c));
       res.on('end', () => {
-        if (live !== req) return;
+        if (live === req && over && lateTimer) {
+          o.onAnswer(); // the late answer: WDA is there, and the phone is done with it
+          return lateEnd(true);
+        }
+        if (live !== req || over) return;
         o.onAnswer(); // any answer at all, whatever it says and however late: WDA is there
+        how = 'answered'; // (a late answer within the hold too: the phone is done with it)
         tell({ status: res.statusCode ?? 0, text: Buffer.concat(chunks).toString('utf8') });
         end();
       });
@@ -602,6 +1142,7 @@ export function exchange(o: {
     });
     live = req;
     const fail = (err: HttpErr) => {
+      if (live === req && over && lateTimer) return lateEnd(false);
       if (live !== req || over) return;
       const stale = !told && !retried && o.resend && req.reusedSocket && (err.code === 'ECONNRESET' || err.code === 'EPIPE' || /socket hang up/i.test(err.message));
       if (stale) return send(true);
@@ -617,7 +1158,7 @@ export function exchange(o: {
     req.end(o.body);
   };
   send(false);
-  return { result, ended };
+  return { result, ended, outcome, cancel, late };
 }
 
 const PORTS_FILE = path.join('data', 'ports.json');
@@ -696,6 +1237,8 @@ export class WdaManager {
   private ports: Record<string, number> = {};
   private health: NodeJS.Timeout;
   private sys: WdaSys;
+  /** 2026-11-27: runners are spawned detached and kept in RUNNERS_FILE (adopted by the next server process). */
+  private detach: boolean;
   /** 2026-11-18: restarts go one phone at a time (never both phones' runners at once): the queue, and the phones in it. */
   private restartLock: Promise<void> = Promise.resolve();
   private lockQueue: string[] = [];
@@ -726,6 +1269,8 @@ export class WdaManager {
     sys?: WdaSys,
   ) {
     this.sys = sys ?? (spawnFn === spawn ? REAL_SYS : NO_SYS);
+    // 2026-11-27: runners outlive the server process (real mode; WDA_DETACHED=0 turns it off)
+    this.detach = this.sys.real && process.env.WDA_DETACHED !== '0';
     try {
       this.ports = JSON.parse(fs.readFileSync(PORTS_FILE, 'utf8'));
     } catch {
@@ -857,6 +1402,8 @@ export class WdaManager {
     state: ControlState; raw: ControlState; misses: number; recoveries: number; runnerRestarts: number; answeredMsAgo: number | null; busy: number; lane: LaneState;
     restarting: { attempt: number; of: number; since: number } | null; controlDown: string | null; needsReplug: boolean; appStall: { since: number; until: number; why: string | null } | null;
     appReads: { sent: number; refused: number; stuck: number }; reconnecting: { since: number; why: string } | null; orientationFrom: 'read' | 'picture' | null; lastRunnerEnd: RunnerEnd | null;
+    link: LinkSnapshot; journal: JournalEntry[]; adopted: boolean;
+    onPhone: { op: string; since: number; held: boolean }[]; phoneState: PhoneState;
   } | null {
     const e = this.entries.get(udid);
     if (!e) return null;
@@ -871,7 +1418,31 @@ export class WdaManager {
       // refused connection, where the orientation came from, and how the last runner ended
       appReads: { ...e.appReads }, reconnecting: e.linkDown ? { ...e.linkDown } : null, orientationFrom: e.orientFrom,
       lastRunnerEnd: e.lastRunnerEnd,
+      // 2026-11-27: the link as observed, what of ours is on the phone, and whether this runner was adopted
+      link: (e.link.update(), e.link.snapshot()), journal: e.lane.journal.entries(), adopted: e.adopted,
+      // what of ours is on the phone now (oldest first), and the state as the clients name it
+      onPhone: e.lane.journal.entries().map((j) => ({ op: j.label, since: j.sentAt, held: j.state === 'abandoned' })),
+      phoneState: this.phoneState(udid),
     };
+  }
+
+  /**
+   * 2026-11-27: the phone's state as the clients name it (GET /phones `state`, the control link's messages): ready,
+   * busy (something of ours on the phone a while: `op`, since), hung, restarting, needs-replug or down.
+   */
+  phoneState(udid: string): PhoneState {
+    const e = this.entries.get(udid);
+    if (!e || !e.wanted) return 'down';
+    if (e.downWhy) return e.needsReplug ? 'needs-replug' : 'down';
+    if (e.restartP || e.status === 'starting') return 'restarting';
+    if (e.status !== 'ready') return 'down';
+    const l = e.link.state;
+    if (l === 'hung') return 'hung';
+    if (l === 'busy') return 'busy';
+    if (l === 'restarting') return 'restarting';
+    if (l === 'needs-replug') return 'needs-replug';
+    if (l === 'dead') return 'down';
+    return 'ready';
   }
 
   /** The restart under way now: which attempt of how many, and since when; null when none is. */
@@ -905,6 +1476,8 @@ export class WdaManager {
     if (e.restartP) throw this.restartingError(e);
     if (e.downWhy) throw this.controlDownError(e);
     if (e.linkDown) throw this.reconnectingError(e);
+    // 2026-11-27: its main queue is hung (its process answers): nothing could be done in time, said at once
+    if (e.status === 'ready' && e.link.state === 'hung') throw this.hungError(e);
   }
 
   private restartingError(e: Entry): HttpError {
@@ -955,8 +1528,32 @@ export class WdaManager {
     if (!e || !e.wanted || e.downWhy) return 'down';
     if (e.restartP || e.status === 'starting') return 'recovering';
     if (e.status !== 'ready') return 'down';
+    // 2026-11-27: hung (HUNG_MS of silence already: no debounce on top) is said as recovering (control.ts's word)
+    if (e.link.state === 'hung') return 'recovering';
+    // ...and so is a main queue held by a request of ours WDA itself never answered (an unlock): an input would wait
+    // behind it. A held read of the app in front is the app's, not WDA's (it says appStall): that stays "ready".
+    // `phoneState()` names both: busy, with the request
+    const held = e.link.state === 'busy' ? e.lane.journal.held('main')[0] : undefined;
+    if (held && !held.appBound) return 'recovering';
     if (e.control !== 'ready' && Date.now() - e.unreadyAt < (this.timeouts.debounce ?? CONTROL_DEBOUNCE_MS)) return 'ready';
     return e.control;
+  }
+
+  /**
+   * 2026-11-27: the phone's control link as observed (ControlLink): absent, starting, ready, busy (something of ours
+   * on the phone a while: which, since when), hung (its main queue silent while its process answers), dead,
+   * restarting or needs-replug; with the beat's latency, /status's failures and the restart cap. Null when unknown.
+   */
+  link(udid: string): LinkSnapshot | null {
+    const e = this.entries.get(udid);
+    if (!e) return null;
+    e.link.update();
+    return e.link.snapshot();
+  }
+
+  /** 2026-11-27: what of ours is on the phone now (oldest first): on its way, or stopped waiting for but maybe still running there. */
+  journal(udid: string): JournalEntry[] {
+    return this.entries.get(udid)?.lane.journal.entries() ?? [];
   }
   /**
    * 2026-11-18 (a live view that stayed on "connecting" while a phone's screen was off): waits up to `ms` for the
@@ -1107,31 +1704,68 @@ export class WdaManager {
     let e = this.entries.get(udid);
     if (e?.wanted) return;
     const n = this.slot(udid);
-    e ??= {
-      udid, wdaPort: this.cfg.wdaBasePort + n, mjpegPort: this.cfg.mjpegBasePort + n, status: 'starting', control: 'recovering',
-      wanted: true, procs: [], restarts: 0, checking: false, lastOk: 0, orientation: null, orientAt: 0, tapRoute: 0, fast: 'unknown', fastFails: 0,
-      mjpeg: { ...DEFAULT_MJPEG }, agent: newAgent(), direct: newAgent(2), lane: new WdaLane(() => this.nameOf(udid), { explain: (label) => this.explainBusy(udid, label) }), heals: 0, lastHeal: null, inflight: 0,
-      lastAnswer: 0, laneAnswer: 0, misses: 0, missAt: 0, unreadyAt: 0, recoveries: 0, runnerRestarts: 0,
-      flavor: 'stock', forkInfo: null, switching: false, launchError: null, liveFailed: null, forkFails: 0, readyAt: 0,
-      attempt: 0, restartSince: 0, downWhy: null, epoch: 0, launchSeq: 0, fwdPorts: [], needsReplug: false,
-      stallUntil: 0, stallMs: 0, stallSince: 0, stallWhy: null, inputAt: 0, inputSeq: 0,
-      appAt: 0, appSeq: 0, appFrom: null, appReads: { sent: 0, refused: 0, stuck: 0 }, appInFlight: 0, orientFrom: null, linkDown: null,
-      xcodeTail: [], lastRunnerEnd: null,
-    };
+    e ??= this.newEntry(udid, n);
     const first = !this.entries.has(udid);
     e.epoch++;
     e.attempt = 0;
     e.downWhy = null;
     e.needsReplug = false;
+    e.capped = false;
     e.restartP = undefined;
     // ours when it was installed on this phone and ran (src/fork.ts), else the stock one
     e.flavor = this.fork?.flavorAtStart(udid) ?? 'stock';
     e.wanted = true;
     this.entries.set(udid, e);
-    // the first start since the server started: a runner or forward left for this phone by the server before (an
-    // update's restart) is ended first, so the new one is the only one
-    if (first && this.sys.real) this.chainStop(e, () => this.reapStrays(e, [this.cfg.wdaBasePort + n, this.cfg.mjpegBasePort + n]));
+    if (first && this.sys.real) {
+      // 2026-11-27: the first start since the server started. A runner an earlier server process left running for
+      // this phone (detached, RUNNERS_FILE) is adopted when it's still there; anything else left for it is ended
+      // first, so the new one is the only one
+      const rec = this.detach ? readRunners()[udid] : undefined;
+      if (rec && rec.udid === udid && Number.isInteger(rec.xcode) && this.sys.alive(rec.xcode)) return this.adopt(e, rec, n);
+      if (rec) this.forgetRunner(udid);
+      this.chainStop(e, () => this.reapStrays(e, [this.cfg.wdaBasePort + n, this.cfg.mjpegBasePort + n]));
+    }
     this.launch(e);
+  }
+
+  private newEntry(udid: string, n: number): Entry {
+    const lane = new WdaLane(() => this.nameOf(udid), {
+      explain: (label) => this.explainBusy(udid, label),
+      // 2026-11-27: nothing is queued for a link that can't do it in time (hung): said at once, with why
+      refuse: () => this.linkRefusal(udid),
+      lookGuardMs: this.timeouts.lookGuard,
+      id: udid,
+    });
+    const link = new ControlLink(
+      lane.journal,
+      {
+        busyMs: this.timeouts.busy ?? BUSY_MS, hungMs: this.timeouts.hung ?? HUNG_MS, hungMaxMs: this.timeouts.hungMax ?? HUNG_MAX_MS,
+        deadProbes: Math.max(1, this.timeouts.probes ?? DEAD_PROBES), restartCap: this.timeouts.restartCap ?? RESTARTS_PER_HOUR, capWindowMs: HOUR_MS,
+      },
+      Date.now,
+      (to, from, s) => this.linkChanged(udid, to, from, s),
+    );
+    const e: Entry = {
+      udid, wdaPort: this.cfg.wdaBasePort + n, mjpegPort: this.cfg.mjpegBasePort + n, status: 'starting', control: 'recovering',
+      wanted: true, procs: [], restarts: 0, checking: false, lastOk: 0, orientation: null, orientAt: 0, tapRoute: 0, fast: 'unknown', fastFails: 0,
+      mjpeg: { ...DEFAULT_MJPEG }, agent: newAgent(), direct: newAgent(3), lane, heals: 0, lastHeal: null, inflight: 0,
+      lastAnswer: 0, laneAnswer: 0, misses: 0, missAt: 0, unreadyAt: 0, recoveries: 0, runnerRestarts: 0,
+      flavor: 'stock', forkInfo: null, switching: false, launchError: null, liveFailed: null, forkFails: 0, readyAt: 0,
+      attempt: 0, restartSince: 0, downWhy: null, epoch: 0, launchSeq: 0, fwdPorts: [], needsReplug: false,
+      stallUntil: 0, stallMs: 0, stallSince: 0, stallWhy: null, inputAt: 0, inputSeq: 0,
+      appAt: 0, appSeq: 0, appFrom: null, appReads: { sent: 0, refused: 0, stuck: 0 }, appInFlight: 0, orientFrom: null, linkDown: null,
+      xcodeTail: [], lastRunnerEnd: null, link, capped: false, adopted: false, lateOpen: 0, mainMovedAt: Date.now(),
+    };
+    lane.journal.on({
+      change: () => void (e.appInFlight = lane.journal.entries().filter((x) => x.appBound).length),
+      abandoned: (x) => this.onAbandoned(e, x),
+      answer: (queue, _sentAt, at) => {
+        if (queue === 'main') e.mainMovedAt = at;
+        // the phone answered something of ours: a cap-refused "down" is over (WDA came back by itself)
+        if (e.capped && e.downWhy) this.uncap(e, 'the phone answers again');
+      },
+    });
+    return e;
   }
 
   stop(udid: string): void {
@@ -1145,7 +1779,11 @@ export class WdaManager {
     e.attempt = 0;
     e.downWhy = null;
     e.needsReplug = false;
+    e.capped = false;
+    if (e.capTimer) clearTimeout(e.capTimer);
+    e.capTimer = undefined;
     this.killProcs(e);
+    e.link.setAbsent('the phone was stopped (unplugged)');
   }
 
   /**
@@ -1166,10 +1804,17 @@ export class WdaManager {
     e.mjpegApplied = undefined;
     e.agent = newAgent();
     e.direct.destroy();
-    e.direct = newAgent(2);
+    e.direct = newAgent(3);
+    e.untail?.();
+    e.untail = undefined;
+    e.adopted = false;
+    // 2026-11-27: the runner is being ended: it's no longer one to adopt
+    if (this.detach) this.forgetRunner(e.udid);
     // 2026-11-21: nothing that waited its turn for the old runner goes to the new one (each hears why at once); the
     // request on its way ends with the old runner's connections (its agent is destroyed below)
     e.lane.flush(e.wanted ? new HttpError(503, `The phone's control link is restarting`, { state: 'restarting' }) : new HttpError(503, `The phone's control link is not running`, { state: 'down' }));
+    // 2026-11-27: and nothing of ours is on the phone any more (its runner goes): the journal starts empty
+    e.lane.journal.flush();
     if (!this.sys.real && !old.procs.some((p) => p.pid)) {
       // no real processes (tests): nothing to wait for
       for (const p of old.procs) p.kill('SIGTERM');
@@ -1349,6 +1994,7 @@ export class WdaManager {
     e.restarts++;
     why = this.clean(e, why);
     e.launchError = why.slice(0, 300);
+    e.link.setDead(why);
     // a switch of flavor is watching (switchFlavor): it decides what's launched next
     if (e.switching) return void this.log(e, why);
     // Our build's runner ended by itself. One that had stayed up a while starts the count afresh (a phone unplugged
@@ -1393,6 +2039,7 @@ export class WdaManager {
     e.sessionId = undefined;
     e.sessionP = undefined;
     e.mjpegApplied = undefined;
+    e.link.setStarting();
     const seq = ++e.launchSeq;
     // one xcodebuild start at a time across the farm (SPAWN_HOLD_MS): at once when nothing else is starting
     if (!e.stopping && (this.spawnHeld === null || this.spawnHeld === e) && !this.spawnQueue.length) {
@@ -1419,21 +2066,6 @@ export class WdaManager {
       this.killProcs(e);
       return this.launch(e);
     }
-    const spawnLogged = (cmd: string, args: string[], env: NodeJS.ProcessEnv = {}) => {
-      const p = this.spawnFn(cmd, args, { env: { ...process.env, ...env }, stdio: ['ignore', 'pipe', 'pipe'] });
-      const errTail: string[] = [];
-      p.stderr?.on('data', (d: Buffer) => {
-        errTail.push(...d.toString().split(/\r?\n/).filter(Boolean));
-        if (errTail.length > 5) errTail.splice(0, errTail.length - 5);
-      });
-      p.on('exit', (code) => {
-        if (code && errTail.length) this.log(e, `${cmd} exited with ${code}; last stderr: ${errTail.join(' | ')}`);
-      });
-      p.stdout?.on('data', () => {});
-      p.on('error', (err) => this.log(e, `${cmd} failed to start: ${err.message}`));
-      return p;
-    };
-
     // Stock: WDA's default ports on the phone (8100, and 9100 for MJPEG), forwarded to this phone's Mac ports. Ours:
     // its own high port and its token, no MJPEG at all (src/fork.ts launchPlan). A forward that dies (a usbmuxd
     // hiccup, the phone re-enumerating after a long sleep) is started again by itself: WDA is still fine, and without
@@ -1445,28 +2077,12 @@ export class WdaManager {
     e.forkInfo = null;
     e.liveFailed = null;
     e.seg = undefined;
-    const forward = (slot: 0 | 1, local: number, remote: number): ChildProcess => {
-      const p = spawnLogged('iproxy', ['-u', e.udid, `${local}:${remote}`]);
-      p.on('exit', (code) => {
-        if (!e.wanted || e.procs[slot] !== p) return; // killed on purpose, or superseded
-        this.healed(e, `the ${slot === 0 ? 'WDA' : 'MJPEG'} port forward (iproxy :${local}) exited (${code}); starting it again`);
-        setTimeout(() => {
-          if (!e.wanted || e.procs[slot] !== p) return;
-          if (slot === 0) {
-            e.agent.destroy(); // its connections went with it
-            e.agent = newAgent();
-            e.direct.destroy();
-            e.direct = newAgent(2);
-          }
-          e.procs[slot] = forward(slot, local, remote);
-        }, 500).unref?.();
-      });
-      return p;
-    };
-    const fwdWda = forward(0, plan.wda.local, plan.wda.device);
-    const fwdMjpeg = plan.mjpeg ? forward(1, plan.mjpeg.local, plan.mjpeg.device) : null;
+    e.adopted = false;
+    e.fwdPlan = [{ slot: 0, local: plan.wda.local, remote: plan.wda.device }, ...(plan.mjpeg ? [{ slot: 1 as const, local: plan.mjpeg.local, remote: plan.mjpeg.device }] : [])];
+    const fwdWda = this.spawnForward(e, 0, plan.wda.local, plan.wda.device);
+    const fwdMjpeg = plan.mjpeg ? this.spawnForward(e, 1, plan.mjpeg.local, plan.mjpeg.device) : null;
     // the environment holds our build's token: it's handed to xcodebuild and never logged
-    const xcode = spawnLogged('xcodebuild', plan.args, plan.env);
+    const xcode = this.spawnLogged(e, 'xcodebuild', plan.args, plan.env);
     e.runner = xcode;
     // this runner holds the farm's xcodebuild start turn until it's up, it ends, it's killed, or SPAWN_HOLD_MS
     {
@@ -1482,13 +2098,81 @@ export class WdaManager {
     e.procs = fwdMjpeg ? [fwdWda, fwdMjpeg, xcode] : [fwdWda, xcode];
     e.fwdPorts = plan.mjpeg ? [plan.wda.local, plan.mjpeg.local] : [plan.wda.local];
     this.log(e, plan.mjpeg ? `starting (wda :${plan.wda.local}, mjpeg :${plan.mjpeg.local})` : `starting our own build (wda :${plan.wda.local} on the Mac and the phone, token set, no MJPEG)`);
+    this.tr(e, 'runner.spawn', { flavor: plan.flavor, port: plan.wda.local, detached: this.detach });
+    this.recordRunner(e);
+    this.followRunner(e, xcode);
+    void this.waitUp(e, xcode, START_MS, false);
+  }
 
+  /**
+   * One of the runner's processes. 2026-11-27: detached (it outlives this server process) with its output in a file
+   * of its own under RUNNER_LOGS (a pipe to a server that exited would end it), or (WDA_DETACHED=0, tests) the
+   * server's child with its output piped.
+   */
+  private spawnLogged(e: Entry, cmd: string, args: string[], env: NodeJS.ProcessEnv = {}, logName = cmd): ChildProcess {
+    if (this.detach) {
+      fs.mkdirSync(RUNNER_LOGS, { recursive: true });
+      const file = path.join(RUNNER_LOGS, `${e.udid.slice(-8)}-${logName}.log`);
+      const fd = fs.openSync(file, 'w', 0o600);
+      let p: ChildProcess;
+      try {
+        p = this.spawnFn(cmd, args, { env: { ...process.env, ...env }, stdio: ['ignore', fd, fd], detached: true });
+      } finally {
+        fs.closeSync(fd);
+      }
+      p.unref?.();
+      p.on('exit', (code) => {
+        if (code) this.log(e, `${cmd} exited with ${code} (its output: ${file})`);
+      });
+      p.on('error', (err) => this.log(e, `${cmd} failed to start: ${err.message}`));
+      return p;
+    }
+    const p = this.spawnFn(cmd, args, { env: { ...process.env, ...env }, stdio: ['ignore', 'pipe', 'pipe'] });
+    const errTail: string[] = [];
+    p.stderr?.on('data', (d: Buffer) => {
+      errTail.push(...d.toString().split(/\r?\n/).filter(Boolean));
+      if (errTail.length > 5) errTail.splice(0, errTail.length - 5);
+    });
+    p.on('exit', (code) => {
+      if (code && errTail.length) this.log(e, `${cmd} exited with ${code}; last stderr: ${errTail.join(' | ')}`);
+    });
+    p.stdout?.on('data', () => {});
+    p.on('error', (err) => this.log(e, `${cmd} failed to start: ${err.message}`));
+    return p;
+  }
+
+  /** A port forward (iproxy), started (or `adoptPid`: adopted), and started again by itself when it exits. */
+  private spawnForward(e: Entry, slot: 0 | 1, local: number, remote: number, adoptPid?: number): ChildProcess {
+    const p = adoptPid ? adoptedProc(this.sys, adoptPid) : this.spawnLogged(e, 'iproxy', ['-u', e.udid, `${local}:${remote}`], {}, `iproxy-${local}`);
+    p.on('exit', (code) => {
+      if (!e.wanted || e.procs[slot] !== p) return; // killed on purpose, or superseded
+      this.healed(e, `the ${slot === 0 ? 'WDA' : 'MJPEG'} port forward (iproxy :${local}) exited (${code}); starting it again`);
+      setTimeout(() => {
+        if (!e.wanted || e.procs[slot] !== p) return;
+        if (slot === 0) {
+          e.agent.destroy(); // its connections went with it
+          e.agent = newAgent();
+          e.direct.destroy();
+          e.direct = newAgent(3);
+        }
+        e.procs[slot] = this.spawnForward(e, slot, local, remote);
+        this.recordRunner(e);
+      }, 500).unref?.();
+    });
+    return p;
+  }
+
+  /**
+   * What the runner's xcodebuild says (its last lines: how it ended, a refused install for a switch's "why") and its
+   * end: relaunched later. `fromEnd`: an adopted runner's log is read from this many bytes before its end.
+   */
+  private followRunner(e: Entry, xcode: ChildProcess, fromEnd = 0): void {
     // what xcodebuild said about a refused install or signing (a locked phone, an expired profile), for the switch's "why"
     const tail: string[] = [];
     // 2026-11-22: and its last lines whatever they say (how the runner ended: noteRunnerEnd)
     const lines: string[] = (e.xcodeTail = []);
-    const keep = (d: Buffer) => {
-      for (const l of d.toString().split(/\r?\n/)) {
+    const keep = (ls: string[]) => {
+      for (const l of ls) {
         const t = l.trim();
         if (!t) continue;
         if (e.runner === xcode) {
@@ -1499,60 +2183,184 @@ export class WdaManager {
       }
       if (tail.length > 4) tail.splice(0, tail.length - 4);
     };
-    xcode.stdout?.on('data', keep);
-    xcode.stderr?.on('data', keep);
+    e.untail?.();
+    if (this.detach) e.untail = tailFile(path.join(RUNNER_LOGS, `${e.udid.slice(-8)}-xcodebuild.log`), keep, fromEnd);
+    else {
+      e.untail = undefined;
+      xcode.stdout?.on('data', (d: Buffer) => keep(d.toString().split(/\r?\n/)));
+      xcode.stderr?.on('data', (d: Buffer) => keep(d.toString().split(/\r?\n/)));
+    }
     xcode.on('exit', (code) => {
       if (e.runner !== xcode) return; // superseded
       if (e.spawnTurn) this.releaseSpawn(e);
+      this.tr(e, 'runner.exit', { code, adopted: e.adopted });
       this.relaunchLater(e, `xcodebuild exited (${code})${tail.length ? `: ${tail.join(' | ')}` : ''}`);
     });
+  }
 
-    // poll WDA /status until it answers, then warm a session
-    const waitReady = async () => {
-      // by the clock (2026-11-18): it counted 360 tries, and a /status that timed out each time made that 15 minutes
-      const until = Date.now() + START_MS;
-      while (Date.now() < until && e.wanted && e.runner === xcode) {
-        if ((await this.ping(e, 2000)).ok) {
-          if (e.runner !== xcode) return;
-          // which WebDriverAgent answered: ours says so (and its version); a stock one doesn't know the route
-          e.forkInfo = await this.askFork(e);
-          if (e.runner !== xcode) return;
-          if (e.forkInfo) this.log(e, `our own build answers (v${e.forkInfo.lotus}${e.forkInfo.upstream ? `, ${e.forkInfo.upstream}` : ''})`);
-          e.readyAt = Date.now();
-          e.status = 'ready';
-          if (e.spawnTurn) this.releaseSpawn(e); // up: the next phone's xcodebuild may start
-          e.restarts = 0;
-          e.lastOk = Date.now();
-          if (!e.restartP) {
-            // WDA answering again by itself (after the restarts gave up): control is back, the count starts afresh
-            if (e.downWhy) this.restartLog(e, `WDA answers again; control is back (it was down: ${e.downWhy})`);
-            e.downWhy = null;
-            e.needsReplug = false;
-            e.attempt = 0;
-          }
-          this.log(e, 'ready');
-          try {
-            await this.session(e);
-            this.setControl(e, 'ready');
-          } catch (err) {
-            this.log(e, `could not make a session yet: ${(err as Error).message}`);
-          }
-          return;
+  /**
+   * Polls WDA's /status until it answers (by the clock, `ms`), then warms a session: a new one, or (`adopted`) the one
+   * the adopted runner already has. An adopted runner that doesn't answer is ended and a new one started.
+   */
+  private async waitUp(e: Entry, xcode: ChildProcess, ms: number, adopted: boolean): Promise<void> {
+    // by the clock (2026-11-18): it counted 360 tries, and a /status that timed out each time made that 15 minutes
+    const until = Date.now() + ms;
+    while (Date.now() < until && e.wanted && e.runner === xcode) {
+      const st = await this.ping(e, 2000);
+      if (st.ok) {
+        if (e.runner !== xcode) return;
+        // which WebDriverAgent answered: ours says so (and its version); a stock one doesn't know the route
+        e.forkInfo = await this.askFork(e);
+        if (e.runner !== xcode) return;
+        if (e.forkInfo) this.log(e, `our own build answers (v${e.forkInfo.lotus}${e.forkInfo.upstream ? `, ${e.forkInfo.upstream}` : ''})`);
+        e.readyAt = Date.now();
+        e.status = 'ready';
+        if (e.spawnTurn) this.releaseSpawn(e); // up: the next phone's xcodebuild may start
+        e.restarts = 0;
+        e.lastOk = Date.now();
+        if (!e.restartP) {
+          // WDA answering again by itself (after the restarts gave up): control is back, the count starts afresh
+          if (e.downWhy) this.restartLog(e, `WDA answers again; control is back (it was down: ${e.downWhy})`);
+          e.downWhy = null;
+          e.needsReplug = false;
+          e.capped = false;
+          e.attempt = 0;
         }
-        await sleep(500);
+        this.log(e, adopted ? 'ready (adopted: the runner an earlier server process started, left running)' : 'ready');
+        this.recordRunner(e);
+        // 2026-11-27: the main queue: its answer makes the link "up", and says which beat route this build has
+        this.beat(e);
+        try {
+          if (adopted && st.sessionId) await this.adoptSession(e, st.sessionId);
+          else await this.session(e);
+          this.setControl(e, 'ready');
+        } catch (err) {
+          this.log(e, `could not make a session yet: ${(err as Error).message}`);
+        }
+        return;
       }
-      if (e.wanted && e.runner === xcode) this.relaunchLater(e, `WDA did not answer within ${Math.round(START_MS / 60000)} minutes`);
+      await sleep(adopted ? 250 : 500);
+    }
+    if (!e.wanted || e.runner !== xcode) return;
+    if (adopted) {
+      this.log(e, `the adopted runner's WebDriverAgent did not answer within ${Math.round(ms / 1000)} s: ending it and starting a new one`);
+      this.killProcs(e);
+      return this.launch(e);
+    }
+    this.relaunchLater(e, `WDA did not answer within ${Math.round(START_MS / 60000)} minutes`);
+  }
+
+  /**
+   * 2026-11-27: the first start since the server started finds this phone's runner still there (an earlier server
+   * process started it detached, RUNNERS_FILE): it's taken over as it is, its WDA session kept, nothing restarted on
+   * the phone. A pid now used by something else, or a WDA that doesn't answer within ADOPT_WAIT_MS: a new runner.
+   */
+  private adopt(e: Entry, rec: RunnerRecord, n: number): void {
+    e.adopted = true;
+    e.flavor = rec.flavor === 'fork' ? 'fork' : 'stock';
+    e.wdaPort = rec.port;
+    if (rec.mjpegPort) e.mjpegPort = rec.mjpegPort;
+    e.token = e.flavor === 'fork' ? rec.token : undefined;
+    e.forkInfo = null;
+    e.liveFailed = null;
+    e.seg = undefined;
+    e.fast = 'unknown';
+    e.fastFails = 0;
+    e.screenTries = 0;
+    e.runnerSession = true; // its sessions were made before: none of them is "fresh" (the phone was silenced already)
+    e.status = 'starting';
+    e.control = 'recovering';
+    e.sessionId = undefined;
+    e.sessionP = undefined;
+    e.mjpegApplied = undefined;
+    e.launchSeq++;
+    e.link.setStarting();
+    const xcode = adoptedProc(this.sys, rec.xcode);
+    e.runner = xcode;
+    const fwd = [...rec.fwd].filter((f) => f.slot === 0 || f.slot === 1).sort((a, b) => a.slot - b.slot);
+    e.fwdPlan = fwd.map((f) => ({ slot: f.slot, local: f.local, remote: f.remote }));
+    const procs: ChildProcess[] = [];
+    for (const f of fwd) procs[f.slot] = this.spawnForward(e, f.slot, f.local, f.remote, this.sys.alive(f.pid) ? f.pid : undefined);
+    e.procs = [...procs.filter(Boolean), xcode];
+    e.fwdPorts = fwd.map((f) => f.local);
+    this.log(e, `adopting the runner an earlier server process left running (xcodebuild pid ${rec.xcode}, wda :${rec.port}${e.flavor === 'fork' ? ', our own build' : ''}): nothing is restarted on the phone`);
+    this.tr(e, 'runner.adopt', { flavor: e.flavor, port: rec.port, since: rec.startedAt });
+    this.recordRunner(e);
+    this.followRunner(e, xcode, 16 * 1024);
+    const epoch = e.epoch;
+    void (async () => {
+      // a pid can be reused by another program: it must still be this phone's runner (never kill what isn't ours)
+      const cmd = this.sys.command ? await this.sys.command(rec.xcode).catch(() => '') : null;
+      if (e.runner !== xcode || e.epoch !== epoch) return;
+      if (cmd !== null && !(/xcodebuild/.test(cmd) && cmd.includes(e.udid))) {
+        this.log(e, `pid ${rec.xcode} is no longer this phone's runner (${cmd ? cmd.slice(0, 80) : 'gone'}): starting a new one`);
+        xcode.unwatch();
+        e.procs = e.procs.filter((p) => p !== xcode);
+        this.killProcs(e);
+        this.chainStop(e, () => this.reapStrays(e, [this.cfg.wdaBasePort + n, this.cfg.mjpegBasePort + n]));
+        return this.launch(e);
+      }
+      // one that was still starting when it was left gets what's left of a start's time
+      const wait = rec.upAt ? ADOPT_WAIT_MS : Math.max(ADOPT_WAIT_MS, START_MS - (Date.now() - rec.startedAt));
+      await this.waitUp(e, xcode, wait, true);
+    })();
+  }
+
+  /** An adopted runner's session (named by its /status): kept, its settings applied again, the screen as known. */
+  private async adoptSession(e: Entry, sid: string): Promise<void> {
+    e.sessionId = sid;
+    e.lastOk = Date.now();
+    await this.applySettings(e, sid);
+    if (!e.sessionId) return void (await this.session(e)); // it was gone after all: a new one (applySettings saw)
+    await this.readScreen(e, sid);
+    try {
+      this.onSession?.(e.udid, false);
+    } catch (err) {
+      this.log(e, `after the session: ${(err as Error).message}`);
+    }
+  }
+
+  /** This phone's runner as it is now, written to RUNNERS_FILE (detached runners only). */
+  private recordRunner(e: Entry): void {
+    if (!this.detach || !e.runner?.pid || !e.fwdPlan) return;
+    const all = readRunners();
+    const prev = all[e.udid];
+    all[e.udid] = {
+      udid: e.udid, flavor: e.flavor, port: e.wdaPort, mjpegPort: e.fwdPlan.find((f) => f.slot === 1)?.local ?? null,
+      ...(e.token ? { token: e.token } : {}),
+      xcode: e.runner.pid,
+      fwd: e.fwdPlan.map((f) => ({ ...f, pid: e.procs[f.slot]?.pid ?? 0 })).filter((f) => f.pid > 0),
+      startedAt: prev && prev.xcode === e.runner.pid ? prev.startedAt : Date.now(),
+      ...(e.status === 'ready' && e.readyAt ? { upAt: e.readyAt } : prev?.upAt && prev.xcode === e.runner.pid ? { upAt: prev.upAt } : {}),
     };
-    void waitReady();
+    writeRunners(all);
+  }
+
+  /** This phone's runner is no longer one to adopt (ended, or not there). */
+  private forgetRunner(udid: string): void {
+    const all = readRunners();
+    if (!all[udid]) return;
+    delete all[udid];
+    writeRunners(all);
+  }
+
+  /** A trace event of this phone's (never a token or a body). */
+  private tr(e: Entry, kind: string, data: Record<string, unknown> = {}): void {
+    try {
+      trace(kind, { udid: e.udid, ...data });
+    } catch {
+      /* the trace never breaks the control link */
+    }
   }
 
   // ---- WDA HTTP client ----
   /**
-   * One HTTP request to WDA (Nagle off, keep-alive), in the phone's lane (src/lane.ts): one at a time, a touch before
-   * waiting reads, a read that waited too long dropped unsent (a LaneBusy, 503), a quiet read skipped while anything
-   * else is on its way. Its `timeout` counts from when it's sent, not while it waits its turn. A request whose caller
-   * stopped waiting keeps the lane until the phone answers it (HOLD_MS at most, then WDA is checked). /status and
-   * /lotus/info (`bypass`) go straight on connections of their own.
+   * One HTTP request to WDA (Nagle off, keep-alive), in the phone's lane (src/lane.ts): one at a time from the Mac, an
+   * input first (a read on its way is stopped for it), a look last, a request that can't start before its deadline
+   * dropped unsent (a LaneBusy, 503), a quiet read skipped while anything else is going on. Its `timeout` counts from
+   * when it's sent, and never runs past its deadline. 2026-11-27: no hold after a timeout: the request is ended on the
+   * Mac at once, and the lane's journal says it may still be on the phone until a later answer (the beat) proves it
+   * done. /status and /lotus/info (`bypass`) go straight on connections of their own.
    */
   private request(e: Entry, method: string, p: string, body: string | undefined, timeout: number, resend = true, via: Via = {}): Promise<Resp> {
     const headers: Record<string, string | number> = {};
@@ -1579,25 +2387,28 @@ export class WdaManager {
     }
     // a Home press or a launch that WDA did: the app in front is known from it (2026-11-22: never asked)
     let appAfter: { info: unknown; from: 'launch' | 'home' } | null = null;
-    const go = (agent: http.Agent, holdMs: number) => {
+    const go = (agent: http.Agent, budget?: number) => {
       if (bound) {
         // checked again at its turn: a read ahead of it may have found the app not answering meanwhile
         const why = this.appReadBlocked(e, true);
         if (why) throw this.appBusy(e, label, why);
         e.appReads.sent++;
-        e.appInFlight++;
       }
       const t0 = Date.now();
+      // 2026-11-27: never longer on the wire than its caller waits (its deadline)
+      const ms = budget !== undefined ? Math.max(1, Math.min(timeout, budget)) : timeout;
       const x = exchange({
-        port: e.wdaPort, method, path: p, body, headers, agent, timeout, holdMs,
+        port: e.wdaPort, method, path: p, body, headers, agent, timeout: ms, holdMs: 0,
+        // the socket stays open `hold` ms past a timeout for the late answer (2 per phone at most: sockets stay free)
+        lateMs: e.lateOpen < LATE_PER_PHONE ? (this.timeouts.hold ?? HOLD_MS) : 0,
         // `resend: false` (typing): never sent a second time, even on a stale socket (WDA may have typed it already)
         resend,
         onAnswer: () => {
           e.lastAnswer = Date.now();
           if (!via.bypass) e.laneAnswer = e.lastAnswer;
           e.misses = 0;
+          e.link.alive();
         },
-        onStuck: (ms) => this.stuck(e, label, ms),
       });
       if (appAfter) {
         const known = appAfter;
@@ -1609,20 +2420,34 @@ export class WdaManager {
       // a read of the app in front: one that isn't answered in time (or that WDA's deadline cut short) means the app
       // doesn't answer accessibility now; a quick answer means it does again
       if (bound) {
-        x.ended.then(() => void (e.appInFlight = Math.max(0, e.appInFlight - 1)));
         x.result.then(
           (r) => {
             if (r.status >= 500 && DEADLINE_RE.test(r.text)) this.markStall(e, label, `WebDriverAgent's ${ACCESSIBILITY_DEADLINE_S} s deadline cut ${label} short`);
             else if (r.status < 500 && Date.now() - t0 <= APP_OK_MS) this.clearStall(e);
           },
           (err: HttpErr) => {
-            if (err.code === 'TIMEOUT') this.markStall(e, label, `no answer to ${label} within ${(timeout / 1000).toFixed(1)} s`);
+            if (err.code === 'TIMEOUT') this.markStall(e, label, `no answer to ${label} within ${(ms / 1000).toFixed(1)} s`);
           },
         );
+        // stopped for an input: the phone may still be on it; still on it past its own time means the app doesn't answer
+        void x.outcome.then((o) => {
+          if (o !== 'cancelled') return;
+          const t = setTimeout(() => {
+            if (e.lane.journal.entries().some((j) => j.appBound && j.label === label && j.sentAt >= t0 - PROOF_MARGIN_MS && j.sentAt <= t0 + PROOF_MARGIN_MS)) {
+              this.markStall(e, label, `no answer to ${label} within ${(ms / 1000).toFixed(1)} s (it was stopped for an input; the phone kept on it)`);
+            }
+          }, Math.max(0, t0 + ms - Date.now()));
+          t.unref?.();
+        });
       }
+      void x.outcome.then((o) => {
+        if (o !== 'timeout' && o !== 'cancelled') return;
+        e.lateOpen++;
+        void x.late.then(() => void e.lateOpen--);
+      });
       return x;
     };
-    if (via.bypass) return go(e.direct, 0).result;
+    if (via.bypass) return go(e.direct).result;
     const prio = via.prio ?? routePriority(method, p);
     if (prio === 'input') {
       e.inputAt = Date.now();
@@ -1644,31 +2469,239 @@ export class WdaManager {
       }
     }
     const wait = via.maxWait ?? (prio === 'quiet' ? QUIET_WAIT_MS : this.timeouts.laneWait ?? LANE_WAIT_MS);
-    const holdMs = via.hold === false ? 0 : this.timeouts.hold ?? HOLD_MS;
     const agent = e.agent;
-    // 2026-11-22: a read of the app in front may be held by the phone for long (an app that doesn't answer
-    // accessibility): the owner's touches go beside it, never behind it (src/lane.ts); an input that reads the app
-    // itself (the focused field) never does
-    return e.lane.run(prio, label, wait, () => go(agent, holdMs), prio === 'quiet' ? label : undefined, { yields: bound, beside: !bound });
+    // 2026-11-27: one deadline. Without one from the caller it's what the lane's wait and the request's time give
+    // (the same bounds as before); a look asked again meanwhile joins the one asked (single flight); a GET may be
+    // stopped for an input (it changes nothing on the phone), anything else never is
+    const deadlineAt = via.deadlineAt ?? Date.now() + wait + timeout;
+    const look = prio === 'look';
+    const queue = routeQueue(method, p);
+    const send = () =>
+      e.lane.run(prio, label, wait, (budget) => go(agent, budget), prio === 'quiet' ? label : look ? `${method} ${p}` : undefined, {
+        deadlineAt, minMs: via.deadlineAt !== undefined ? via.minMs : timeout, cancellable: method === 'GET', queue, appBound: bound,
+      });
+    // 2026-11-27 (root cause section 2.1): something of ours the Mac stopped waiting for still holds the phone's main
+    // queue (a /wda/unlock with no answer), and that queue hasn't moved for HELD_STUCK_MS: anything sent now would only
+    // wait behind it (and an input land late). Refused unsent, at once, with what holds it. A queue that
+    // is only slow (it answers now and then) still takes requests, behind what's there. Stills too: the lane holds
+    // them back while anything of ours is held on the phone, so they could only wait their whole turn and be refused
+    if (e.lane.journal.held('main').length) {
+      const silent = Date.now() - e.mainMovedAt;
+      if (silent >= HELD_STUCK_MS) return Promise.reject(this.heldError(e, label, silent));
+    }
+    return send();
   }
 
   /**
-   * A request the phone never answered, not even late (its hold ran out): XCTest may be stuck. WDA is checked (and
-   * restarted only when /status goes unanswered, or no session can be made while nothing else is asked of it).
-   * 2026-11-22: never for a read of the app in front: that app doesn't answer accessibility (the stall says so), WDA
-   * itself is fine and its /status answers; checking it only queued more behind the same read.
+   * 2026-11-27: the phone's main queue is stuck: a request of ours the Mac stopped waiting for is held on it and
+   * nothing answered there for HELD_STUCK_MS (what holds it, since when, how long silent); null otherwise. Nothing but
+   * /status and the beat is sent to it meanwhile.
    */
-  private stuck(e: Entry, label: string, ms: number): void {
-    if (!e.wanted || e.status !== 'ready' || e.restartP || e.downWhy) return;
-    const why = `no answer within ${(ms / 1000).toFixed(1)} s to ${label}, not even late`;
-    const sp = label.indexOf(' ');
-    if (sp > 0 && appBound(label.slice(0, sp), label.slice(sp + 1))) {
+  stuck(udid: string): { op: string; since: number; silentMs: number } | null {
+    const e = this.entries.get(udid);
+    if (!e) return null;
+    const h = e.lane.journal.held('main')[0];
+    if (!h) return null;
+    const silentMs = Date.now() - e.mainMovedAt;
+    return silentMs >= HELD_STUCK_MS ? { op: h.label, since: h.sentAt, silentMs } : null;
+  }
+
+  /** An input refused unsent: the phone's main queue still holds an earlier request of ours (which, since when). */
+  private heldError(e: Entry, label: string, silentMs: number): LaneBusy {
+    const h = e.lane.journal.held('main')[0];
+    const op = h?.label ?? null;
+    const since = h?.sentAt ?? null;
+    const ago = since ? ` (sent ${Math.round((Date.now() - since) / 1000)} s ago, no answer yet)` : '';
+    return new LaneBusy(
+      `${this.nameOf(e.udid)} is still on ${op ?? 'an earlier request'}${ago}, and its main queue hasn't moved for ${Math.round(silentMs / 1000)} s: ${label} was not sent, so it can't land late; try again in a moment`,
+      { state: 'busy', op, since, reason: 'held' },
+    );
+  }
+
+  // ---- 2026-11-27: the control link watched while something of ours is on the phone ----
+
+  /**
+   * Something the Mac stopped waiting for may still be on the phone (a timeout, or a read stopped for an input). Before
+   * (2026-11-21) the request held the lane up to HOLD_MS for the phone's late answer, then had WDA checked; now the
+   * journal says it, and the link is watched: /status (is the process there?) and the beat (does the main queue move?
+   * its answer proves everything sent before it done). Dead or hung for long enough: restarted (beginRestart).
+   */
+  private onAbandoned(e: Entry, x: JournalEntry): void {
+    const secs = ((Date.now() - x.sentAt) / 1000).toFixed(1);
+    if (x.appBound && x.why?.startsWith('no answer')) {
       e.appReads.stuck++;
-      if (!this.stalled(e)) this.markStall(e, label, why);
-      return void this.log(e, `${why}: the app in front doesn't answer accessibility; nothing is checked or restarted for it`);
+      this.log(e, `no answer within ${secs} s to ${x.label}: the app in front doesn't answer accessibility; the phone may still be on it (the journal says so) and nothing is restarted for it`);
+    } else if (x.why?.startsWith('no answer')) {
+      this.log(e, `no answer within ${secs} s to ${x.label}: the phone may still be on it; watching its control link (/status and the main queue's beat)`);
     }
-    this.log(e, `${why}: checking WebDriverAgent`);
-    void this.recover(e, why).catch(() => {});
+    this.watch(e, `no answer within ${secs} s to ${x.label} (the server stopped waiting, the phone may still be on it)`);
+    // still on the journal `hold` ms later (no late answer, no later answer proving it): WDA is checked (recover, which
+    // never holds the lane: it asks /status). Not for the app in front's reads (they're its accessibility, not WDA)
+    if (x.appBound || !x.why?.startsWith('no answer')) return;
+    const epoch = e.epoch;
+    const t = setTimeout(() => {
+      const now = e.lane.journal.entries();
+      if (e.epoch !== epoch || !e.wanted || !now.some((j) => j.id === x.id)) return;
+      // behind a read of the app in front the phone hasn't finished (one main queue): that app's business, not WDA's
+      // (the watch's hung limit still restarts a main queue that never moves again)
+      const ahead = now.find((j) => j.appBound && j.state === 'abandoned' && j.queue === x.queue && j.sentAt <= x.sentAt);
+      if (ahead) return this.log(e, `${x.label} is still behind ${ahead.label} on the phone (the app in front doesn't answer accessibility); WDA isn't checked for it`);
+      this.recover(e, `no answer within ${secs} s to ${x.label}, not even late`).catch(() => {});
+    }, this.timeouts.hold ?? HOLD_MS);
+    t.unref?.();
+  }
+
+  /** The watch: one per phone, while anything of ours is on the phone or a beat is out. Never throws. */
+  private watch(e: Entry, trigger: string): void {
+    if (e.watchP || !e.wanted) return;
+    const epoch = e.epoch;
+    const live = () => e.wanted && e.epoch === epoch && !e.restartP && !e.downWhy && e.status === 'ready';
+    e.watchP = (async () => {
+      const every = this.timeouts.probeEvery ?? PROBE_EVERY_MS;
+      const statusMs = this.timeouts.status ?? STATUS_MS;
+      while (live()) {
+        e.lane.journal.age('side', this.timeouts.sideCap ?? SIDE_CAP_MS);
+        if (!e.lane.journal.count() && e.link.beatPending() === null) break;
+        const at = Date.now();
+        if (this.absent.has(e.udid)) {
+          await sleep(every); // off the USB list for a moment: nothing to learn until it's back
+          continue;
+        }
+        const r = await this.ping(e, statusMs);
+        if (!live()) break;
+        const dead = e.link.deadWhy();
+        if (dead) {
+          void this.beginRestart(e, `${trigger}; then ${dead}`);
+          break;
+        }
+        if (e.lane.journal.held('main').length || e.link.beatPending() !== null) this.beat(e);
+        const due = e.link.restartDue();
+        if (due) {
+          void this.beginRestart(e, due);
+          break;
+        }
+        const wait = (r.conn ? Math.min(every, CONN_PROBE_EVERY_MS) : every) - (Date.now() - at);
+        if (wait > 0) await sleep(wait);
+      }
+    })()
+      .catch((err) => this.log(e, `watching the control link: ${(err as Error)?.message ?? err}`))
+      .finally(() => {
+        e.watchP = undefined;
+      });
+  }
+
+  /**
+   * The main queue's beat, one request at a time. Our build (v7) serves GET /lotus/beat?wait=ms off the main queue: it
+   * puts one no-op there (never a second while one waits) and says whether it ran within the wait and how long it
+   * waited (or how long it has been waiting so far): asked again while the watch runs. A stock WDA or an older build
+   * of ours gets GET /wda/locked, which runs on the main queue itself: it's sent once and kept open (each one more would
+   * only queue up behind the same work on the phone), for HUNG_MAX_MS and more. Either way, a run proves everything of
+   * ours on the main queue sent before it done.
+   */
+  private beat(e: Entry): void {
+    if (e.beatP || !e.wanted || e.status !== 'ready') return;
+    const ours = e.flavor === 'fork' && !!e.forkInfo && e.link.beatRouteNow() !== STAND_IN_BEAT_ROUTE;
+    const route = ours ? BEAT_ROUTE : STAND_IN_BEAT_ROUTE;
+    const headers: Record<string, string | number> = {};
+    if (e.token) headers[TOKEN_HEADER] = e.token;
+    const sentAt = Date.now();
+    e.link.beatSent(route, sentAt);
+    const x = exchange({
+      port: e.wdaPort, method: 'GET', path: ours ? `${route}?wait=${BEAT_WAIT_MS}` : route, headers, agent: e.direct,
+      timeout: ours ? BEAT_WAIT_MS + 5000 : (this.timeouts.hungMax ?? HUNG_MAX_MS) + 10_000, holdMs: 0, resend: true,
+      onAnswer: () => {
+        e.lastAnswer = Date.now();
+        e.misses = 0;
+        e.link.alive();
+      },
+    });
+    e.beatP = x.result
+      .then(
+        (r) => {
+          if (!ours) {
+            // a 404 (no such route) is the router's answer, not proof the main queue ran: no beat from it
+            if (r.status === 404) {
+              e.link.beatLost();
+              return this.tr(e, 'link.beat', { route, ms: null, status: r.status });
+            }
+            e.link.beatRan(Date.now() - sentAt);
+            e.lane.journal.prove('main', sentAt);
+            return this.tr(e, 'link.beat', { route, ms: Date.now() - sentAt });
+          }
+          let v: { main?: unknown; mainMs?: unknown; pendingMs?: unknown } | null = null;
+          try {
+            v = JSON.parse(r.text)?.value ?? null;
+          } catch {
+            /* not ours */
+          }
+          if (!v || typeof v.main !== 'boolean') {
+            // our build from before the beat (v6 and older): the stand-in from now on, asked at once
+            e.link.useBeatRoute(STAND_IN_BEAT_ROUTE);
+            e.link.beatLost();
+            this.log(e, `this build has no ${BEAT_ROUTE}: ${STAND_IN_BEAT_ROUTE} stands in for the main queue's beat`);
+            return void setTimeout(() => this.beat(e), 0);
+          }
+          const num = (n: unknown) => (typeof n === 'number' && Number.isFinite(n) ? Math.max(0, n) : null);
+          if (v.main) {
+            const ms = num(v.mainMs) ?? 0;
+            e.link.beatRan(ms);
+            // the no-op went on the main queue `ms` before it ran (now, give or take a few ms): what we sent before is over
+            e.lane.journal.prove('main', Math.min(sentAt, Date.now() - ms));
+            this.tr(e, 'link.beat', { route, ms });
+          } else {
+            const pending = num(v.pendingMs) ?? Date.now() - sentAt;
+            e.link.beatWaiting(Date.now() - pending);
+            this.tr(e, 'link.beat', { route, ms: null, pendingMs: pending });
+          }
+        },
+        () => {
+          e.link.beatLost();
+          this.tr(e, 'link.beat', { route, ms: null, lost: true });
+        },
+      )
+      .finally(() => {
+        e.beatP = undefined;
+      });
+  }
+
+  /** The link changed state: said in the log (once per change) and the trace; a hung link refuses inputs from now. */
+  private linkChanged(udid: string, to: LinkState, from: LinkState, s: LinkSnapshot): void {
+    const e = this.entries.get(udid);
+    if (!e) return;
+    this.tr(e, 'link.state', { from, to, why: s.why, op: s.op, quietMs: s.quietMs });
+    if (to === 'hung') {
+      this.log(e, `control link hung: ${s.why}; touches and reads are refused at once until it answers (restarted after ${Math.round((this.timeouts.hungMax ?? HUNG_MAX_MS) / 1000)} s of this)`);
+      this.watch(e, 'the main queue went silent');
+    } else if (from === 'hung') this.log(e, `control link ${to} again (the main queue answers)`);
+  }
+
+  /** 2026-11-27: why a request can't be queued for this phone at all now (its main queue is hung), or null. */
+  private linkRefusal(udid: string): HttpError | null {
+    const e = this.entries.get(udid);
+    if (!e || e.link.state !== 'hung') return null;
+    return this.hungError(e);
+  }
+
+  private hungError(e: Entry): HttpError {
+    const s = e.link.snapshot();
+    const left = Math.max(0, (this.timeouts.hungMax ?? HUNG_MAX_MS) - (s.quietMs ?? 0));
+    return new HttpError(
+      503,
+      `${this.nameOf(e.udid)}'s WebDriverAgent is hung: ${s.why ?? 'its main queue does not answer'}, while its process answers; nothing more is sent to it${left > 0 ? `, and it is restarted in about ${Math.ceil(left / 1000)} s if it stays so` : ''}`,
+      { state: 'hung', op: s.op, since: s.opSince },
+    );
+  }
+
+  /** A cap-refused "down" is over (the phone answers again, or the cap allows a restart now). */
+  private uncap(e: Entry, why: string): void {
+    if (e.capTimer) clearTimeout(e.capTimer);
+    e.capTimer = undefined;
+    if (!e.capped) return;
+    e.capped = false;
+    if (e.downWhy) this.restartLog(e, `${why}; control is back (it was down: ${e.downWhy})`);
+    e.downWhy = null;
+    e.link.setUp();
+    this.setControl(e, 'ready');
   }
 
   /** The app in front isn't answering accessibility reads now (a read of it would only hold the phone). */
@@ -1763,7 +2796,32 @@ export class WdaManager {
   }
 
   /** GET /status, past the lane on a connection of its own (WDA answers it off its main queue, however busy that is). */
-  private async ping(e: Entry, timeout: number): Promise<{ ok: boolean; sessionId?: string; why?: string; conn?: boolean }> {
+  private ping(e: Entry, timeout: number): Promise<{ ok: boolean; sessionId?: string; why?: string; conn?: boolean }> {
+    // 2026-11-27: one /status ask at a time per phone, shared by whoever asks (the watch, a recover, the health check),
+    // and a failed one is the answer for a while (most of a probe's spacing): two loops asking side by side never
+    // count one outage twice as fast
+    if (e.pingP && e.pingP.epoch === e.epoch) return e.pingP.p;
+    const last = e.lastPing;
+    if (last && last.epoch === e.epoch && !last.r.ok) {
+      const every = last.r.conn ? Math.min(this.timeouts.probeEvery ?? PROBE_EVERY_MS, CONN_PROBE_EVERY_MS) : (this.timeouts.probeEvery ?? PROBE_EVERY_MS);
+      if (Date.now() - last.at < every * 0.8 && e.lastAnswer < last.at) return Promise.resolve(last.r);
+    }
+    const epoch = e.epoch;
+    const at = Date.now();
+    const p = this.pingOnce(e, timeout).then((r) => {
+      // every /status ask is one observation of the process for the control link
+      e.link.status(r.ok, !!r.conn, r.why ?? null, at);
+      e.lastPing = { epoch, at: Date.now(), r };
+      return r;
+    });
+    e.pingP = { epoch, p };
+    void p.finally(() => {
+      if (e.pingP?.p === p) e.pingP = undefined;
+    });
+    return p;
+  }
+
+  private async pingOnce(e: Entry, timeout: number): Promise<{ ok: boolean; sessionId?: string; why?: string; conn?: boolean }> {
     try {
       const r = await this.request(e, 'GET', '/status', undefined, timeout, true, { bypass: true });
       let j: any = {};
@@ -2081,34 +3139,31 @@ export class WdaManager {
     // asked as often, but every CONN_PROBE_EVERY_MS while its own connections fail the same way (~6 s, not ~12)
     const fast = Math.min(every, CONN_PROBE_EVERY_MS);
     const ms = this.timeouts.status ?? STATUS_MS;
-    const fails: string[] = [];
-    // 2026-11-21: never while a request of ours is still with the phone: it's busy, not dead. The lane drains first
-    // (that request is answered, fails, or is given up at its hold); any answer meanwhile means WDA is there.
+    // 2026-11-21: never while a request of ours is on its way from the Mac: it's busy, not dead. It ends within its
+    // deadline (2026-11-27: no hold after it); any answer meanwhile means WDA is there. /status answers off the main
+    // queue, so what we stopped waiting for on the phone (the journal) is no reason to wait.
     const asked = Date.now();
     if (!e.lane.idle) {
-      const drained = await e.lane.drained(Math.min(this.timeouts.hold ?? HOLD_MS, conn ? Math.min(DRAIN_MS, 3000) : DRAIN_MS));
+      const drained = await e.lane.drained(conn ? Math.min(DRAIN_MS, 3000) : DRAIN_MS);
       if (e.lastAnswer >= asked) return null;
-      if (!drained && !conn) return 'moot'; // still busy with a request of ours: checked again when that one is over (stuck)
+      if (!drained && !conn) return 'moot'; // still busy with a request of ours: the watch sees to it
     }
-    const t0 = Date.now();
+    // 2026-11-27: the control link counts /status asks that failed in a row (this check's, the watch's, the health
+    // check's) and says when that's dead (ControlLink.deadWhy): one count, one threshold, wherever they're asked
     for (let i = 0; i < n; i++) {
       // off the USB list for a moment: unreachable, not dead (checked again once it's back)
       if (!e.wanted || e.status !== 'ready' || e.restartP || this.absent.has(e.udid)) return 'moot';
       const at = Date.now();
       const r = await this.ping(e, ms);
       if (r.ok || e.lastAnswer >= at) return null;
-      fails.push(r.why ?? 'no answer');
-      if (i < n - 1) {
-        const wait = (r.conn ? fast : every) - (Date.now() - at);
-        if (wait > 0) await sleep(wait);
-        if (e.lastAnswer >= at) return null; // something else got an answer meanwhile: WDA is there
-      }
+      const dead = e.link.deadWhy();
+      if (dead) return this.absent.has(e.udid) ? 'moot' : dead;
+      const wait = (r.conn ? fast : every) - (Date.now() - at);
+      if (wait > 0) await sleep(wait);
+      if (e.lastAnswer >= at) return null; // something else got an answer meanwhile: WDA is there
     }
     if (this.absent.has(e.udid)) return 'moot';
-    const counts = new Map<string, number>();
-    for (const f of fails) counts.set(f, (counts.get(f) ?? 0) + 1);
-    const how = [...counts].map(([f, c]) => (c > 1 ? `${f} x${c}` : f)).join(', ');
-    return `/status asked ${n} times over ${((Date.now() - t0) / 1000).toFixed(1)} s, never answered (${how})`;
+    return e.link.deadWhy() ?? 'moot';
   }
 
   /**
@@ -2142,7 +3197,19 @@ export class WdaManager {
       if (e.status !== 'ready') throw this.downError(e, `WebDriverAgent is ${e.status === 'starting' ? 'still starting' : e.status}`);
       // WDA answers. Its session is kept when it still answers too; dropped when it's gone, or when it says nothing
       const sid = e.sessionId;
-      if (sid) {
+      // 2026-11-27: the phone is still on something of ours (the journal): a session check would only queue up behind
+      // it. /status (off the main queue) says whose session WDA has instead
+      if (sid && !sessionGone && e.lane.journal.held('main').length) {
+        if (await this.sessionExpired(e, sid)) this.log(e, "the session is no longer WDA's (its /status names another): making a new one");
+        else {
+          const st = e.lastPing;
+          if (st?.r.ok) e.lastOk = Date.now();
+          this.log(e, st?.r.ok ? 'recovered (the phone is still on an earlier request of ours: its control link is watched)' : `the phone is still on an earlier request of ours and /status didn't answer (${st?.r.why ?? 'no answer'}): its control link is watched`);
+          this.watch(e, 'a recover found the phone still on an earlier request');
+          return;
+        }
+      }
+      if (sid && e.sessionId === sid) {
         let gone = sessionGone;
         if (!gone) {
           try {
@@ -2234,6 +3301,8 @@ export class WdaManager {
           } else {
             e.downWhy = `WebDriverAgent did not come back after ${max} restarts (last: ${last})`.slice(0, 400);
           }
+          if (e.needsReplug) e.link.setNeedsReplug(e.downWhy);
+          else e.link.setDead(e.downWhy);
           this.setControl(e, 'down');
           this.restartLog(e, `control down${e.needsReplug ? ' (needs replug)' : ''} after ${max} attempts in ${secs(e.restartSince)}: ${last}; it stays down until a recover, a replug, or WDA answering again`);
           return;
@@ -2252,6 +3321,7 @@ export class WdaManager {
           // the last attempt's runner may still come up meanwhile: then WDA is back and nothing more is restarted
           if (await this.readyWithin(e, wait, live)) {
             e.attempt = 0;
+            e.link.setUp();
             this.setControl(e, 'ready');
             this.restartLog(e, `WDA came back while waiting; restart done in ${secs(e.restartSince)}`);
             return;
@@ -2261,10 +3331,37 @@ export class WdaManager {
         // a phone off the USB list for a moment: its runner is launched once it's back (not counted against it)
         if (!(await this.onUsb(e, this.timeouts.usbWait ?? USB_WAIT_MS, live))) this.restartLog(e, 'the phone is still off the USB list: trying anyway');
         if (!live()) return;
+        // 2026-11-27: at most `restartCap` automatic restarts per phone per hour (each one risks jamming XCTest more):
+        // past that, control is down with why until the cap allows the next one, an answer, or a recover
+        const cap = e.link.cap();
+        if (!cap.ok) {
+          const at = cap.nextAllowedAt ?? Date.now() + 60_000;
+          e.capped = true;
+          e.downWhy = `WebDriverAgent was restarted ${cap.lastHour} times in the last hour, the most allowed; the next restart is allowed in ${Math.ceil((at - Date.now()) / 60_000)} min (last: ${last})`.slice(0, 400);
+          e.link.setDead(e.downWhy);
+          this.setControl(e, 'down');
+          this.restartLog(e, `not restarting: ${e.downWhy}`);
+          if (e.capTimer) clearTimeout(e.capTimer);
+          e.capTimer = setTimeout(() => {
+            e.capTimer = undefined;
+            if (!e.capped || !e.wanted || e.restartP) return;
+            e.capped = false;
+            e.downWhy = null;
+            void this.beginRestart(e, `the restart cap allows one again (${reason})`);
+          }, Math.max(1000, at - Date.now()));
+          e.capTimer.unref?.();
+          return;
+        }
+        // 2026-11-27: never while another phone's runner is starting (two xcodebuild starts at once jam CoreDevice)
+        await this.othersStarting(e, live);
+        if (!live()) return;
         e.attempt++;
         const n = e.attempt;
         const t = Date.now();
         const why = n === 1 ? reason : `attempt ${n - 1} failed: ${last}`;
+        e.link.noteRestart();
+        e.link.setRestarting(n, why);
+        this.tr(e, 'runner.restart', { attempt: n, of: max, why });
         this.restartLog(e, `attempt ${n}/${max}: restarting WDA (${why})`);
         this.healed(e, `restarting WDA (attempt ${n}/${max}): ${why}`);
         // 2026-11-22: what the runner given up on said last (unless its xcodebuild's exit was just recorded)
@@ -2278,6 +3375,7 @@ export class WdaManager {
         if (!live()) return;
         if (r.ok) {
           e.attempt = 0;
+          e.link.setUp();
           this.setControl(e, 'ready');
           this.restartLog(e, `attempt ${n}/${max} ok: WDA is back in ${secs(t)} (${secs(e.restartSince)} since the restart began)`);
           return;
@@ -2294,6 +3392,7 @@ export class WdaManager {
         this.restartLog(e, `the restart stopped: ${(err as Error)?.message ?? err}`);
         if (live()) {
           e.downWhy = `the restart stopped: ${(err as Error)?.message ?? err}`.slice(0, 400);
+          e.link.setDead(e.downWhy);
           this.setControl(e, 'down');
         }
       })
@@ -2302,6 +3401,19 @@ export class WdaManager {
       });
     e.restartP = p;
     return p;
+  }
+
+  /**
+   * 2026-11-27: an automatic restart never begins (never even ends the old runner) while another phone's runner is
+   * starting: holding the farm's xcodebuild start turn (until its WDA answers, it ends, or SPAWN_HOLD_MS), or waiting
+   * for it. Bounded by a restart's time.
+   */
+  private async othersStarting(e: Entry, live: () => boolean): Promise<void> {
+    const busy = () => [this.spawnHeld, ...this.spawnQueue.map((q) => q.e)].filter((o): o is Entry => !!o && o !== e && o.wanted);
+    if (!busy().length) return;
+    this.restartLog(e, `waiting for ${busy().map((o) => this.nameOf(o.udid)).join(', ')}'s runner to finish starting first (never a restart beside another start)`);
+    const until = Date.now() + this.timeouts.restart;
+    while (busy().length && live() && Date.now() < until) await sleep(100);
   }
 
   /**
@@ -2440,6 +3552,18 @@ export class WdaManager {
       await within(p, wait, () => new Error('wait')).catch(() => {});
       return this.state(udid);
     };
+    // 2026-11-27: someone asked: the restart cap's count starts afresh, and a cap-refused "down" is over
+    e.link.clearRestarts();
+    if (e.capped) {
+      e.capped = false;
+      if (e.capTimer) clearTimeout(e.capTimer);
+      e.capTimer = undefined;
+    }
+    // ...and a hung main queue (its process answers, nothing else will free it) is restarted now, not after HUNG_MAX_MS
+    if (!e.restartP && !e.downWhy && e.status === 'ready' && !e.switching && e.link.state === 'hung') {
+      this.restartLog(e, `a recover was asked while the main queue is hung: restarting it now (${e.link.snapshot().why})`);
+      return join(this.beginRestart(e, `a recover was asked while ${e.link.snapshot().why}`));
+    }
     if (e.restartP) {
       this.restartLog(e, `a recover was asked during attempt ${Math.max(1, e.attempt)}: it joins the restart under way`);
       return join(e.restartP);
@@ -2478,7 +3602,7 @@ export class WdaManager {
    * without WDA saying so in that answer, so a new one is made and the call asked once more.
    */
   call(udid: string, method: string, sub: string, body?: unknown, timeout = 30000, via: CallVia = {}): Promise<any> {
-    const how: Via = via.explicit ? { explicit: true } : {};
+    const how = viaOf(via);
     return this.withRecovery(udid, async (e) => {
       const sid = await this.session(e);
       try {
@@ -2554,7 +3678,7 @@ export class WdaManager {
   }
 
   callNoSession(udid: string, method: string, p: string, body?: unknown, timeout = 30000, via: CallVia = {}): Promise<any> {
-    return this.withRecovery(udid, (e) => this.raw(e, method, p, body, timeout, true, via.explicit ? { explicit: true } : {}));
+    return this.withRecovery(udid, (e) => this.raw(e, method, p, body, timeout, true, viaOf(via)));
   }
 
   /** A read that never triggers a recovery (a slow /source on a heavy screen must not restart WDA). */
@@ -2726,7 +3850,7 @@ export class WdaManager {
    * any error. Throws the plain WdaError of an unknown route as it is (`kind: "unknown"`), everything else named.
    */
   private async sendOnce(e: Entry, sub: string, body: unknown, timeout: number, typed: string, via: CallVia = {}, sessionless = false): Promise<void> {
-    const how: Via = via.explicit ? { explicit: true } : {};
+    const how = viaOf(via);
     e.inflight++;
     try {
       if (sessionless) await this.raw(e, 'POST', sub, body, timeout, false, how);
@@ -2984,6 +4108,13 @@ export class WdaManager {
   private healthCheck(): void {
     for (const e of this.entries.values()) {
       if (!e.wanted || e.status !== 'ready' || e.recovering || e.restartP || e.downWhy || e.checking || this.absent.has(e.udid)) continue;
+      // 2026-11-27: something of ours still on the phone, or a beat out: the watch sees to it (it asks /status too)
+      if (e.lane.journal.count() || e.link.beatPending() !== null) {
+        if (!e.lane.journal.inDeadline().length) this.watch(e, 'the health check found the phone still on an earlier request');
+        continue;
+      }
+      // the main queue's latency now and then, when nothing else said it lately (the link's stats: beat p95)
+      if (e.lane.idle && Date.now() - Math.max(e.laneAnswer, e.link.snapshot().beat.lastAt ?? 0) >= BEAT_IDLE_MS) this.beat(e);
       if (e.sessionId && Date.now() - Math.max(e.lastOk, e.lastAnswer) < HEALTH_MS - 1000) continue; // it answered lately
       if (e.inflight > 0 || !e.lane.idle) continue; // busy with something: that request finds out for itself
       e.checking = true;
@@ -3189,15 +4320,50 @@ export class WdaManager {
     }
   }
 
-  /** Every runner and forward ended (their WDA sessions deleted first); resolves once they're gone, at most `ms`. */
-  async shutdown(ms = 8000): Promise<void> {
+  /**
+   * The server stops. 2026-11-27: detached runners (real mode) are left running, as they are, in RUNNERS_FILE: the next
+   * server process adopts them, so an update or a restart of the server restarts nothing on the phones
+   * (`keepRunners: false`, WDA_DETACHED=0 or a test: every runner and forward is ended, its WDA session deleted
+   * first; resolves once they're gone, at most `ms`).
+   */
+  async shutdown(ms = 8000, opts: { keepRunners?: boolean } = {}): Promise<void> {
     clearInterval(this.health);
     const all = [...this.entries.values()];
+    // detached runners stay by default; `keepRunners: true` lets go of children too (the API layer's close: an
+    // update or a signal never ends a runner itself, root cause §11), `false` ends them (a real stop)
+    const keep = opts.keepRunners === true || (this.detach && opts.keepRunners !== false);
     for (const e of all) {
       e.wanted = false;
       e.epoch++;
-      this.killProcs(e);
+      if (e.capTimer) clearTimeout(e.capTimer);
+      e.capTimer = undefined;
+      if (keep && e.runner && !e.stopping) this.leave(e);
+      else this.killProcs(e);
+    }
+    if (keep) {
+      const left = all.filter((e) => e.status === 'stopped' && readRunners()[e.udid]).length;
+      if (left) console.log(`[wda] ${left} runner(s) left running for the next server process to adopt (${RUNNERS_FILE})`);
+      return;
     }
     await Promise.all(all.map((e) => this.settled(e, ms)));
+  }
+
+  /** The server lets go of the phone's runner without ending it (shutdown with detached runners). */
+  private leave(e: Entry): void {
+    if (e.timer) clearTimeout(e.timer);
+    e.timer = undefined;
+    if (e.spawnTurn) this.releaseSpawn(e);
+    e.untail?.();
+    e.untail = undefined;
+    for (const p of e.procs) (p as Partial<{ unwatch(): void }>).unwatch?.();
+    this.recordRunner(e); // as it is now (a forward started again since, say)
+    e.procs = [];
+    e.runner = undefined;
+    e.status = 'stopped';
+    e.control = 'down';
+    e.lane.flush(new HttpError(503, "The server is restarting; the phone's control link stays up", { state: 'restarting' }));
+    e.agent.destroy();
+    e.direct.destroy();
+    e.link.setAbsent('the server stopped (the runner was left running)');
   }
 }

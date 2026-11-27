@@ -28,7 +28,9 @@ restarting (attempt N)", "state": "restarting"}`; after the restarts gave up, 50
 
 | Method | Path | Body / query | Result |
 |---|---|---|---|
-| GET | `/health` | - | `{ok, mock, commit, startedAt, uptimeS, rssMb}` (no auth): alive, and which build runs (the commit's first 7 characters, when it started), so a client can tell whether the Mac has pulled a change |
+| GET | `/health` | - | `{ok, mock, commit, startedAt, uptimeS, rssMb}` (no auth): alive, and which build runs (the commit's first 7 characters, when it started), so a client can tell whether the Mac has pulled a change; 2026-11-27 also `build: {commit, startedAt}` and `forkVersion` (our WebDriverAgent's version in this checkout, or null) |
+| POST | `/phones/:udid/open` | `{}` | 2026-11-27: the live view's open. Starts only the USB picture, answers at once, never wakes or asks WDA: `{ok, udid, state, onPhone, lease, capture, pictureAgeMs, control, locked, screenOn, picture: "starting"\|"stream", pictureWhy?, input}`. See [State, open, trace](#state-open-and-trace-2026-11-27) |
+| GET | `/trace` (also `/api/trace`) | `?udid=&kind=&after=&since=&limit=` | 2026-11-27: the trace journal `{ok, now, events: [{seq, at, kind, udid, data}], seq, kept, max, counts}`. See [State, open, trace](#state-open-and-trace-2026-11-27) |
 | GET | `/phones` | - | `[{udid, name, model, ios, battery, online, ready, control, scale, point_width, point_height, width, height, orientation}]`: `battery` 0-100 or null; `model` the product type (`iPhone14,5`); `ready` = WDA running; `control` = `"ready"` (session warm), `"recovering"` (WDA starting or session being remade) or `"down"`; `orientation` how the phone is turned now (`portrait`, `landscape-left`, `landscape-right`, `portrait-upside-down`; null until WDA has said; see [Orientation and coordinates](#orientation-and-coordinates)); `scale` from WDA (`/wda/screen`); `point_width`/`point_height` the screen in points **as it's turned now** (390 x 844 upright, 844 x 390 on its side), null until known; `width`/`height` the same in pixels (points x scale); `stats` the live view numbers (see [Live view](#live-view-webrtc-h264-mjpeg)); `lan` the Mac's own base URLs on its LAN (private IPv4 only, `["http://192.168.1.20:8787", ...]`, same for every phone); `tailnet` its Tailscale ones (100.64/10), listed apart because a Tailscale address is not a local path; `info` the detail card's data as it was last gathered (see [Device info](#device-info-the-detail-card)); `focused` true for the one phone in focus (see [One live phone at a time](#one-live-phone-at-a-time)); `stats.heals` / `stats.lastHeal` WDA's self-heals (see [Staying responsive](#staying-responsive-wda-self-heal)) |
 | GET | `/phones/:udid/info` | `?fresh=1` (ask the phone now) | `{ok, udid, battery: {level, percent, charging}, temperatureC, app: {bundleId, name}, uptimeSec, model, ios, bootedAt, wda: {expiresAt, daysLeft, state}, thermal, connectedAt, at, fresh}`: the detail card, kept ~15 s; anything unknown is `null`. See [Device info](#device-info-the-detail-card) |
 | POST | `/phones/:udid/warm` | `{}` | `{ok, udid, capture: "warm"\|"off"\|"unavailable", reason?, input}`: wakes the phone for a viewer that's about to open it and says whether its capture runs; it starts none (2026-11-16). See [Capture only while a live view is open](#capture-only-while-a-live-view-is-open) |
@@ -72,8 +74,74 @@ the control socket or a data channel, goes through one queue per phone, so they 
 overlap (at most 50 waiting, then 503; a touch's `down` and `up` are never refused). **A locked or dark phone is woken
 first, inside the queue, and then the action runs**: a tap on a sleeping phone is never lost and nothing overtakes it.
 Discrete actions (taps, swipes, typing, keys, a touch's `down`) start at least 40 ms after the one before ended, so a
-burst reaches WDA spaced and never in parallel; an action that gets no answer in time is answered 504 and the phone is
-healed (see [Staying responsive](#staying-responsive-wda-self-heal)).
+burst reaches WDA spaced and never in parallel; an action that gets no answer in time is answered 504 (2026-11-27: with
+"look at the screen", and nothing is pressed or healed because of it; see [Architecture](#architecture-2026-11-27)).
+
+### Architecture (2026-11-27)
+
+Why each part is built the way it is: [docs/root-cause.md](docs/root-cause.md), section 13 (principles, owners, state
+machines). The short version:
+
+- **One `PhoneActor` per phone** (`src/phone/actor.ts`) owns everything that reaches it: an input line (touches first)
+  and a background line (power, looks, system work), and a **lease** (`free`, `owner`, `hand:<id>`, `system:<op>`).
+  Re-signing, the fork install and the updater's checks take the system lease (`acquireSystem`) and wait for a free
+  phone; the updater asks the actors' leases before it restarts anything (`setLeaseProbe`).
+- **One request at a time to WDA** (`src/lane.ts`): every request is in a journal (`queued`, `sent`, `answered`,
+  `abandoned`); a request WDA hasn't answered still counts as on the phone until it answers or its deadline passes, so
+  nothing is sent behind a stuck one. When the phone's main queue hasn't moved for 10 s, new actions are refused at once
+  (503 `{state: "busy", op, since, reason: "held"}`) instead of landing late.
+- **The control link is a state machine** (`src/wda.ts`): `ready`, `busy` (held over 2 s), `hung` (no beat 20 s past
+  the held request's deadline), `restarting`, `needs-replug`, `down`. Only `hung` or a dead runner restarts the runner;
+  a slow call never does.
+- **The capture is a state machine** (`src/h264.ts`): `Off`, `Finding`, `Starting`, `Live`, `Still`, `Stale`,
+  `WaitingUnlock`, `Restarting`, `GaveUp`, `Stopping`. A stop finishes before the next start; a picture older than a
+  second is said to be stale, never shown as live; a phone seen locked waits for its unlock.
+- **No action from inference**: nothing is pressed because a screen couldn't be looked at; a tap is never preceded by
+  a probe; only a phone *seen* locked or dark is woken first.
+- **A server update leaves the runners up** (`RealBackend.close()` keeps them; only a real stop, `SIGUSR2` or
+  `STOP_DEVICES_ON_EXIT=true`, ends them), so a restart of the server doesn't restart WDA on the phones. This needs
+  `AbandonProcessGroup` in the launchd plist (see [Run as a launchd service](#run-as-a-launchd-service)).
+
+### State, open and trace (2026-11-27)
+
+All additive: an older client that ignores these fields keeps working (`control` still says only `ready`,
+`recovering` or `down`).
+
+**In `/phones` (and every list entry, `/api/status`'s `devices`) and in the control socket's `control` messages:**
+
+| Field | Meaning |
+|---|---|
+| `state` | `"ready"`, `"busy"` (WDA is working on something), `"hung"` (WDA's main queue doesn't answer), `"restarting"`, `"needs-replug"`, `"down"` |
+| `onPhone` | `{op, since, held}` or null: the oldest request on the phone now (`op` like `"POST /wda/unlock"`, `since` ms since the epoch, `held` true once its own wait has passed and the phone still hasn't answered) |
+| `lease` | `{kind: "free"}`, `{kind: "owner", since}`, `{kind: "hand", id, since}` or `{kind: "system", op, since}` |
+| `capture` | `{state, why}` or null: the capture's state (above) and why, when it isn't live |
+| `pictureAgeMs` | how old the newest picture from the phone is (null when there's none) |
+
+**`deadlineAt`** (ms since the epoch, optional): in an action's body (or `?deadlineAt=` on any action and on
+`GET /ui`), the time after which its answer is no use. A request that can't start before it is refused with 503
+`{state: "busy"}` and never sent; `GET /ui` waits at most until it (and never more than 25 s).
+
+**`POST /phones/:udid/open`** opens a live view: it takes the picture for 15 s (for the view's own stream or offer to
+pick up) and answers at once with the phone's state. It never wakes, unlocks or waits on WDA; waking is `POST /wake`, a
+separate action whose failure can't fail the open. 404 unknown phone, 503 offline.
+
+**`GET /trace`** (`src/trace.ts`) is a ring buffer of the last 20,000 events, in memory only:
+`{ok, now, events: [{seq, at, kind, udid, data}], seq, kept, max, counts}`, oldest first. Kinds: `wda.queued`,
+`wda.sent`, `wda.answered`, `wda.failed`, `wda.abandoned`, `wda.cancelled`, `wda.refused`, `wda.skipped`,
+`wda.joined`, `wda.dropped`, `link.state`, `link.beat`, `runner.spawn`, `runner.adopt`, `runner.exit`,
+`runner.restart`, `capture.state`, `capture.beat`, `freeze`, `open`. Query: `udid` (that phone's and the farm's own),
+`kind` (comma-separated, a prefix ending in `.` takes the group: `kind=wda.,freeze`), `after` (seq: read on from the
+last one seen), `since` (ms since the epoch), `limit` (default 500, at most 5000). It holds labels, times, numbers and
+states only: never a token, typed text or a body (fields named like secrets are dropped).
+
+**The H.264 stream socket** (`WS /phones/:udid/stream?codec=h264`) also sends
+`{type: "capture-state", udid, state, reason, capture_time, age_ms}` on every capture change and
+`{type: "frame-age", udid, state, capture_time, age_ms}` every second (`capture_time` the newest picture's own time,
+`age_ms` its age now), and takes `{type: "freeze", ms?, why?}` from the viewer (journalled as `freeze`). Its `stats`
+add `frame_age_ms`.
+
+**Settings:** `agentSeesCapture` (optional, true when absent): whether Lotus's agent may read the screen from the live
+picture instead of asking WDA.
 
 ### Natural touch
 
@@ -1132,6 +1200,18 @@ launchctl list | grep phonefarm          # check it's running
 tail -f ~/phone-farm-server/server.log   # logs (the token is never logged)
 launchctl unload ~/Library/LaunchAgents/com.lotus.phonefarm.plist   # stop
 ```
+
+**Once, after the 2026-11-27 update:** the plist now has `AbandonProcessGroup` (so launchd doesn't kill the WDA
+runners with the server when it restarts for an update). launchd reads a plist only when it's loaded, and the
+auto-update can't reload it, so copy it and reload it by hand once (keep your edited paths):
+
+```
+cp deploy/com.lotus.phonefarm.plist ~/Library/LaunchAgents/   # then put your WorkingDirectory / log / node paths back
+launchctl unload ~/Library/LaunchAgents/com.lotus.phonefarm.plist
+launchctl load ~/Library/LaunchAgents/com.lotus.phonefarm.plist
+launchctl print gui/$(id -u)/com.lotus.phonefarm | grep -i abandon   # should say it's set
+```
+Until then the server works as before, only a server restart still takes the runners with it.
 ### Auto-update
 
 The Mac sits behind a home router, so nothing outside can trigger an update: the server checks GitHub itself (outbound only) every `AUTO_UPDATE_SECONDS` (default 10, `0` disables; mock mode never updates) with a tiny `git ls-remote origin refs/heads/main`. As soon as main's commit differs from `HEAD` it force-updates: `git fetch`, `git checkout -f -B main origin/main` (a hard reset: local edits and local commits on the Mac are dropped; untracked/ignored files like `.env` stay), `npm install` (only if package files changed), `npm run build`, then exits so launchd (`KeepAlive`) starts the new build. If install or build fails it resets back to the previous commit and rebuilds it, so the running server and `dist/` stay on the working version; the failure goes to `server.log` (`[updater]` lines) and `GET /update/status` (`lastError`, `failedCommit`), and the poller won't retry that commit until a newer one is pushed. `.env` is never read or printed by it. The old `AUTO_UPDATE_MINUTES` is ignored (only `AUTO_UPDATE_MINUTES=0` still turns updates off).
@@ -1143,6 +1223,16 @@ It relies on the launchd service above, so install that first: `cp deploy/com.lo
 After `git pull`/code changes run `npm run build` and `launchctl kickstart -k gui/$(id -u)/com.lotus.phonefarm`.
 
 ## Testing
+
+**The gate (2026-11-27):** `npm run regress` runs the type-check, every suite file below (one row each) and every bug
+class in `test/regress/` (one test per past bug, on fake phones through the public API; nothing contacts a real phone);
+it exits non-zero on any FAIL. `npm run regress:classes` runs only the classes, `npx tsx test/regress/run.ts --only
+<id>,<id>` a few. See [docs/regression.md](docs/regression.md).
+
+**The soak:** `npm run soak -- --hours 4 --phones iPhone-1,iPhone-2` runs for hours against a real running server (on
+the Mac, as a viewer: reads, Home, TikTok or Instagram, vertical scrolls, the live view; never a tap, a post or a like)
+and gives input and read p95, picture age, freezes, restarts and every stall with its recovery; `npm run soak --
+--dry-run` checks the tool in 20 s against a mock server. See [docs/soak.md](docs/soak.md).
 
 `npm run check` type-checks. `npm test` runs `test/h264.ts` (helper framing, config-before-key, latest-only drop to keyframe,
 helper restarts, offer/RTCP parsing, WebRTC's keyframe unit, RTP clock and pacer queue), `test/input.ts` (live touch straight to the phone and its fallbacks, the HID sidecar's

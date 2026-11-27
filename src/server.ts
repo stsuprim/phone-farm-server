@@ -15,6 +15,7 @@ import { frameAgrees, Size } from './orient.js';
 import type { WdaResigner, WdaSignStatus } from './resign.js';
 import { isRemote, NO_PICTURE_WAKE_MS, pathKind, rtcSignaling } from './rtc.js';
 import { SettingsStore } from './settings.js';
+import { trace, traceRead } from './trace.js';
 import { Backend, H264Want, HttpError, PhoneInfo, Profile, QualityTier, SessionStats, StreamSettings, WarmState } from './types.js';
 import type { Updater } from './updater.js';
 
@@ -34,8 +35,11 @@ export interface ServerExtras {
   touchSeed?: number;
   /** Tests only: every touch exactly where and how it was asked (checks of places and timing). Natural touch is always on otherwise. */
   exactTouch?: boolean;
-  /** What GET /health says of this build: `{ commit, startedAt }` (index.ts reads the commit once at start). */
-  version?: { commit: string | null; startedAt: string };
+  /**
+   * What GET /health says of this build: `{ commit, startedAt }` (index.ts reads the commit once at start), and since
+   * 2026-11-27 `fork`: the version of our WebDriverAgent build in this checkout (wda/LOTUS_FORK.json), null without.
+   */
+  version?: { commit: string | null; startedAt: string; fork?: number | null };
   /** How long after a switch of the live phone the one before is locked, if nobody watches it by then (ms; default FOCUS_LOCK_MS). */
   focusLockMs?: number;
   /** How often the server pings a control socket (ms; default CONTROL_PING_MS; 0 = never). */
@@ -308,6 +312,17 @@ function inTime<T>(p: Promise<T>, ms: number, why: string): Promise<T> {
 }
 /** An MJPEG hello waits this long at most for the first frame (so it can say `connectMs`), then goes without it. */
 const MJPEG_HELLO_WAIT_MS = 1500;
+/** 2026-11-27: POST /open keeps the phone's capture on this long for the viewer's own stream or offer to take over (ms). */
+export const OPEN_HOLD_MS = 15_000;
+/** 2026-11-27: how often an H.264 stream socket hears its picture's true age (`frame-age`). */
+const FRAME_AGE_MS = 1000;
+
+/** A client's `deadlineAt` (ms since the epoch) from a body or the query, else undefined. */
+function deadlineFrom(body: Record<string, unknown> | null, q: URLSearchParams): number | undefined {
+  const v = body?.deadlineAt ?? body?.deadline_at ?? q.get('deadlineAt') ?? q.get('deadline_at') ?? undefined;
+  const n = typeof v === 'string' ? Number(v) : v;
+  return typeof n === 'number' && Number.isFinite(n) && n > 0 ? n : undefined;
+}
 
 export function createServer(backend: Backend, token: string, updater?: Updater, extras: ServerExtras = {}): http.Server {
   const settings = extras.settings ?? new SettingsStore();
@@ -340,6 +355,10 @@ export function createServer(backend: Backend, token: string, updater?: Updater,
   // the first action after a quiet spell (and one that hung) has the phone's WDA probed and healed first
   if (backend.heal) control.onHeal = (udid, reason) => backend.heal!(udid, reason);
   const agent = new Agent(backend, control);
+  // 2026-11-27: the owner's setting says whether the agent's looks may use the capture (default: the backend's own)
+  backend.setAgentSeesCapture?.(() => settings.get().agentSeesCapture !== false);
+  /** The phone's lease (who drives it): free, owner, hand (an agent) or system (re-sign, fork install, self-test). */
+  const leaseOf = (udid: string) => control.actor(udid).lease();
   // 2026-11-24: files for the phones: one at a time each, behind its touches and slower while it's watched
   const sends = backend.files && extras.filesDir
     ? new FileSends({
@@ -469,7 +488,22 @@ export function createServer(backend: Backend, token: string, updater?: Updater,
       ...p, lan, tailnet, focused: p.udid === focused, locked: pw.locked, screenOn: pw.screenOn, lastActive: pw.lastActive,
       // whether the phone's USB screen capture runs now: only while a live view of it is open (and a moment after)
       capturing: backend.capturing?.(p.udid) ?? false,
+      // 2026-11-27: the state machines as they are (additive): the phone's state, who drives it, its capture
+      ...stateView(p),
       stats: withInput(p.udid, p.stats), info: info.peek(p),
+    };
+  };
+  /** The phone's state (ready, busy, hung, restarting, needs-replug, down), what holds it, its lease and its picture. */
+  const stateView = (p: PhoneInfo) => {
+    const state = !p.online ? 'down' : backend.phoneState?.(p.udid) ?? (p.control === 'ready' ? 'ready' : p.control === 'recovering' ? 'restarting' : 'down');
+    const held = backend.onPhone?.(p.udid) ?? [];
+    const cap = backend.captureState?.(p.udid) ?? null;
+    return {
+      state,
+      onPhone: held[0] ? { op: held[0].op, since: held[0].since, held: held[0].held } : null,
+      lease: leaseOf(p.udid),
+      capture: cap ? { state: cap.state, why: cap.why } : null,
+      pictureAgeMs: cap?.pictureAgeMs ?? null,
     };
   };
   const wdaStatus = (): WdaSignStatus | { state: 'unavailable'; lastError: string; fork?: unknown } => ({
@@ -536,13 +570,22 @@ export function createServer(backend: Backend, token: string, updater?: Updater,
   // `{type: "control", udid, control, controlDown, needsReplug, restarting}` to a phone's control sockets whenever one
   // of them changes (looked at every CONTROL_PUSH_MS while a socket is open), once right after each socket's hello,
   // and the same fields in the hello itself when known. Older clients read only `control` (a string) and ignore the rest.
-  type CtlView = { control: PhoneInfo['control']; controlDown: string | null; needsReplug: boolean; restarting: PhoneInfo['restarting'] | null };
+  // 2026-11-27: and the state machines' (additive): `state` (ready, busy, hung, restarting, needs-replug, down), what
+  // holds the phone (`onPhone`), `lease` (who drives it) and the picture's age (said, but not a change on its own)
+  type CtlView = { control: PhoneInfo['control']; controlDown: string | null; needsReplug: boolean; restarting: PhoneInfo['restarting'] | null } & ReturnType<typeof stateView>;
   const ctlView = (p: PhoneInfo): CtlView => ({
     control: p.online ? p.control : 'down',
     controlDown: p.controlDown ?? null,
     needsReplug: p.needsReplug ?? false,
     restarting: p.restarting ?? null,
+    ...stateView(p),
   });
+  /** What counts as a change to push: everything but the picture's age and the lease's times. */
+  const ctlKey = (v: CtlView) =>
+    JSON.stringify({
+      ...v, pictureAgeMs: undefined, onPhone: v.onPhone?.op ?? null,
+      lease: v.lease.kind === 'hand' ? `hand:${v.lease.id}` : v.lease.kind === 'system' ? `system:${v.lease.op}` : v.lease.kind,
+    });
   const ctlNow = new Map<string, CtlView>(); // the last seen, for hellos
   const ctlSaid = new Map<string, string>(); // what the sockets of the phone heard last
   let ctlPolling = false;
@@ -557,7 +600,7 @@ export function createServer(backend: Backend, token: string, updater?: Updater,
         if (!p) continue;
         const v = ctlView(p);
         ctlNow.set(udid, v);
-        const key = JSON.stringify(v);
+        const key = ctlKey(v);
         if (ctlSaid.get(udid) === key) continue;
         const first = !ctlSaid.has(udid);
         ctlSaid.set(udid, key);
@@ -582,7 +625,7 @@ export function createServer(backend: Backend, token: string, updater?: Updater,
     if (!p) return;
     const v = ctlView(p);
     ctlNow.set(udid, v);
-    if (!ctlSaid.has(udid)) ctlSaid.set(udid, JSON.stringify(v));
+    if (!ctlSaid.has(udid)) ctlSaid.set(udid, ctlKey(v));
     reply({ type: 'control', udid, ...v });
   };
   const ctlEvery = extras.controlPushMs ?? CONTROL_PUSH_MS;
@@ -701,6 +744,9 @@ export function createServer(backend: Backend, token: string, updater?: Updater,
         return send(res, 200, {
           ok: true, mock: backend.mock, ...(extras.version ?? {}),
           uptimeS: Math.round(process.uptime()), rssMb: Math.round(process.memoryUsage.rss() / 1048576),
+          // 2026-11-27 (additive): the build and our WebDriverAgent build's version in this checkout, said together
+          build: { commit: extras.version?.commit ?? null, startedAt: extras.version?.startedAt ?? null },
+          forkVersion: extras.version?.fork ?? null,
         });
       }
       if (!authorized(bearer(req))) {
@@ -709,6 +755,18 @@ export function createServer(backend: Backend, token: string, updater?: Updater,
       }
       const addr = server.address();
       const port = addr && typeof addr === 'object' ? addr.port : 8787;
+      // 2026-11-27: the trace journal (src/trace.ts): WDA requests queued/sent/answered, the control link, runners,
+      // capture states and heartbeats, freezes. ?udid=&kind=wda.,freeze&after=<seq>&since=<ms>&limit=. No secrets in it
+      if (path === '/trace' || path === '/api/trace') {
+        if (req.method !== 'GET') throw new HttpError(405, 'use GET');
+        const q = url.searchParams;
+        const num = (k: string) => (q.has(k) && Number.isFinite(Number(q.get(k))) ? Number(q.get(k)) : undefined);
+        res.setHeader('cache-control', 'no-store');
+        return send(res, 200, {
+          ok: true, now: Date.now(),
+          ...traceRead({ udid: q.get('udid') ?? undefined, kinds: q.get('kind')?.split(',').map((s) => s.trim()), after: num('after'), since: num('since'), limit: num('limit') }),
+        });
+      }
       if (req.method === 'GET' && (path === '/phones' || path === '/api/devices')) {
         const lan = lanUrls(port);
         const tailnet = lanUrls(port, 'tailnet');
@@ -785,10 +843,31 @@ export function createServer(backend: Backend, token: string, updater?: Updater,
         }
       }
 
-      const m = /^\/(?:phones|api\/devices)\/([^/]+)\/(screenshot|tap|swipe|path|hold|touch|type|clear|key|keyboard|clipboard|home|launch|recover|input|wake|lock|ui|apps|orientation|tap-element|act|info|warm|focus|owner)$/.exec(path);
+      const m = /^\/(?:phones|api\/devices)\/([^/]+)\/(screenshot|tap|swipe|path|hold|touch|type|clear|key|keyboard|clipboard|home|launch|recover|input|wake|lock|ui|apps|orientation|tap-element|act|info|warm|focus|owner|open)$/.exec(path);
       if (!m) return send(res, 404, { error: 'not found' });
       const udid = decodeURIComponent(m[1]!);
       const action = m[2]!;
+
+      if (action === 'open') {
+        // 2026-11-27 (root cause section 4): a live view's open needs only the USB capture: it's started (kept on
+        // OPEN_HOLD_MS for the viewer's own stream or offer), and the answer says the phone's state at once. It never
+        // wakes, unlocks or asks WDA anything (the wake is POST /wake, its own action, which can't fail the open)
+        if (req.method !== 'POST') throw new HttpError(405, 'use POST');
+        const p = (await backend.list()).find((x) => x.udid === udid);
+        if (!p) throw new HttpError(404, 'unknown phone');
+        if (!p.online) throw new HttpError(503, 'phone is offline');
+        const release = backend.holdPicture?.(udid, 'client') ?? null;
+        if (release) setTimeout(release, OPEN_HOLD_MS).unref();
+        const pw = idle.state(udid);
+        trace('open', { udid, capture: !!release });
+        return send(res, 200, {
+          ok: true, udid, ...stateView(p), control: p.control, locked: pw.locked, screenOn: pw.screenOn,
+          // the picture: its capture starting (or running), or why it can't here (the stream starts its own then)
+          picture: release ? 'starting' : 'stream',
+          ...(release ? {} : { pictureWhy: backend.holdPicture ? 'the capture cannot run on this phone now (the stream tries its own)' : 'this backend starts its picture with the stream' }),
+          input: backend.inputMethods?.(udid) ?? null,
+        });
+      }
 
       if (action === 'wake' || action === 'lock') {
         if (req.method !== 'POST') throw new HttpError(405, 'use POST');
@@ -860,9 +939,13 @@ export function createServer(backend: Backend, token: string, updater?: Updater,
         const q = url.searchParams;
         const max = q.has('max') && Number.isFinite(Number(q.get('max'))) ? Number(q.get('max')) : undefined;
         // 2026-11-21: answered inside a client's 30 s whatever the phone is doing (Lotus said "can't be reached")
+        // 2026-11-27: a client's `deadlineAt` shortens the budget (refused at once when it's already past)
+        const dl = deadlineFrom(null, q);
+        const budget = dl === undefined ? UI_BUDGET_MS : Math.min(UI_BUDGET_MS, dl - Date.now());
+        if (budget <= 0) throw new HttpError(503, 'the screen was not read: its deadline had passed', { state: 'busy' });
         const reading = agent.ui(udid, { all: flag(q.get('all')), max, fresh: flag(q.get('fresh')), settle: flag(q.get('settle')) });
         const name = (await backend.list().catch(() => [])).find((p) => p.udid === udid)?.name ?? udid;
-        return send(res, 200, { ok: true, ...(await inTime(reading, UI_BUDGET_MS, `${name}'s screen could not be read within ${UI_BUDGET_MS / 1000} s: its WebDriverAgent is busy or stuck (nothing was restarted); try again in a moment`)) });
+        return send(res, 200, { ok: true, ...(await inTime(reading, budget, `${name}'s screen could not be read within ${Math.round(budget / 100) / 10} s: its WebDriverAgent is busy or stuck (nothing was restarted); try again in a moment`)) });
       }
       if (action === 'apps') {
         if (req.method !== 'GET') throw new HttpError(405, 'use GET');
@@ -884,6 +967,9 @@ export function createServer(backend: Backend, token: string, updater?: Updater,
       if (req.method !== 'POST') throw new HttpError(405, 'use POST');
       if (action === 'recover') return send(res, 200, { ok: true, control: await control.recover(udid) });
       const body = await readJson(req);
+      // 2026-11-27: one deadline from the client inward (`deadlineAt`, ms since the epoch, in the body or the query)
+      const dl = deadlineFrom(body, url.searchParams);
+      if (dl !== undefined) body.deadlineAt = dl;
       const t0 = performance.now();
       if (action === 'tap-element') return send(res, 200, await agent.inOrder(udid, () => agent.tapElement(udid, body)));
       if (action === 'act') return send(res, 200, await agent.inOrder(udid, () => agent.batch(udid, body)));
@@ -1168,10 +1254,27 @@ export function createServer(backend: Backend, token: string, updater?: Updater,
         h.setTarget(viewer, rc.bps);
         h.add(viewer);
         const v = viewer;
+        // 2026-11-27 (root cause section 6): the capture's state on every change, and the newest picture's true age
+        // every FRAME_AGE_MS (`capture_time` is the picture's own; a re-sent one keeps it); the client's `freeze` is
+        // journalled (src/trace.ts). Older clients ignore both messages
+        const sayJson = (m: Record<string, unknown>) => {
+          if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(m));
+        };
+        const ageNow = () => {
+          const t = h.sourceTime();
+          return { capture_time: t, age_ms: t === null ? null : Math.max(0, Date.now() - t) };
+        };
+        const unstate = h.onState((state, why) => sayJson({ type: 'capture-state', udid, state, reason: why, ...ageNow() }));
+        const ageTimer = setInterval(() => sayJson({ type: 'frame-age', udid, state: h.captureState(), ...ageNow() }), FRAME_AGE_MS);
+        ageTimer.unref?.();
         ws.on('message', (data, isBinary) => {
           const msg = isBinary ? null : parseObject(data);
           if (msg?.type === 'key') v.forceKey();
           else if (msg?.type === 'ping') ws.send(JSON.stringify({ type: 'pong', t: msg.t ?? null, server_time: Date.now() }));
+          else if (msg?.type === 'freeze') {
+            const ms = typeof msg.ms === 'number' && Number.isFinite(msg.ms) ? Math.round(msg.ms) : null;
+            trace('freeze', { udid, cause: 'client', ms, why: typeof msg.why === 'string' ? msg.why.slice(0, 120) : null, transport: 'h264-ws', state: h.captureState(), ...ageNow() });
+          }
         });
         const unbeat = streamHeartbeat(ws, streamPingMs, streamDeadMs, (ms) => {
           console.log(`[stream ${udid.slice(-8)}] nothing heard for ${(ms / 1000).toFixed(1)} s: closing the dead link`);
@@ -1183,6 +1286,8 @@ export function createServer(backend: Backend, token: string, updater?: Updater,
           over = true;
           unbeat();
           clearInterval(tick);
+          clearInterval(ageTimer);
+          unstate();
           h.remove(v);
           unlist();
           unturn();
@@ -1227,6 +1332,9 @@ export function createServer(backend: Backend, token: string, updater?: Updater,
     // nothing (the owner's Unlock wakes it by POST /wake, a picture's rtc-offer does too)
     const releaseIdle = idle.viewer(udid, false);
     // (the capture starts with the viewer's own rtc-offer, not here: it runs only under a picture someone asked for)
+    // 2026-11-27 (root cause section 8): the owner's live view with input just opened: his first touch is coming, so a
+    // read of the app in front (it holds WDA's one main queue for as long as the app takes) waits a moment first
+    control.actor(udid).ownerOpened();
     const link = linkOf(udid);
     const opened = Date.now();
     link.open++;
@@ -1308,6 +1416,7 @@ export function createServer(backend: Backend, token: string, updater?: Updater,
   }
 
   server.on('close', () => {
+    agent.close();
     void sends?.close();
     if (watchTimer) clearInterval(watchTimer);
     if (ctlTimer) clearInterval(ctlTimer);

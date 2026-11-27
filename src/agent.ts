@@ -3,6 +3,8 @@ import { Control, touchAck } from './control.js';
 import type { InputResult } from './inputlog.js';
 import type { TypeCheck } from './field.js';
 import type { Orientation } from './orient.js';
+import { Lease, Who } from './phone/actor.js';
+import { Budgeted, captureQuiet, isCaptureLook, isVideoApp, PictureToken, TREE_GAP_VIDEO_MS, tokenHash } from './phone/look.js';
 import { Backend, HttpError } from './types.js';
 import { centerOf, describeQuery, ElementQuery, findElements, flattenUi, UiElement, UiTree } from './ui.js';
 
@@ -12,6 +14,12 @@ import { centerOf, describeQuery, ElementQuery, findElements, flattenUi, UiEleme
  * back with what it did: `{ok, ms, changed, app, orientation, verified?, error?}`. `changed` compares a cheap hash of
  * the picture before and after (the UI tree's when the backend has no picture hash); `verify` waits for a condition
  * (a string or a label on screen, the foreground app) and says whether it came.
+ *
+ * 2026-11-27 (docs/root-cause.md G5): the agent works on top of the phone's actor (src/phone/actor.ts) as a hand
+ * (`hand: "<id>"`, default "lotus"): the owner pre-empts it. Its eyes are the phone's USB screen capture when it runs
+ * (kept running while the agent works, unless the owner's `agentSeesCapture` keeps the agent from it): `changed` and
+ * the settle read the capture's frames, never a WDA still. Without a capture, the settle is one coalesced look, and
+ * looks, trees and app reads are budgeted (at most one per 3 s while a video app is in front).
  */
 
 /** 2026-11-17: a tree read this recently is given again (any action since makes it stale at once). Was 300 ms. */
@@ -36,7 +44,6 @@ export const SETTLE_LAUNCH_MAX_MS = 1600;
 export const OWNER_QUIET_MS = 5000;
 export const OWNER_WAIT_MS = 45_000;
 export const OWNER_BATCH_WAIT_MS = 120_000;
-const OWNER_POLL_MS = 200;
 /** The words a single action answers with when the screen it aimed at went away while the owner touched it. */
 export const CHANGED_WHILE_TOUCHING = 'screen changed while you were touching';
 /** Timing lines in the log (2026-11-17, to measure reads and actions); off in tests (INPUT_LOG=0). */
@@ -51,9 +58,18 @@ const MAX_WAIT_MS = 15000;
 const TRANSITION_MS = 1500;
 /** After recent input, an element that isn't there yet is waited for this long even when no `timeoutMs` was given. */
 const GRACE_MS = 1000;
-/** Waiting for the picture to stop changing: two looks this far apart that are the same, for at most STILL_MAX_MS. */
+/** Waiting for the picture to stop changing: no new frame of the capture for this long, for at most STILL_MAX_MS. */
 const STILL_STEP_MS = 150;
 const STILL_MAX_MS = 900;
+/**
+ * 2026-11-27: without a capture, the settle is one look after this long (a launch SETTLE_LAUNCH_MAX_MS), never a loop
+ * of WDA stills (each one a turn on the phone's busy main queue).
+ */
+export const SETTLE_ONE_LOOK_MS = 350;
+/** The capture the agent started is kept running this long after its last work (so it isn't toggled per action). */
+export const AGENT_CAPTURE_LINGER_MS = 60_000;
+/** The hand id of the agent's work when the message names none. */
+export const DEFAULT_HAND = 'lotus';
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const round1 = (v: number) => Math.round(v * 10) / 10;
 
@@ -121,8 +137,14 @@ export interface ActionOptions {
 }
 
 interface Look {
-  kind: 'frame' | 'ui';
+  /** capture: the USB capture's frame count (no WDA); frame: a WDA still's hash; ui: the tree's. */
+  kind: 'capture' | 'frame' | 'ui';
   hash: string;
+}
+
+/** The hand a message is from (`hand: "<id>"`), else the default. */
+function handOf(msg: Record<string, unknown>): string {
+  return typeof msg.hand === 'string' && msg.hand.trim() ? msg.hand.trim().slice(0, 64) : DEFAULT_HAND;
 }
 
 const errorOf = (err: unknown): string => (err instanceof HttpError ? err.message : err instanceof Error ? err.message : String(err));
@@ -158,12 +180,18 @@ function says(el: UiElement, q: ElementQuery): boolean {
 }
 
 export class Agent {
-  private uiCache = new Map<string, { at: number; t0: number; p: Promise<UiSnapshot> }>();
+  private uiCache = new Map<string, { at: number; t0: number; p: Promise<UiSnapshot>; token: string | null }>();
   private lane = new Map<string, Promise<void>>();
-  /** 2026-11-17: when the owner last gave a phone input (Date.now()), by udid. */
-  private ownerAt = new Map<string, number>();
   /** 2026-11-17: phones on which an action of Lotus's is waiting for the owner now: since when (Date.now()). */
   private pausedSince = new Map<string, number>();
+  /** 2026-11-27: when each phone's last UI tree was asked of the phone (Date.now()), for the tree budget. */
+  private treeAt = new Map<string, number>();
+  /** The app in front as the agent last read it (the tree and app budgets key on it), with when. */
+  private appSeen = new Map<string, { app: string; at: number }>();
+  /** The app in front, read through the phone's actor: single-flight and budgeted on video apps. */
+  private appReads: Budgeted<string | null>;
+  /** The capture the agent keeps running on each phone while it works (released AGENT_CAPTURE_LINGER_MS after). */
+  private pictures = new Map<string, { release: () => void; timer?: NodeJS.Timeout }>();
   /** A read saw the app in front (the server keeps the phone's card up to date with it). */
   onApp?: (udid: string, bundleId: string) => void;
 
@@ -181,16 +209,42 @@ export class Agent {
     this.quietMs = opts.ownerQuietMs ?? OWNER_QUIET_MS;
     this.waitOneMs = opts.ownerWaitMs ?? OWNER_WAIT_MS;
     this.waitBatchMs = opts.ownerBatchWaitMs ?? OWNER_BATCH_WAIT_MS;
+    // the owner's quiet time is the lease's (src/phone/actor.ts): the actor pauses a hand's input by it too
+    control.actors.tune({ ownerQuietMs: this.quietMs, ownerWaitMs: this.waitOneMs });
     control.resolveApp = (udid, name) => this.bundleId(udid, name);
+    this.appReads = new Budgeted<string | null>(
+      async (udid) => {
+        const app = (await this.backend.activeApp?.(udid)) ?? null;
+        if (app) this.sawApp(udid, app);
+        return app;
+      },
+      { gapMs: (udid) => (this.videoFront(udid) ? TREE_GAP_VIDEO_MS : 0) },
+    );
+  }
+
+  /** The app in front as last known, without asking the phone: the agent's own read or the backend's (a launch, Home), the newer. */
+  private appKnown(udid: string): string | null {
+    const seen = this.appSeen.get(udid);
+    const k = this.backend.knownApp?.(udid) ?? null;
+    if (k?.bundleId && (!seen || k.at > seen.at)) return k.bundleId;
+    return seen?.app ?? null;
+  }
+
+  /** A video app (TikTok, Instagram...) is in front, as last known: every accessibility read of it is budgeted. */
+  private videoFront(udid: string): boolean {
+    return isVideoApp(this.appKnown(udid));
   }
 
   /**
    * One reported action at a time per phone, in arrival order: a reported action looks at the screen before it enters
    * the phone's queue, so without this a tap-element sent right behind a launch would read the screen the launch is
-   * about to replace. Live touches never wait here.
+   * about to replace. Live touches never wait here. It holds the hand's lease (`hand`, default "lotus") meanwhile.
    */
-  inOrder<T>(udid: string, fn: () => Promise<T>): Promise<T> {
-    const p = (this.lane.get(udid) ?? Promise.resolve()).then(fn);
+  inOrder<T>(udid: string, fn: () => Promise<T>, hand = DEFAULT_HAND): Promise<T> {
+    const p = (this.lane.get(udid) ?? Promise.resolve()).then(() => {
+      const release = this.control.actor(udid).holdHand(hand);
+      return fn().finally(release);
+    });
     const done = p.then(() => {}, () => {});
     this.lane.set(udid, done);
     void done.then(() => {
@@ -199,29 +253,29 @@ export class Agent {
     return p;
   }
 
-  // ---- the owner's input (2026-11-17) ----
+  // ---- the owner's input (2026-11-17; 2026-11-27: the phone's lease, src/phone/actor.ts) ----
 
   /** The owner gave this phone input now (a touch, a swipe, a key from the page). */
   ownerInput(udid: string): void {
-    this.ownerAt.set(udid, Date.now());
+    this.control.actor(udid).ownerInput();
   }
 
   /** How long ago the owner last gave this phone input (ms); Infinity when never. */
   ownerQuiet(udid: string): number {
-    const at = this.ownerAt.get(udid);
-    return at === undefined ? Infinity : Date.now() - at;
+    return this.control.actor(udid).ownerQuiet();
   }
 
   /** The owner touched this phone in the last OWNER_QUIET_MS. */
   ownerActive(udid: string): boolean {
-    return this.ownerQuiet(udid) < this.quietMs;
+    return this.control.actor(udid).ownerActive();
   }
 
-  /** For GET /phones/:udid/owner and the phone's list entry: `{ activeMs, paused, pausedMs }`. */
-  ownerState(udid: string): { active: boolean; quietMs: number | null; paused: boolean; pausedMs: number | null } {
-    const q = this.ownerQuiet(udid);
+  /** For GET /phones/:udid/owner and the phone's list entry: `{ active, quietMs, paused, pausedMs, lease }`. */
+  ownerState(udid: string): { active: boolean; quietMs: number | null; paused: boolean; pausedMs: number | null; lease: Lease } {
+    const a = this.control.actor(udid);
+    const q = a.ownerQuiet();
     const since = this.pausedSince.get(udid);
-    return { active: q < this.quietMs, quietMs: Number.isFinite(q) ? q : null, paused: since !== undefined, pausedMs: since !== undefined ? Date.now() - since : null };
+    return { active: a.ownerActive(), quietMs: Number.isFinite(q) ? q : null, paused: since !== undefined, pausedMs: since !== undefined ? Date.now() - since : null, lease: a.lease() };
   }
 
   /**
@@ -229,18 +283,53 @@ export class Agent {
    * wasn't touching it (nothing waited); else how long it waited and whether he stopped (`resumed`).
    */
   async yieldToOwner(udid: string, maxMs: number): Promise<{ ms: number; resumed: boolean } | null> {
-    if (!this.ownerActive(udid)) return null;
-    const t0 = Date.now();
-    this.pausedSince.set(udid, t0);
-    try {
-      while (this.ownerActive(udid)) {
-        if (Date.now() - t0 >= maxMs) return { ms: Date.now() - t0, resumed: false };
-        await sleep(Math.max(5, Math.min(OWNER_POLL_MS, this.quietMs - this.ownerQuiet(udid) + 5)));
-      }
-      return { ms: Date.now() - t0, resumed: true };
-    } finally {
-      if (this.pausedSince.get(udid) === t0) this.pausedSince.delete(udid);
+    let t0 = 0;
+    return this.control.actor(udid).waitOwnerQuiet(
+      maxMs,
+      (since) => this.pausedSince.set(udid, (t0 = since)),
+      () => {
+        if (this.pausedSince.get(udid) === t0) this.pausedSince.delete(udid);
+      },
+    );
+  }
+
+  // ---- the agent's eyes: the capture while it works (2026-11-27) ----
+
+  /** The capture's token now, when it runs and the owner lets the agent see it; null otherwise. */
+  private token(udid: string): PictureToken | null {
+    return isCaptureLook(this.backend) ? this.backend.pictureToken(udid) : null;
+  }
+
+  /** The agent works on this phone: its capture is kept running (when allowed) until a while after its last work. */
+  private watching(udid: string): void {
+    if (!isCaptureLook(this.backend)) return;
+    let held = this.pictures.get(udid);
+    if (!held) {
+      const release = this.backend.holdPicture(udid, 'agent');
+      if (!release) return;
+      this.pictures.set(udid, (held = { release }));
     }
+    if (held.timer) clearTimeout(held.timer);
+    const h = held;
+    h.timer = setTimeout(() => {
+      if (this.pictures.get(udid) === h) this.pictures.delete(udid);
+      h.release();
+    }, AGENT_CAPTURE_LINGER_MS);
+    h.timer.unref?.();
+  }
+
+  /** Let every capture the agent holds go (the server is closing). */
+  close(): void {
+    for (const [udid, h] of this.pictures) {
+      if (h.timer) clearTimeout(h.timer);
+      h.release();
+      this.pictures.delete(udid);
+    }
+  }
+
+  private sawApp(udid: string, app: string): void {
+    this.appSeen.set(udid, { app, at: Date.now() });
+    this.onApp?.(udid, app);
   }
 
   /** A single action waits for the owner; still touching after OWNER_WAIT_MS: refused (409). */
@@ -258,14 +347,32 @@ export class Agent {
    * picture to stop changing first (a transition to end).
    */
   ui(udid: string, opts: { all?: boolean; max?: number; fresh?: boolean; settle?: boolean } = {}): Promise<UiSnapshot> {
+    this.watching(udid);
     const key = `${udid}|${opts.all ? 'all' : 'seen'}|${opts.max ?? ''}`;
     const kept = this.uiCache.get(key);
     const current = !!kept && kept.t0 >= this.control.lastAction(udid);
     if (kept && current && !opts.fresh && !opts.settle && (kept.at === 0 || Date.now() - kept.at < UI_FRESH_MS)) {
       return kept.p.then((s) => (kept.at === 0 ? s : { ...s, cached: true }));
     }
+    // 2026-11-27: the capture shows the very picture the kept tree was read from (no new frame since, no input since):
+    // the same tree, however old (a tree is asked only when the picture changed: docs/root-cause.md section 7)
+    const tok = this.token(udid);
+    if (kept && current && kept.at > 0 && !opts.settle && tok && kept.token === tokenHash(tok)) {
+      return kept.p.then((s) => ({ ...s, cached: true }));
+    }
+    // 2026-11-27: a read on its way, asked after the phone's last input: everyone asking meanwhile (fresh too) shares
+    // it, so two callers never put two trees on the phone (root cause section 7)
+    if (kept && current && kept.at === 0 && !opts.settle) return kept.p;
     // at 0 = still on its way: everyone asking meanwhile shares it
-    const entry = { at: 0, t0: performance.now(), p: opts.settle ? this.still(udid).then(() => this.snapshot(udid, opts)) : this.snapshot(udid, opts) };
+    const read = async () => {
+      if (opts.settle) await this.still(udid);
+      await this.treeTurn(udid);
+      const t = this.token(udid);
+      entry.token = t ? tokenHash(t) : null; // the picture this tree is read from
+      return this.snapshot(udid, opts);
+    };
+    const entry: { at: number; t0: number; p: Promise<UiSnapshot>; token: string | null } = { at: 0, t0: performance.now(), p: Promise.resolve(null as never), token: null };
+    entry.p = read();
     this.uiCache.set(key, entry);
     entry.p.then(
       () => {
@@ -281,21 +388,42 @@ export class Agent {
     return entry.p;
   }
 
+  /**
+   * The tree budget (2026-11-27, docs/root-cause.md section 7): while a video app is in front, a UI tree (an
+   * accessibility snapshot built inside that app, on its main thread) is asked at most once per TREE_GAP_VIDEO_MS.
+   */
+  private async treeTurn(udid: string): Promise<void> {
+    if (this.videoFront(udid)) {
+      const left = TREE_GAP_VIDEO_MS - (Date.now() - (this.treeAt.get(udid) ?? -Infinity));
+      if (left > 0) {
+        timingLog(`${udid.slice(-8)} ui: a video app is in front, the next tree in ${left} ms (one per ${TREE_GAP_VIDEO_MS / 1000} s)`);
+        await sleep(left);
+      }
+    }
+    this.treeAt.set(udid, Date.now());
+  }
+
   private async snapshot(udid: string, opts: { all?: boolean; max?: number }): Promise<UiSnapshot> {
     const source = this.backend.uiSource?.bind(this.backend);
     if (!source) throw new HttpError(501, 'this backend cannot read the UI');
     const t0 = performance.now();
+    // 2026-11-27: on a video app the tree is the one accessibility read of the turn (its budget, root cause section
+    // 7): the app in front is what's known (our own launch, the last read) and the orientation the picture's own
+    const video = this.videoFront(udid);
     const read = () =>
       Promise.all([
         source(udid),
-        this.app(udid),
+        video ? Promise.resolve(this.appKnown(udid)) : this.app(udid),
         // the tree's rectangles are upright: so must the screen be (2026-11-22: Lotus's own read, so the phone may be asked)
-        this.backend.refreshOrientation?.(udid, 500, true).catch(() => null),
+        video ? this.backend.refreshOrientation?.(udid, 500, false).catch(() => null) : this.backend.refreshOrientation?.(udid, 500, true).catch(() => null),
       ]);
     let [tree, app] = await read();
     // the phone had input while the tree was being read (a big screen takes a second): the tree may show either side
-    // of it, so it's read once more
-    if (this.control.lastAction(udid) > t0) [tree, app] = await read();
+    // of it, so it's read once more (within the tree budget)
+    if (this.control.lastAction(udid) > t0) {
+      await this.treeTurn(udid);
+      [tree, app] = await read();
+    }
     const s = this.backend.screen(udid);
     const flat = flattenUi(tree, s, opts);
     timingLog(`${udid.slice(-8)} ui: ${flat.elements.length} elements in ${round1(performance.now() - t0)} ms`);
@@ -307,11 +435,14 @@ export class Agent {
     };
   }
 
-  private async app(udid: string): Promise<string | null> {
+  /**
+   * The app in front: read now (single-flight; while a video app is in front at most once per TREE_GAP_VIDEO_MS).
+   * `wait`: wait for the budget (a verify); else over the budget the last read is given (an action's report).
+   */
+  private async app(udid: string, wait = false): Promise<string | null> {
     try {
-      const app = (await this.backend.activeApp?.(udid)) ?? null;
-      if (app) this.onApp?.(udid, app);
-      return app;
+      const r = await this.appReads.get(udid, { waitMs: wait ? TREE_GAP_VIDEO_MS : 0 });
+      return r?.value ?? null;
     } catch {
       return null;
     }
@@ -330,8 +461,13 @@ export class Agent {
 
   // ---- acting ----
 
-  /** A cheap look at the screen: the picture's hash, else (a backend without one) the UI tree's. */
+  /**
+   * A cheap look at the screen: the capture's frame count when it runs (no WDA at all), else a still's hash (WDA's,
+   * coalesced and budgeted by the backend), else (a backend without one) the UI tree's.
+   */
   private async look(udid: string): Promise<Look | null> {
+    const t = this.token(udid);
+    if (t) return { kind: 'capture', hash: tokenHash(t) };
     if (this.backend.frameHash) {
       const h = await this.backend.frameHash(udid).catch(() => null);
       return h ? { kind: 'frame', hash: h } : null;
@@ -345,22 +481,18 @@ export class Agent {
   }
 
   /**
-   * Wait for the picture to stop changing: two looks STILL_STEP_MS apart that are the same, for at most `maxMs`
-   * (a video never stops). True when it's still; false when it kept moving or the backend has no picture to compare.
+   * Wait for the picture to stop changing: no new frame of the capture for STILL_STEP_MS, for at most `maxMs` (a
+   * video never stops). True when it's still; false when it kept moving or can't be told. 2026-11-27: without a
+   * capture, no loop of WDA stills: one wait of SETTLE_ONE_LOOK_MS (false: it couldn't be told).
    */
   async still(udid: string, maxMs = STILL_MAX_MS): Promise<boolean> {
-    const hash = this.backend.frameHash?.bind(this.backend);
-    if (!hash) return false;
-    const until = performance.now() + maxMs;
-    let prev = await hash(udid).catch(() => null);
-    while (prev !== null) {
-      await sleep(STILL_STEP_MS);
-      const now = await hash(udid).catch(() => null);
-      if (now === prev) return true;
-      if (performance.now() >= until) break;
-      prev = now;
-    }
-    return false;
+    if (this.token(udid)) return captureQuiet(() => this.token(udid), STILL_STEP_MS, maxMs);
+    if (!this.backend.frameHash) return false;
+    // no capture: two looks one settle apart (the backend's looks are coalesced and budgeted), never a loop of stills
+    const a = await this.backend.frameHash(udid).catch(() => null);
+    if (!a) return false;
+    await sleep(Math.min(maxMs, SETTLE_ONE_LOOK_MS));
+    return a === (await this.backend.frameHash(udid).catch(() => null));
   }
 
   /**
@@ -373,10 +505,13 @@ export class Agent {
     const paused = msg.owner === true || opts.noYield ? null : await this.yieldOne(udid);
     const t0 = performance.now();
     const verify = parseVerify(opts.verify ?? msg.verify);
+    // the owner's own reported action is his; anyone else's is a hand's (the owner pre-empts it in the actor too)
+    const who: Who = msg.owner === true ? { owner: true } : { hand: handOf(msg) };
+    if ('hand' in who) this.watching(udid);
     const before = await this.look(udid);
     const tAct = performance.now();
     const since = Date.now();
-    const r = (await this.control.handle(udid, msg, owner)) as InputResult | void;
+    const r = (await this.control.handle(udid, msg, owner, who)) as InputResult | void;
     const ms = round1(performance.now() - tAct);
     // a gesture answered when it was queued is still playing on the phone: the look after comes after it
     const play = r && typeof r.play_ms === 'number' && r.play_ms > 0 ? Math.min(r.play_ms, 60_000) : 0;
@@ -415,30 +550,22 @@ export class Agent {
       await sleep(Math.min(5000, Math.max(0, asked)));
       return look ? this.look(udid) : null;
     }
-    await sleep(launch ? SETTLE_LAUNCH_MIN_MS : SETTLE_MIN_MS);
+    const min = launch ? SETTLE_LAUNCH_MIN_MS : SETTLE_MIN_MS;
+    const max = launch ? SETTLE_LAUNCH_MAX_MS : SETTLE_MAX_MS;
+    // the capture: as soon as no new frame came for STILL_STEP_MS (at least `min`, at most `max`), never a WDA still
+    if (this.token(udid)) {
+      await sleep(min);
+      await captureQuiet(() => this.token(udid), STILL_STEP_MS, max - min);
+      const t = this.token(udid);
+      if (t) return { kind: 'capture', hash: tokenHash(t) };
+    }
+    // 2026-11-27: no capture: one coalesced look after the settle (the backend's still is single-flight and budgeted)
     if (this.backend.frameHash) {
-      const h = await this.stillHash(udid, (launch ? SETTLE_LAUNCH_MAX_MS : SETTLE_MAX_MS) - (launch ? SETTLE_LAUNCH_MIN_MS : SETTLE_MIN_MS));
-      return h ? { kind: 'frame', hash: h } : null;
+      await sleep(launch ? SETTLE_LAUNCH_MAX_MS : SETTLE_ONE_LOOK_MS);
+      return this.look(udid);
     }
-    await sleep(Math.max(0, SETTLE_MS - SETTLE_MIN_MS));
+    await sleep(launch ? SETTLE_LAUNCH_MIN_MS : SETTLE_MS);
     return look ? this.look(udid) : null;
-  }
-
-  /** Like `still`, but says the last still's hash (null: no still came). */
-  private async stillHash(udid: string, maxMs: number): Promise<string | null> {
-    const hash = this.backend.frameHash!.bind(this.backend);
-    const until = performance.now() + maxMs;
-    let t = performance.now();
-    let prev = await hash(udid).catch(() => null);
-    while (prev !== null && performance.now() < until) {
-      // two stills STILL_STEP_MS apart: a still that took that long already is the gap
-      await sleep(Math.max(0, STILL_STEP_MS - (performance.now() - t)));
-      t = performance.now();
-      const now = await hash(udid).catch(() => null);
-      if (now === null || now === prev) return now ?? prev;
-      prev = now;
-    }
-    return prev;
   }
 
   /** Wait for a condition: every given part must hold (`gone`: the text and label must be absent). */
@@ -457,7 +584,7 @@ export class Agent {
     for (;;) {
       const missing: string[] = [];
       if (wantApp) {
-        app = await this.app(udid);
+        app = await this.app(udid, true); // within the app budget: a verify on a video app waits its turn
         if ((app ?? '').toLowerCase() !== wantApp) missing.push(`the foreground app is ${app ?? 'unknown'}, not ${v.app}`);
       }
       if ((v.text || v.label) && !missing.length) {
@@ -573,6 +700,7 @@ export class Agent {
       if (!s || typeof s !== 'object' || Array.isArray(s)) throw new HttpError(400, `steps[${i}] must be an object like {"type": "tap", "x": 0.5, "y": 0.5}`);
     }
     const t0 = performance.now();
+    this.watching(udid);
     const before = await this.look(udid);
     const out: Record<string, unknown>[] = [];
     let ok = true;
@@ -668,11 +796,11 @@ export class Agent {
       }
       if (msg.type === 'tap-element') {
         // on a socket `id` is the ack's: the element's id comes as `element`
-        const r = await this.inOrder(udid, () => this.tapElement(udid, { ...msg, id: msg.element }, owner));
+        const r = await this.inOrder(udid, () => this.tapElement(udid, { ...msg, id: msg.element }, owner), handOf(msg));
         return id !== null ? { type: 'ack', ...r, id } : null;
       }
       if (msg.report === true || parseVerify(msg.verify)) {
-        const r = await this.inOrder(udid, () => this.action(udid, msg, {}, owner));
+        const r = await this.inOrder(udid, () => this.action(udid, msg, {}, owner), handOf(msg));
         return id !== null ? { type: 'ack', ...r, id } : null;
       }
       // a plain action behind a reported one keeps its place; otherwise it goes straight to the phone's queue

@@ -70,7 +70,7 @@ async function until(what: string, cond: () => boolean, ms = 8000) {
   const p = new RecordParser((r) => got.push(r.kind));
   p.push(Buffer.concat([encodeRecord(5, 1, Buffer.from([1, 2])), encodeRecord(6, 2, Buffer.from('{}')), encodeRecord(3, 3, Buffer.from([0, 0, 1, 1]))]));
   assert.deepEqual(got, [5, 6, 3]);
-  assert.throws(() => new RecordParser(() => {}).push(encodeRecord(7, 0, Buffer.alloc(0))), 'kind 7 is still a corrupt stream');
+  assert.throws(() => new RecordParser(() => {}).push(encodeRecord(11, 0, Buffer.alloc(0))), 'kind 11 is still a corrupt stream (7-10: heartbeat, still, repeats)');
 
   // a fake phonecap: what it was started with, what it's told, records it "writes"
   type Fake = ChildProcess & { lines: string[]; args: string[]; out: PassThrough; die(code?: number): void };
@@ -81,7 +81,7 @@ async function until(what: string, cond: () => boolean, ms = 8000) {
     const lines: string[] = [];
     const stdin = new PassThrough();
     stdin.on('data', (d) => lines.push(...d.toString().split('\n').filter(Boolean)));
-    Object.assign(ee, { stdout: out, stderr: new PassThrough(), stdin, lines, args, out, kill: () => true, die: (code = 4) => ee.emit('exit', code, null) });
+    Object.assign(ee, { stdout: out, stderr: new PassThrough(), stdin, lines, args, out, kill: (s: string) => (setImmediate(() => ee.emit('exit', null, s)), true), die: (code = 4) => ee.emit('exit', code, null) });
     spawned.push(ee);
     return ee;
   };
@@ -112,6 +112,7 @@ async function until(what: string, cond: () => boolean, ms = 8000) {
   release();
   assert.equal(host.running, false, 'released: stopped');
   assert.ok(sink.ends >= 1, 'the sound heard that the capture ended');
+  await sleep(5); // the ended phonecap exits (a new one never starts on its screen device before)
 
   // a capture that dies before any picture with sound on, twice: the next one goes without sound (the video first)
   host.setAudio(true);

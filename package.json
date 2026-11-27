@@ -13,7 +13,10 @@
     "dev:mock": "MOCK=true tsx src/index.ts",
     "init-env": "node scripts/init-env.mjs",
     "test": "tsx test/h264.ts && tsx test/lanes.ts && tsx test/input.ts && tsx test/congestion.ts && tsx test/rtc.ts && tsx test/features.ts && tsx test/smoke.ts && tsx test/orient.ts && tsx test/touch.ts && tsx test/ui.ts && tsx test/info.ts && tsx test/connect.ts && tsx test/reliability.ts && tsx test/heal.ts && tsx test/human.ts && tsx test/dark.ts && tsx test/drag.ts && tsx test/link.ts && tsx test/restart.ts && tsx test/capture.ts && tsx test/fork.ts && tsx test/audio.ts && tsx test/unlock.ts && tsx test/scripts.ts && tsx test/live.ts && tsx test/gestures.ts && tsx test/owner.ts && tsx test/typing.ts && tsx test/keyboard.ts && tsx test/files.ts && tsx test/screens.ts && tsx test/longrun.ts && tsx test/lane.ts && tsx test/usb.ts && tsx test/tiktok.ts",
-    "build:native": "node scripts/build-native.mjs"
+    "build:native": "node scripts/build-native.mjs",
+    "regress:classes": "tsx test/regress/run.ts",
+    "regress": "tsx test/regress/run.ts --all",
+    "soak": "tsx scripts/soak.ts"
   },
   "dependencies": {
     "node-datachannel": "0.33.6",

@@ -4,9 +4,9 @@ import { FieldState, fieldValueOut, parseTypeRequest, TypeRequest, typeCheck } f
 import { InputMeter, InputResult, InputVia } from './inputlog.js';
 import { ClipResult, cutText, isSelectAll, KeyStep, parseClipboard, parseKeyOps, pressCount } from './keys.js';
 import { guessUnit, parseUnit, toPoints, Unit } from './orient.js';
+import { Actors, actorsFor, deadlineOf, PhoneActor, Who, whoOf } from './phone/actor.js';
 import { Backend, ButtonName, ControlState, HttpError, PathPoint } from './types.js';
 
-const MAX_WAITING = 50; // actions queued per phone before new ones are refused
 /** 2026-11-18: time allowed for reading the focused field (twice per `type`) and for emptying it. */
 const FIELD_READ_MS = 8000;
 const FIELD_CLEAR_MS = 20000;
@@ -155,16 +155,13 @@ interface Touch {
 type Result = InputResult | void;
 
 interface RunOptions {
-  /** A discrete action (tap, swipe, touch down, typing...): a locked or dark phone is woken first. */
+  /** A discrete action (tap, swipe, touch down, typing...): a phone observed locked or dark is woken first (its own turn). */
   discrete?: boolean;
   /** Never refused by a full queue (a touch's down and up, a lift). */
   must?: boolean;
   /** Not activity and never wakes (a lock). */
   silent?: boolean;
-  /**
-   * 2026-11-21: one that takes too long is answered with its error, and the phone is NOT healed for it (a lock: the
-   * focus puts the phone that was left to sleep, and a slow lock there must never set off a restart of its WDA).
-   */
+  /** 2026-11-21 (kept for callers): 2026-11-27, nothing is healed for any action any more (docs/root-cause.md G4). */
   noHeal?: boolean;
   /** Why a slower route took it, for the meter and the ack. */
   reason?: string;
@@ -172,12 +169,12 @@ interface RunOptions {
   timeoutMs?: number;
   /** Not input at all (a health check): not activity, not timed, no spacing, never marks the phone as acted on. */
   quiet?: boolean;
-  /**
-   * The owner's live touch on the phone's live channel (HID): never held up by what only WDA needs. It doesn't wait
-   * for a health check, the idle probe or the look at a quiet phone's screen (those run beside it), nor for the
-   * breath between two actions.
-   */
+  /** The owner's live touch on the phone's live channel (HID): no breath between two of them. */
   live?: boolean;
+  /** Who sent it (the lease: the owner pre-empts a hand). Default: the server's API. */
+  who?: Who;
+  /** The client's deadline (Date.now() ms): refused at once, busy, when it can't start by then. */
+  deadlineAt?: number;
 }
 
 export interface ControlOptions {
@@ -191,10 +188,12 @@ export interface ControlOptions {
   ownerGraceMs?: number;
   /** Discrete actions on one phone start at least this long after the last one ended (ms; default MIN_GAP_MS). */
   minGapMs?: number;
-  /** An action that takes longer than this is answered with an error and the phone is healed (ms; default ACTION_TIMEOUT_MS). */
+  /** An action that takes longer than this is answered with an error (ms; default ACTION_TIMEOUT_MS); nothing is healed for it. */
   actionTimeoutMs?: number;
-  /** The first discrete action after this long without one probes the phone first (ms; default IDLE_PROBE_MS). */
+  /** Kept for callers; 2026-11-27: no probe goes in front of an action any more (docs/root-cause.md section 8). */
   idleProbeMs?: number;
+  /** The phones' actors (src/phone/actor.ts; default: the backend's, shared with the agent and the idle lock). */
+  actors?: Actors;
   /**
    * Natural touch on now (the server's `naturalTouch` setting; default off here): taps, swipes, holds and drags sent
    * as commands move like a finger (src/human.ts). A message with `natural: false` is always exact.
@@ -206,18 +205,12 @@ export interface ControlOptions {
 
 /** Bursts are spaced: WDA (and the phone) get a breath between two discrete actions. */
 export const MIN_GAP_MS = 40;
-/** An action hung longer than this (beyond its own length) is given up on and the phone healed. */
+/** An action hung longer than this (beyond its own length) is answered with a 504 (nothing is restarted for it). */
 export const ACTION_TIMEOUT_MS = 20_000;
-/** A phone left alone this long is probed (and healed) before the next action, inside the same request. */
+/** Kept for callers (2026-11-27: no probe before an action any more). */
 export const IDLE_PROBE_MS = 30_000;
-/** How long an action waits for that probe (a WDA restart takes longer: the action then waits in WDA's own start). */
-const HEAL_WAIT_MS = 20_000;
-/** How long an action waits for the phone to wake before it goes anyway. */
+/** How long an action waits for the phone's wake (its own turn before it) before it goes anyway. */
 const WAKE_WAIT_MS = 30_000;
-/** An action waits at most this long for a health check on the phone's WDA to end. */
-const CHECK_WAIT_MS = 5_000;
-/** After an action timed out, the next one waits this much longer for it to settle (never two at once on WDA). */
-const HUNG_GRACE_MS = 5_000;
 
 /** `p`, or `onTimeout()`'s error after `ms`. */
 function within<T>(p: Promise<T>, ms: number, onTimeout: () => Error): Promise<T> {
@@ -273,18 +266,18 @@ export function touchAck(msg: Record<string, unknown>, t0: number, r: Result, er
 }
 
 /**
- * Validates, maps and serialises every phone action. Coordinates come in normalized (0..1 of the upright picture),
- * in the upright picture's pixels or in points, and leave as upright points, clamped to the screen. One queue per
- * phone, so actions from HTTP, the control WebSocket and the data channels run in the order they arrived and never
- * overlap; a locked or dark phone is woken inside the queue, before the action. Live touch (down/move/up) goes
- * straight to the phone when it has a live channel (CoreDevice HID); otherwise it's buffered into one gesture played
- * on "up". Every action's receive -> injected time is measured (`meter`).
+ * Validates and maps every phone action, and hands it to the phone's actor (src/phone/actor.ts) as an input job.
+ * Coordinates come in normalized (0..1 of the upright picture), in the upright picture's pixels or in points, and
+ * leave as upright points, clamped to the screen. The actor's one input line per phone keeps actions from HTTP, the
+ * control WebSocket and the data channels in the order they arrived, never overlapping. 2026-11-27 (docs/root-cause.md
+ * G4): nothing else happens inside an input's turn: no probe or heal of the phone's WDA, no look at its screen, no
+ * wake (a phone observed locked or dark gets its wake as its own turn, right before the input). Live touch
+ * (down/move/up) goes straight to the phone when it has a live channel (CoreDevice HID); otherwise it's buffered into
+ * one gesture played on "up". Every action's receive -> injected time is measured (`meter`).
  */
 export class Control {
-  private queues = new Map<string, { tail: Promise<unknown>; waiting: number }>();
   private touches = new Map<string, Touch>();
   private acted = new Map<string, number>(); // when each phone last had an action start, end or finish playing
-  private checks = new Map<string, Promise<unknown>>(); // a health check running beside each phone's queue
   private turns = new Map<string, number>(); // how many actions each phone was given so far
   private selectedAll = new Map<string, number>(); // the turn of a Cmd+A: nothing came after it, so the whole field is selected
   private releaseMs: number;
@@ -293,8 +286,8 @@ export class Control {
   private ownerGraceMs: number;
   readonly meter: InputMeter;
   /**
-   * Called for every input, inside the phone's queue (src/idle.ts): marks activity; for a discrete action it
-   * returns a promise to wait for (the phone waking) or null.
+   * Called for every input as it's received, before it's queued (src/idle.ts): marks activity; for a phone observed
+   * locked or dark it returns the wake (queued in the phone's input line ahead of this input), else null.
    */
   onInput?: (udid: string, discrete: boolean, live?: boolean) => Promise<void> | null;
   /** Lock and wake (src/idle.ts), for `key: "lock"` and `wake`. */
@@ -302,15 +295,16 @@ export class Control {
   /** An app's name -> its bundle id (src/agent.ts), for `launch {name}`. */
   resolveApp?: (udid: string, name: string) => Promise<string>;
   /**
-   * Probe the phone and heal what's wrong (backend.heal): called inside the queue before the first discrete action
-   * after `idleProbeMs` without one, and (not waited for) when an action hung.
+   * Kept for callers. 2026-11-27: never called from here any more: a phone's health is its control link's (its own
+   * probes and the request journal), never a probe or a heal inside an action's turn (docs/root-cause.md 13.2).
    */
   onHeal?: (udid: string, reason: string) => Promise<unknown>;
+  /** The phones' actors: the queue, the lease, the deadlines. */
+  readonly actors: Actors;
   /** An action ran (or failed): what it may have changed (the app in front, the battery) is worth a fresh look. */
   onActed?: (udid: string) => void;
   private minGapMs: number;
   private actionTimeoutMs: number;
-  private idleProbeMs: number;
   private naturalOn: () => boolean;
   private rng: Rng;
 
@@ -322,7 +316,7 @@ export class Control {
     this.ownerGraceMs = opts.ownerGraceMs ?? OWNER_GRACE_MS;
     this.minGapMs = opts.minGapMs ?? MIN_GAP_MS;
     this.actionTimeoutMs = opts.actionTimeoutMs ?? ACTION_TIMEOUT_MS;
-    this.idleProbeMs = opts.idleProbeMs ?? IDLE_PROBE_MS;
+    this.actors = opts.actors ?? actorsFor(backend);
     this.naturalOn = opts.natural ?? (() => false);
     this.rng = seeded(opts.seed ?? crypto.randomInt(0, 2 ** 31));
   }
@@ -337,26 +331,31 @@ export class Control {
     }
   }
 
-  /** Actions waiting in (or running from) the phone's queue now. */
+  /** The phone's actor. */
+  actor(udid: string): PhoneActor {
+    return this.actors.of(udid);
+  }
+
+  /** Actions waiting in (or running from) the phone's input line now. */
   pending(udid: string): number {
-    return this.queues.get(udid)?.waiting ?? 0;
+    return this.actors.of(udid).inputPending();
   }
 
   /**
-   * A health check beside the phone's queue: it never runs on WDA alongside an action (it's skipped, false, when the
-   * queue isn't empty: the phone is being used, so the actions themselves find out; and an action that comes while
-   * it runs waits for it). 2026-11-16: the owner's live touch doesn't wait for it: it goes by the phone's live channel,
-   * not WDA, and a press that landed during a check used to sit in the queue for seconds (a drag that started late
-   * and jumped).
+   * A health check as background work of the phone's actor: skipped (false) when the phone has anything else on or
+   * someone drives it (the actions themselves find out). 2026-11-27: input never waits for it (it's never in an
+   * input's turn); it waits for input (the reservation).
    */
   async check(udid: string, fn: () => Promise<void>): Promise<boolean> {
-    if (this.pending(udid) > 0 || this.checks.has(udid)) return false;
-    const p = fn().finally(() => {
-      if (this.checks.get(udid) === p) this.checks.delete(udid);
+    let ran = false;
+    await this.actors.of(udid).submit({
+      kind: 'look', label: 'health check', skipIfBusy: true, who: { server: 'watch' },
+      run: async () => {
+        ran = true;
+        await fn();
+      },
     });
-    this.checks.set(udid, p);
-    await p;
-    return true;
+    return ran;
   }
 
   /**
@@ -372,9 +371,25 @@ export class Control {
    * Run one message: `{type: "tap"|"swipe"|"path"|"hold"|"home"|"type"|"key"|"launch"|"wake"|"touch", ...}`. A swipe
    * is either `{x1, y1, x2, y2, ms}` or a whole drag `{points: [[x, y, t], ...], duration}` (swipePlan). `unit` says
    * what the coordinates are ("norm", "px" with optional `w`/`h` of the picture, "pt"); without it, values within
-   * 0..1 are normalized and anything else points.
+   * 0..1 are normalized and anything else points. 2026-11-27: `who` (else from the message: `owner: true` or a touch
+   * is the owner's, `hand: "<id>"` an agent's) is the lease it runs under, and `deadlineAt` (Date.now() ms) the
+   * client's deadline: an action that can't start by then is refused at once, busy.
    */
-  async handle(udid: string, msg: Record<string, unknown>, owner?: object): Promise<Result> {
+  handle(udid: string, msg: Record<string, unknown>, owner?: object, who?: Who): Promise<Result> {
+    const prev = this.ctx;
+    this.ctx = { who: who ?? whoOf(msg), deadlineAt: deadlineOf(msg) };
+    try {
+      // its jobs are queued synchronously, inside this (the context is read as they're made)
+      return this.route(udid, msg, owner);
+    } finally {
+      this.ctx = prev;
+    }
+  }
+
+  /** Who sent the message being handled now, and its deadline (set by `handle` while it queues its jobs). */
+  private ctx: { who: Who; deadlineAt: number | undefined } | null = null;
+
+  private async route(udid: string, msg: Record<string, unknown>, owner?: object): Promise<Result> {
     const tRecv = performance.now();
     switch (msg.type) {
       case 'tap': {
@@ -554,7 +569,7 @@ export class Control {
       return r;
     };
     const result = await this.run(udid, action, tRecv, () => quietly(fn()), {
-      discrete: true, timeoutMs: this.keysMs(text !== null ? [{ text }] : []) + CLIP_READ_MS * 2 + CUT_SETTLE_MS,
+      discrete: true, who: { owner: true }, timeoutMs: this.keysMs(text !== null ? [{ text }] : []) + CLIP_READ_MS * 2 + CUT_SETTLE_MS,
     });
     if (action === 'copy' && whole) this.selectedAll.set(udid, turn);
     return { clip, result };
@@ -715,84 +730,66 @@ export class Control {
     return this.run(udid, type, tRecv, () => this.backend.gesture(udid, pts), { discrete: true, timeoutMs: this.actionTimeoutMs + Math.max(0, pts[pts.length - 1]![2]) });
   }
 
-  // ---- the phone's queue ----
+  // ---- the phone's input line (src/phone/actor.ts) ----
 
-  /** In the phone's queue; with `tRecv`, its receive -> injected time is recorded. */
+  /** An input job in the phone's actor; with `tRecv`, its receive -> injected time is recorded. */
   private run(udid: string, type: string, tRecv: number | null, fn: () => Promise<Result>, opts: RunOptions = {}): Promise<Result> {
-    let q = this.queues.get(udid);
-    if (!q) {
-      q = { tail: Promise.resolve(), waiting: 0 };
-      this.queues.set(udid, q);
-    }
-    if (q.waiting >= MAX_WAITING && !opts.must) return Promise.reject(new HttpError(503, 'too many actions waiting for this phone'));
-    const queue = q;
-    queue.waiting++;
+    const actor = this.actors.of(udid);
     if (!opts.quiet) this.turns.set(udid, this.turn(udid) + 1);
-    let hung: Promise<unknown> | null = null; // the action that timed out, still on its way at the phone
-    const p = queue.tail.then(async () => {
-      if (opts.quiet) return fn();
-      // a health check is on WDA right now: what goes through WDA waits for it (the owner's live touch doesn't)
-      // (at most CHECK_WAIT_MS: a check on a WDA that's dying never holds the phone's actions)
-      const check = this.checks.get(udid);
-      if (!opts.live && check) await within(check, CHECK_WAIT_MS, () => new Error('check')).catch(() => {});
-      // the first action after a quiet spell: the phone's WDA is probed (and healed) first, in this same request
-      if (opts.discrete && this.onHeal) {
-        const last = this.acted.get(udid);
-        const quiet = last === undefined ? Infinity : performance.now() - last;
-        if (quiet >= this.idleProbeMs) {
-          const why = last === undefined ? 'first action since the server started' : `first action after ${Math.round(quiet / 1000)} s idle`;
-          const probe = within(this.onHeal(udid, why), HEAL_WAIT_MS, () => new Error('probe')).catch(() => {});
-          if (!opts.live) await probe; // a live touch isn't WDA's: the probe runs beside it
-        }
+    const who = opts.who ?? this.ctx?.who ?? { server: 'api' };
+    const deadlineAt = opts.deadlineAt ?? this.ctx?.deadlineAt;
+    if ('owner' in who) actor.ownerInput(); // his lease from the moment it's received: a hand pauses now
+    // Input is activity (idle lock). A phone observed locked or dark has its wake queued now, as the turn before this
+    // one; nothing is looked at, probed or woken inside this input's own turn.
+    if (!opts.silent && !opts.quiet) {
+      const waking = this.onInput?.(udid, !!opts.discrete, !!opts.live);
+      if (waking && opts.discrete) {
+        void actor
+          .submit({ kind: 'input', label: 'wake', must: true, who: { server: 'power' }, run: () => within(waking, WAKE_WAIT_MS, () => new Error('wake')).catch(() => {}) })
+          .catch(() => {});
       }
-      // input is activity (idle lock); a locked or dark phone is woken first, here, so the order of actions holds
-      if (!opts.silent) {
-        const waking = this.onInput?.(udid, !!opts.discrete, !!opts.live);
-        if (waking && opts.discrete) await within(waking, WAKE_WAIT_MS, () => new Error('wake')).catch(() => {});
-      }
+    }
+    let tStart = 0;
+    const p = actor.submit<Result>({
+      kind: 'input',
+      label: type,
+      who,
+      must: opts.must,
+      deadlineEpoch: deadlineAt,
       // bursts are spaced: a discrete action starts a breath after the last one ended
-      if (opts.discrete && !opts.live && this.minGapMs > 0) {
-        const since = performance.now() - (this.acted.get(udid) ?? -Infinity);
-        if (since < this.minGapMs) await sleep(this.minGapMs - since);
-      }
-      const tStart = performance.now();
-      this.acted.set(udid, tStart);
-      try {
-        const inner = fn();
-        const limit = opts.timeoutMs ?? this.actionTimeoutMs;
-        let r = await within(inner, limit, () => {
-          hung = inner.catch(() => {});
-          const why = `${type} on the phone got no answer within ${Math.round(limit / 1000)} s`;
-          if (opts.noHeal) return new HttpError(504, `${why}; nothing was restarted for it`);
-          void this.onHeal?.(udid, why)?.catch(() => {});
-          return new HttpError(504, `${why}: the phone is being checked and healed; it may still happen, so look at the screen before trying again`);
-        });
-        if (opts.reason && r && !r.reason) r = { ...r, reason: opts.reason };
-        if (tRecv !== null) this.record(udid, type, tRecv, tStart, r ? r.via : null, true, undefined, r ? r.reason : undefined);
-        return r;
-      } catch (err) {
-        if (tRecv !== null) this.record(udid, type, tRecv, tStart, null, false, (err as Error)?.message);
-        throw err;
-      } finally {
-        this.acted.set(udid, performance.now());
-        if (opts.discrete) this.onActed?.(udid);
-      }
-    });
-    // An action answered when it was queued on the phone (HID's paths, the fast WDA route) is still playing there:
-    // its sender has its answer, but the phone's next action waits until it's through, so a Home press or a tap by
-    // another route never lands in the middle of a swipe. One that timed out is waited for a little longer too.
-    queue.tail = p.then(
-      (r) => {
-        const play = r && typeof r.play_ms === 'number' && r.play_ms > 0 ? Math.min(r.play_ms, MAX_GESTURE_MS) : 0;
-        return play ? sleep(play).then(() => void this.acted.set(udid, performance.now())) : undefined;
+      gapMs: opts.discrete && !opts.live && !opts.quiet ? this.minGapMs : 0,
+      timeoutMs: opts.quiet ? undefined : opts.timeoutMs ?? this.actionTimeoutMs,
+      onTimeout: (ms) =>
+        new HttpError(504, `${type} on the phone got no answer within ${Math.round(ms / 1000)} s; nothing was restarted for it; it may still happen, so look at the screen before trying again`),
+      // An action answered when it was queued on the phone (HID's paths, the fast WDA route) is still playing there:
+      // its sender has its answer, but the phone's next input waits until it's through, so a Home press or a tap by
+      // another route never lands in the middle of a swipe. One that timed out is waited for a little longer too.
+      holdAfter: (r) => (r && typeof r.play_ms === 'number' && r.play_ms > 0 ? Math.min(r.play_ms, MAX_GESTURE_MS) : 0),
+      run: async () => {
+        tStart = performance.now();
+        if (!opts.quiet) this.acted.set(udid, tStart);
+        try {
+          let r = await fn();
+          if (opts.reason && r && !r.reason) r = { ...r, reason: opts.reason };
+          return r;
+        } finally {
+          if (!opts.quiet) this.acted.set(udid, performance.now());
+          if (opts.discrete) this.onActed?.(udid);
+        }
       },
-      () => (hung ? Promise.race([hung, sleep(HUNG_GRACE_MS)]).then(() => undefined) : undefined),
-    );
-    void queue.tail.then(() => {
-      queue.waiting--;
-      if (!queue.waiting && this.queues.get(udid) === queue) this.queues.delete(udid);
     });
-    return p;
+    return p.then(
+      (r) => {
+        if (tRecv !== null) this.record(udid, type, tRecv, tStart || performance.now(), r ? r.via : null, true, undefined, r ? r.reason : undefined);
+        const play = r && typeof r.play_ms === 'number' && r.play_ms > 0 ? Math.min(r.play_ms, MAX_GESTURE_MS) : 0;
+        if (play && !opts.quiet) setTimeout(() => void this.acted.set(udid, performance.now()), play).unref?.();
+        return r;
+      },
+      (err) => {
+        if (tRecv !== null) this.record(udid, type, tRecv, tStart || performance.now(), null, false, (err as Error)?.message);
+        throw err;
+      },
+    );
   }
 
   private record(udid: string, type: string, tRecv: number, tStart: number, via: InputVia | null, ok: boolean, error?: string, reason?: string): void {

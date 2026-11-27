@@ -173,7 +173,7 @@ const touch = (phase: string, x: number, y: number, seq: number, id = 1, t = seq
   ok('no live channel: the gesture is kept whole and played on "up"');
 }
 
-// ---- taps behind a wake: a dark phone is woken first, then the taps, in order ----
+// ---- taps behind a wake: a phone observed locked is woken first (its own turn), then the taps, in order ----
 {
   const calls: string[] = [];
   let locked = true;
@@ -198,20 +198,34 @@ const touch = (phase: string, x: number, y: number, seq: number, id = 1, t = seq
   const idle = new IdleLock(b, () => 10, { tickMs: 0, log: () => {}, now: () => now });
   const c = new Control(b);
   c.onInput = (u, discrete) => idle.activity(u, discrete);
-  // the server doesn't know the phone went dark by itself: the first tap after a quiet spell asks it
+  // 2026-11-27 (docs/root-cause.md 13.3d): the server doesn't know the phone went dark by itself (Unknown): the taps go
+  // as they are; nothing is asked or pressed in front of them on a guess
   await Promise.all([1, 2, 3].map((i) => c.handle('P', { type: 'tap', x: i, y: 1, unit: 'pt' })));
-  assert.deepEqual(calls, ['unlock', 'tap 1 locked=false', 'tap 2 locked=false', 'tap 3 locked=false']);
+  assert.deepEqual(calls, ['tap 1 locked=true', 'tap 2 locked=true', 'tap 3 locked=true'], 'no look and no wake on Unknown');
+  assert.equal(idle.state('P').power?.state, 'unknown');
+  // observed locked (the server's own lock): the wake is the turn before the taps, and they land in order after it
+  await idle.lock('P');
+  assert.equal(idle.state('P').power?.state, 'locked');
+  calls.length = 0;
+  await Promise.all([4, 5, 6].map((i) => c.handle('P', { type: 'tap', x: i, y: 1, unit: 'pt' })));
+  assert.deepEqual(calls, ['unlock', 'tap 4 locked=false', 'tap 5 locked=false', 'tap 6 locked=false']);
   assert.equal(idle.state('P').locked, false);
-  // right after, nothing is asked again; after a quiet spell it is
+  assert.equal(idle.state('P').power?.state, 'awake');
+  // right after, nothing is asked again; a quiet spell asks nothing either (it's Unknown again, never acted on)
   locked = true;
   calls.length = 0;
-  await c.handle('P', { type: 'tap', x: 4, y: 1, unit: 'pt' });
-  assert.deepEqual(calls, ['tap 4 locked=true'], 'just used: no check (it cannot have gone dark yet)');
+  await c.handle('P', { type: 'tap', x: 7, y: 1, unit: 'pt' });
   now += 60_000;
-  await c.handle('P', { type: 'tap', x: 5, y: 1, unit: 'pt' });
-  assert.deepEqual(calls.slice(1), ['unlock', 'tap 5 locked=false']);
+  assert.equal(idle.state('P').power?.state, 'unknown', 'an awake observation is old after 25 s');
+  await c.handle('P', { type: 'tap', x: 8, y: 1, unit: 'pt' });
+  assert.deepEqual(calls, ['tap 7 locked=true', 'tap 8 locked=true']);
+  // the watch saw it locked: an observation, so the next tap has it woken first
+  idle.note('P', true);
+  calls.length = 0;
+  await c.handle('P', { type: 'tap', x: 9, y: 1, unit: 'pt' });
+  assert.deepEqual(calls, ['unlock', 'tap 9 locked=false']);
   idle.close();
-  ok('wake: a tap on a dark phone wakes it first, then the taps land in order');
+  ok('wake: only an observed lock is woken before the taps (its own turn, in order); Unknown is never acted on');
 }
 
 // ---- HID reconnects by itself: a failed open is retried while someone watches, a broken session reopens at once ----
@@ -335,7 +349,7 @@ type Fake = ChildProcess & EventEmitter & { lines: Record<string, unknown>[]; ou
   ok('server: a live drag over the control socket (normalized), {ack: seq, ok, ms} per touch, a lift after 1.5 s without an "up", latency in /input');
 }
 
-// ---- the server: a tap on a phone that went dark wakes it first ----
+// ---- the server: a tap on a phone observed locked wakes it first; never on a guess ----
 {
   const token = crypto.randomBytes(16).toString('hex');
   const backend = new MockBackend(1);
@@ -345,10 +359,17 @@ type Fake = ChildProcess & EventEmitter & { lines: Record<string, unknown>[]; ou
   const auth = { authorization: `Bearer ${token}`, 'content-type': 'application/json' };
   const udid = (await (await fetch(`${base}/phones`, { headers: auth })).json())[0].udid as string;
   try {
-    await backend.lock(udid); // the phone locked itself: the server was never told
+    // 2026-11-27: the phone locked itself and the server was never told: Unknown, so the tap goes as it is (nothing
+    // is pressed or unlocked on a guess; the owner's Unlock or a look that sees it locked does that)
+    await backend.lock(udid);
     backend.inputLog(udid).length = 0;
-    const r = await (await fetch(`${base}/phones/${udid}/tap`, { method: 'POST', headers: auth, body: JSON.stringify({ x: 0.5, y: 0.5, fast: true }) })).json();
-    assert.equal(r.ok, true);
+    const tap = async () => (await (await fetch(`${base}/phones/${udid}/tap`, { method: 'POST', headers: auth, body: JSON.stringify({ x: 0.5, y: 0.5, fast: true }) })).json()) as { ok: boolean };
+    assert.equal((await tap()).ok, true);
+    assert.deepEqual(backend.inputLog(udid), ['tap 195,422']);
+    // locked through the server (observed): the next tap has the phone woken first, as its own turn
+    assert.equal((await fetch(`${base}/phones/${udid}/lock`, { method: 'POST', headers: auth })).status, 200);
+    backend.inputLog(udid).length = 0;
+    assert.equal((await tap()).ok, true);
     assert.deepEqual(backend.inputLog(udid), ['unlock', 'tap 195,422']);
     assert.equal(await backend.isLocked(udid), false);
   } finally {
@@ -356,7 +377,7 @@ type Fake = ChildProcess & EventEmitter & { lines: Record<string, unknown>[]; ou
     server.close();
     await backend.close();
   }
-  ok('server: a tap on a dark phone unlocks it first, then taps');
+  ok('server: a tap on a phone observed locked unlocks it first, then taps; one locked unseen is left as it is');
 }
 
 console.log(`\nall ${passed} touch checks passed`);

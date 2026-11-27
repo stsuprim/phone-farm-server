@@ -1,9 +1,9 @@
 import type NdcModule from 'node-datachannel';
 import { AudioFeed, AudioFrame, audioPlan, AudioRtpClock, parseOfferAudio } from './audio.js';
-import { bitrateAsk, DEFAULT_CEILING_BPS, DelayTracker, parseRtcp, RateControl, REMOTE_START_BPS } from './congestion.js';
+import { bitrateAsk, DEFAULT_CEILING_BPS, DELAY_MARKS, FreezeTracker, JitterDelay, LinkControl, parseRtcp, REMOTE_START_BPS } from './congestion.js';
 import { Control, touchAck } from './control.js';
-import { H264Info, H264Settings, H264Source, H264Viewer, KIND, Rec, REMOTE_DROP_BYTES, Transport } from './h264.js';
-import { THUMB_DEFAULT_FPS } from './lanes.js';
+import { CaptureState, H264Info, H264Settings, H264Source, H264Viewer, KIND, Rec, REMOTE_DROP_BYTES, Transport } from './h264.js';
+import { noteSource, THUMB_DEFAULT_FPS } from './lanes.js';
 import { Backend, HttpError, Profile, QualityTier } from './types.js';
 
 /**
@@ -21,6 +21,14 @@ import { Backend, HttpError, Profile, QualityTier } from './types.js';
  * stream id as the picture (so the browser keeps them in step from the RTCP sender reports; AUDIO_SYNC=0 puts it in a
  * stream of its own, never waiting on the picture). rtc-hello says `audio` (true/false) and `audio_reason`;
  * {type:"rtc-audio", audio, reason} follows when that changes. A sound that fails is dropped alone; the picture goes on.
+ * 2026-11-27 (docs/root-cause.md 5, 6), the picture's truth to the client:
+ *   server -> {type:"capture-state", udid, state, reason} (control socket and "input-r") whenever the capture's state
+ *   changes (Off, Finding, Starting, Live, Still, Stale, Restarting, GaveUp, WaitingUnlock, Stopping);
+ *   "input-r" {type:"frame-age", rtp, capture_time, age_ms, repeat, key, state} with every keyframe, every re-sent or
+ *   re-encoded picture (`repeat`: an earlier picture, never "now") and once a second (then `rtp` null while no frame
+ *   flows), `capture_time` the picture's own capture time; client -> {type:"freeze", ms?} on "input" or "input-r"
+ *   when its picture froze (labelled by cause in stats.sessions[].freezes; rtc-key counts the same way).
+ * Congestion control is jitter-aware (src/congestion.ts LinkControl): a far link's jitter is never read as a queue.
  */
 type Ndc = typeof NdcModule;
 type PeerConnection = InstanceType<Ndc['PeerConnection']>;
@@ -123,16 +131,10 @@ export function keyInFlightMs(rttMs: number | null, pacedMs: number): number {
 const PLAYOUT_DELAY_URI = 'http://www.webrtc.org/experiments/rtp-hdrext/playout-delay';
 
 /**
- * Delay-based congestion control (the round trip from RTCP beyond the path's own): a queue over `cut` ms lowers the
- * bitrate (x0.85, x0.6 over `hard`), and the bitrate only climbs while it stays under `clear`. A far link (Tailscale
- * across countries) has a long, jittery path, so its marks are higher than the LAN's.
+ * Delay-based congestion control: DELAY_MARKS and DELAY_HOLD_MS live in src/congestion.ts since 2026-11-27 (its
+ * JitterDelay raises each mark to a multiple of the measured jitter); exported here as before.
  */
-export const DELAY_MARKS = {
-  remote: { cut: 150, hard: 500, clear: 50 },
-  lan: { cut: 80, hard: 300, clear: 25 },
-};
-/** After a delay cut, the next waits this long: the queue needs a round trip or two to drain. */
-export const DELAY_HOLD_MS = 2000;
+export { DELAY_HOLD_MS, DELAY_MARKS } from './congestion.js';
 
 let lib: Ndc | null | undefined;
 let libError = '';
@@ -290,7 +292,11 @@ export const RTC_CONNECT_MS = 20_000;
 /** A connection that stays "disconnected" this long (a client that slept or lost its network) is given up the same way. */
 export const RTC_DISCONNECTED_MS = 15_000;
 
-/** An offer whose capture has given no picture this long has the phone woken (and again at the second mark). */
+/**
+ * An offer whose capture has given no picture this long asks for the phone to be woken (and again at the second mark).
+ * 2026-11-27 (docs/root-cause.md 6, P4): never `force`d: a screen that couldn't be looked at is no reason to press
+ * Home; only an observed dark screen is woken.
+ */
 export const NO_PICTURE_WAKE_MS = [2500, 6500];
 /** A picture that gave no frame this long while the viewer asks for keyframes has the phone woken (at most this often). */
 export const STALL_WAKE_MS = 4000;
@@ -314,8 +320,8 @@ export class RtcSession {
   private lastMoveT = -1;
   private inputR?: DataChannel;
   private lastTsMsg = 0;
-  // congestion control (libdatachannel has none): the browser's loss reports and NACKs set the bitrate
-  private rc?: RateControl;
+  // congestion control (libdatachannel has none): loss, NACKs and the jitter-aware delay set the bitrate (LinkControl)
+  private link?: LinkControl;
   private ccTimer?: NodeJS.Timeout;
   private packets = 0; // RTP packets sent since the last tick (estimated from the frame sizes)
   private nacked = 0; // packets the browser asked again since the last tick
@@ -324,7 +330,16 @@ export class RtcSession {
   private keysAsked = 0; // keyframes the viewer asked for (PLI, FIR, rtc-key)
   private lastKeySent = 0;
   private want?: { bitrate: number | null };
-  private delay = new DelayTracker(); // the round trip from the browser's receiver reports
+  private delay = new JitterDelay(); // the round trip and jitter from the browser's receiver reports
+  // 2026-11-27: the picture's truth (frame ages, repeats, freezes by cause) and the capture held while connecting
+  private vSsrc = 0;
+  private freezes?: FreezeTracker;
+  private unhold?: () => void;
+  private unstate?: () => void;
+  private lastAgeMsg = 0;
+  private playoutId: number | null = null; // a far viewer's playout-delay extension id (set once it's far)
+  private playoutNow: { min: number; max: number } | null = null;
+  private repeatsSent = 0;
   private tier: QualityTier = 'full';
   private uninfo?: () => void;
   readonly since = Date.now();
@@ -407,15 +422,22 @@ export class RtcSession {
     const src = this.backend.h264(this.udid, want);
     if (typeof src === 'string') throw new Error(src);
     this.src = src;
-    // the capture starts now (when it isn't up already), while the peer connection is put together and ICE runs
+    noteSource(this.udid, src);
+    this.delay.marks = this.remote ? DELAY_MARKS.remote : DELAY_MARKS.lan;
+    // the capture starts now (when it isn't up already), while the peer connection is put together and ICE runs.
+    // 2026-11-27: held on until the viewer is attached (ICE and DTLS take seconds at 185 ms), so the idle grace can't
+    // stop a warm capture between the open and the track opening (docs/root-cause.md 3)
     this.warm = src.ready;
+    this.unhold = src.hold('a WebRTC viewer connecting');
     const opening = src.open();
     opening.catch(() => {}); // heard below; this only keeps a failure from going unheard if the setup throws first
-    // 2026-11-18: an offer that brings no picture: the phone's screen is likely off, so it's woken (twice at most)
+    this.unstate = src.onState((state, why) => this.captureState(state, why));
+    // 2026-11-18: an offer that brings no picture: the phone's screen may be off, so a wake is asked (twice at most;
+    // 2026-11-27: never forced, see NO_PICTURE_WAKE_MS)
     if (!src.ready && this.hooks.noPicture) {
       for (const ms of NO_PICTURE_WAKE_MS) {
         const t = setTimeout(() => {
-          if (!this.closed && !this.ready) void this.wakeForPicture('the capture has given no picture yet', true);
+          if (!this.closed && !this.ready) void this.wakeForPicture('the capture has given no picture yet', false);
         }, ms);
         t.unref?.();
         this.wakeTimers.push(t);
@@ -462,6 +484,7 @@ export class RtcSession {
     pc.onDataChannel((dc) => this.channel(dc));
 
     const ssrc = (Math.random() * 0x7fffffff) >>> 0 || 1;
+    this.vSsrc = ssrc;
     const video = new ndc.Video(offer.mid, 'SendOnly');
     video.addH264Codec(offer.pt, 'profile-level-id=42e01f;packetization-mode=1;level-asymmetry-allowed=1');
     video.addSSRC(ssrc, 'phone', 'lotus-phone', 'screen');
@@ -470,6 +493,12 @@ export class RtcSession {
     // asks for the least delay). LAN viewers keep it.
     const playout = this.remote && process.env.RTC_PLAYOUT_ZERO !== '1' ? null : offer.playoutDelayId;
     if (playout !== null) video.parseSdpLine(`a=extmap:${playout} ${PLAYOUT_DELAY_URI}`);
+    // 2026-11-27: a far viewer's playout delay follows its jitter (a bigger jitter buffer instead of late frames):
+    // negotiated now, sent only once the link is found far (ccTick). RTC_PLAYOUT_ADAPT=0 leaves the browser's own.
+    else if (this.remote && offer.playoutDelayId !== null && process.env.RTC_PLAYOUT_ADAPT !== '0') {
+      this.playoutId = offer.playoutDelayId;
+      video.parseSdpLine(`a=extmap:${offer.playoutDelayId} ${PLAYOUT_DELAY_URI}`);
+    }
     const track = pc.addTrack(video);
     this.track = track;
     const rtp = new ndc.RtpPacketizationConfig(ssrc, 'phone', offer.pt, 90000);
@@ -567,12 +596,68 @@ export class RtcSession {
     this.fail(err);
   }
 
-  /** The viewer's picture stalled (it asks for a keyframe): no frame for STALL_WAKE_MS means the screen likely went off. */
+  /**
+   * The viewer's picture stalled (it asks for a keyframe): no frame for STALL_WAKE_MS means the screen may have gone
+   * off. 2026-11-27: judged on the picture's TRUE age (a re-sent or re-encoded old picture doesn't count as a frame),
+   * and not while the capture itself is the reason (finding, starting, stale, restarting: it recovers by itself).
+   */
   stalled(): void {
     if (this.closed || !this.ready || !this.hooks.noPicture) return;
     const now = Date.now();
-    if (!this.lastFrameAt || now - this.lastFrameAt < STALL_WAKE_MS || now - this.wokeAt < 15_000) return;
-    void this.wakeForPicture(`no frame for ${Math.round((now - this.lastFrameAt) / 1000)} s`, false);
+    const s = this.src?.captureState();
+    if (s && s !== 'Live' && s !== 'Still') return;
+    const last = Math.max(this.lastFrameAt, now - (this.src?.sourceAgeMs(now) ?? Infinity));
+    if (!last || !Number.isFinite(last) || now - last < STALL_WAKE_MS || now - this.wokeAt < 15_000) return;
+    void this.wakeForPicture(`no new frame for ${Math.round((now - last) / 1000)} s`, false);
+  }
+
+  /** 2026-11-27: the client's picture froze (its "freeze" message, or rtc-key): labelled by cause for the stats. */
+  clientFreeze(ms: number | null, why?: string): void {
+    if (this.closed) return;
+    const e = this.freezes?.client(ms, why);
+    if (e) console.log(`[rtc ${this.udid.slice(-8)}] freeze (${e.cause}): ${e.detail}`);
+  }
+
+  /** The capture's state changed: the client hears it (control socket and "input-r"). */
+  private captureState(state: CaptureState, why: string | null): void {
+    if (this.closed) return;
+    const msg = { type: 'capture-state', udid: this.udid, state, reason: why };
+    this.signal(msg);
+    this.sendR(msg);
+  }
+
+  private sendR(msg: Record<string, unknown>): void {
+    try {
+      if (this.inputR?.isOpen()) this.inputR.sendMessage(JSON.stringify(msg));
+    } catch {
+      /* closed */
+    }
+  }
+
+  /**
+   * 2026-11-27, a getStats()-like report of this session: the link (class, round trip, jitter, the delay signal),
+   * the video (bitrate, frame rate, picture scale, playout delay), the capture (state, the picture's true age) and the
+   * freezes by cause (src, encoder, network, client; still screens apart).
+   */
+  getStats() {
+    const src = this.src;
+    const link = this.link;
+    const cls = link?.linkClass() ?? null;
+    return {
+      link: { class: cls?.name ?? (this.remote ? 'remote' : 'lan'), path: this.path, ...this.delay.stats(), floor_kbps: link ? Math.round(link.rc.floor / 1000) : null, cuts: link?.cuts ?? null, last: link?.last ? { why: link.last.why, loss: Math.round(link.last.loss * 1000) / 1000 } : null },
+      video: {
+        target_kbps: link ? Math.round(link.rc.bps / 1000) : null,
+        encoder_kbps: src ? Math.round(src.bitrateNow() / 1000) : null,
+        fps_target: src?.fpsNow() ?? null,
+        scale: src?.scaleNow() ?? null,
+        playout_delay_ms: this.playoutNow,
+        keys_asked: this.keysAsked,
+        repeats_sent: this.repeatsSent,
+        dropped: this.viewer?.dropped ?? 0,
+      },
+      capture: { state: src?.captureState() ?? 'Off', why: src?.stateWhy() ?? null, source_age_ms: src?.sourceAgeMs() ?? null },
+      freezes: this.freezes?.stats() ?? null,
+    };
   }
 
   // ---- the phone's sound ----
@@ -654,10 +739,11 @@ export class RtcSession {
     return { on: this.aOpen && !this.aReason, reason: this.aReason, sent: this.aSent };
   }
 
-  /** This session for `stats.sessions` (null until its video runs). */
-  info(): { profile: Profile; quality: QualityTier; net: string | null; fps: number; latencyMs: number | null; lane: 'lan' | 'remote' | 'thumb' | null; since: number; connectMs: number | null; keysAsked: number; audio: { on: boolean; reason: string | null; sent: number } | null } | null {
+  /** This session for `stats.sessions` (null until its video runs); 2026-11-27 with getStats()'s link, capture and freezes. */
+  info(): { profile: Profile; quality: QualityTier; net: string | null; fps: number; latencyMs: number | null; lane: 'lan' | 'remote' | 'thumb' | null; since: number; connectMs: number | null; keysAsked: number; audio: { on: boolean; reason: string | null; sent: number } | null } & Partial<ReturnType<RtcSession['getStats']>> | null {
     if (!this.viewer || this.closed) return null;
-    return { profile: this.remote ? 'remote' : 'lan', quality: this.tier, net: this.path, ...this.viewer.sessionStats(), since: this.since, connectMs: this.connectMs, keysAsked: this.keysAsked, audio: this.audioInfo() };
+    const g = this.getStats();
+    return { profile: this.remote ? 'remote' : 'lan', quality: this.tier, net: this.path, ...this.viewer.sessionStats(), since: this.since, connectMs: this.connectMs, keysAsked: this.keysAsked, audio: this.audioInfo(), link: g.link, capture: g.capture, freezes: g.freezes };
   }
 
   addIce(candidate: unknown, mid: unknown): void {
@@ -683,20 +769,31 @@ export class RtcSession {
       // not every node-datachannel build has Track.bufferedAmount; RTP over UDP doesn't queue much anyway
       buffered: () => (typeof self.track?.bufferedAmount === 'function' ? self.track.bufferedAmount() : 0) + (self.pace?.waiting() ?? 0),
       open: () => !self.closed && !!self.track?.isOpen(),
-      send: (r: Rec) => self.sendFrame(r),
+      send: (r: Rec, meta?: { primed?: boolean }) => self.sendFrame(r, !!meta?.primed),
       fail: (reason: string) => self.fail(reason),
       path: () => self.path,
       net: () => self.delay.stats(),
       // a far viewer: a few frames of pacer queue at most, like its WebSocket (H264Viewer.over)
       dropBytes: this.pace ? REMOTE_DROP_BYTES : undefined,
     };
-    this.viewer = new H264Viewer(transport, this.src);
-    // a far viewer starts low and climbs to its ask (its lane's frame rate follows the bitrate)
-    const ceiling = this.want?.bitrate ?? (this.src.ceiling || DEFAULT_CEILING_BPS);
-    this.rc = new RateControl(ceiling, this.remote ? Math.min(ceiling, REMOTE_START_BPS) : ceiling);
-    this.src.setTarget(this.viewer, this.rc.bps);
-    this.src.add(this.viewer);
+    const viewer = new H264Viewer(transport, this.src);
+    this.viewer = viewer;
+    const src = this.src;
+    // a far viewer starts low and climbs to its ask (its lane's frame rate and picture size follow the bitrate)
+    const ceiling = this.want?.bitrate ?? (src.ceiling || DEFAULT_CEILING_BPS);
+    this.link = new LinkControl({ ceiling, start: this.remote ? Math.min(ceiling, REMOTE_START_BPS) : ceiling, remote: this.remote, delay: this.delay });
+    this.freezes = new FreezeTracker(() => {
+      const c = src.counters();
+      return { state: c.state, srcFrames: c.srcFrames, devFrames: c.devFrames, dropped: viewer.dropped, loss: this.link?.last?.loss ?? 0 };
+    });
+    this.freezes.udid = this.udid;
+    src.setTarget(viewer, this.link.rc.bps);
+    src.add(viewer);
+    // attached: the viewer keeps the capture on from now (the connect hold goes)
+    this.unhold?.();
+    this.unhold = undefined;
     this.ccTimer = setInterval(() => this.ccTick(), 1000);
+    this.ccTimer.unref?.();
   }
 
   /** RTCP from the browser: keyframe asks (at most one per 500 ms: a lossy link sends many), loss and NACKs. */
@@ -710,7 +807,11 @@ export class RtcSession {
     this.delay.add(info.rttMs);
     if (info.wantsKey) this.key();
     this.nacked += info.nacked;
-    if (info.fractionLost !== null) this.reportLoss = Math.max(this.reportLoss ?? 0, info.fractionLost);
+    // 2026-11-27: the picture's own report block (not the sound's): its loss and its interarrival jitter (90 kHz)
+    const mine = info.blocks.filter((b) => b.ssrc === this.vSsrc);
+    const lost = mine.length ? Math.max(...mine.map((b) => b.fractionLost)) : info.fractionLost;
+    if (lost !== null) this.reportLoss = Math.max(this.reportLoss ?? 0, lost);
+    for (const b of mine) this.delay.addJitter(b.jitter / 90);
   }
 
   /**
@@ -729,39 +830,71 @@ export class RtcSession {
   }
 
   /**
-   * Once a second, like WebRTC's own (GCC), delay first: a queue building in front of the viewer (its round trip
-   * beyond the path's own, from the receiver reports) cuts the bitrate before any loss shows, since a router's buffer
-   * holds seconds of video before it drops anything (and the acks of taps wait in the same queue). Then loss: more than
-   * 10 % lost -> bitrate x (1 - loss/2). The bitrate climbs only while the queue is short and under 2 % is lost.
-   * (REMB isn't used: a browser's receive-side estimate starts low and ramps.)
+   * Once a second (src/congestion.ts LinkControl): loss first (more than 10 % lost -> bitrate x (1 - loss/2), a fresh
+   * keyframe over 20 %), then the jitter-aware delay signal (a queue building beyond 2x the measured jitter cuts before
+   * any loss shows: a router's buffer holds seconds of video, and the acks of taps wait in it too), else a climb while
+   * the link is clean (fast back to what it carried before a short congestion). (REMB isn't used: a browser's
+   * receive-side estimate starts low and ramps.) Also: a far viewer's playout delay, the freeze labels, and the
+   * picture's age while no frame flows.
    */
   private ccTick(): void {
-    if (!this.rc || !this.viewer || !this.src || this.closed) return;
-    const byNack = this.packets > 0 ? Math.min(1, this.nacked / this.packets) : 0;
-    const loss = Math.max(byNack, this.reportLoss ?? 0);
-    const sent = this.packets;
+    if (!this.link || !this.viewer || !this.src || this.closed) return;
+    const t = this.link.tick({ sent: this.packets, nacked: this.nacked, reportLoss: this.reportLoss });
     this.packets = this.nacked = 0;
     this.reportLoss = null;
-    const marks = this.remote ? DELAY_MARKS.remote : DELAY_MARKS.lan;
-    const queue = this.delay.queueMs();
-    let changed = false;
-    if (sent >= 10 && loss > 0.1) changed = this.rc.down(Math.max(0.5, 1 - loss / 2), null, 900);
-    else if (queue !== null && queue > marks.cut) changed = this.rc.down(queue > marks.hard ? 0.6 : 0.85, null, DELAY_HOLD_MS);
-    else if (loss < 0.02 && (queue === null || queue < marks.clear)) changed = this.rc.up();
-    if (changed) this.src.setTarget(this.viewer, this.rc.bps);
+    if (t.changed) this.src.setTarget(this.viewer, t.bps);
+    if (t.keyNow) this.viewer.forceKey(); // heavy loss: the keyframe now, not after the browser's PLI round trip
+    this.adaptPlayout();
+    this.freezes?.tick();
+    const now = Date.now();
+    if (now - this.lastAgeMsg >= 1000) this.ageMsg(null, now);
+  }
+
+  /** A far viewer's playout delay (its jitter buffer) follows the measured jitter; a near one keeps the browser's own. */
+  private adaptPlayout(): void {
+    if (this.playoutId === null || !this.rtp || !this.link) return;
+    const want = this.link.playout();
+    const same = (a: typeof want, b: typeof want) => (a === null && b === null) || (!!a && !!b && a.min === b.min && a.max === b.max);
+    if (same(want, this.playoutNow)) return;
+    // libdatachannel's playout-delay fields are in 10 ms steps; an id of 0 sends no extension
+    this.rtp.playoutDelayId = want ? this.playoutId : 0;
+    this.rtp.playoutDelayMin = want ? Math.round(want.min / 10) : 0;
+    this.rtp.playoutDelayMax = want ? Math.round(want.max / 10) : 0;
+    if (want) console.log(`[rtc ${this.udid.slice(-8)}] far link (jitter ${Math.round(this.delay.jitter())} ms): playout delay ${want.min}-${want.max} ms`);
+    this.playoutNow = want;
+  }
+
+  /**
+   * The picture's age on "input-r" (2026-11-27): `capture_time` is the picture's own capture time and `repeat` says
+   * it's an earlier picture sent again (a primed keyframe, a re-encode), so the client can show a picture's age instead
+   * of trusting it as live. With no frame (`rtp` null): the newest picture's age as the capture stands.
+   */
+  private ageMsg(frame: { rtp: number; time: number; repeat: boolean; key: boolean } | null, now: number): void {
+    if (!this.inputR?.isOpen()) return;
+    this.lastAgeMsg = now;
+    const state = this.src?.captureState() ?? 'Off';
+    const time = frame?.time ?? this.src?.sourceTime() ?? null;
+    this.sendR({
+      type: 'frame-age', rtp: frame?.rtp ?? null, capture_time: time, age_ms: time === null ? null : Math.max(0, Math.round(now - time)),
+      repeat: frame?.repeat ?? false, key: frame?.key ?? false, state,
+    });
   }
 
   /** One frame onto the track; a keyframe goes with the SPS and PPS as one access unit (keyUnit). */
-  private sendFrame(r: Rec): void {
+  private sendFrame(r: Rec, primed = false): void {
     if (!this.track || !this.rtp) return;
     if (r.kind === KIND.CONFIG) {
       this.config = r.payload;
       return;
     }
     const data = r.kind === KIND.KEY ? keyUnit(this.config, r.payload) : r.payload;
-    // the RTP clock follows the capture time; a cached (old) keyframe is stamped as just captured (RtpClock)
+    // the RTP clock follows the capture time; a cached (old) keyframe is stamped as just captured (RtpClock), and the
+    // client hears its true age on "input-r" (frame-age)
     const now = Date.now();
-    this.lastFrameAt = now;
+    const repeat = primed || !!r.repeat;
+    if (!repeat) this.lastFrameAt = now;
+    else this.repeatsSent++;
+    this.freezes?.sent();
     const { ts, stale } = this.clock.stamp(r.time, now);
     this.rtp.timestamp = (this.tsBase + ts) >>> 0;
     this.pace?.add(data.length, now);
@@ -776,8 +909,9 @@ export class RtcSession {
     if (this.connectMs === null && r.kind === KIND.KEY) {
       // the first picture left on the track: the offer -> this is how long the view took to open
       this.connectMs = Math.round(performance.now() - this.tOffer);
-      this.signal({ type: 'first-frame', udid: this.udid, transport: 'webrtc', connectMs: this.connectMs, warm: this.warm });
+      this.signal({ type: 'first-frame', udid: this.udid, transport: 'webrtc', connectMs: this.connectMs, warm: this.warm, repeat, capture_time: r.time, age_ms: Math.round(now - r.time) });
     }
+    if (r.kind === KIND.KEY || repeat || now - this.lastAgeMsg >= 1000) this.ageMsg({ rtp: this.rtp.timestamp, time: r.time, repeat, key: r.kind === KIND.KEY }, now);
     // about once a second: which RTP timestamp is which capture time (ms since the epoch, server clock),
     // so the client can measure glass-to-glass latency with the ping/pong clock offset
     if (!stale && now - this.lastTsMsg >= 1000 && this.inputR?.isOpen()) {
@@ -813,6 +947,8 @@ export class RtcSession {
         return reply({ type: 'ack', id: null, ok: false, error: 'message must be a JSON object' });
       }
       if (msg.type === 'ping') return reply({ type: 'pong', t: msg.t ?? null, server_time: Date.now() });
+      // 2026-11-27: the client's picture froze (it says how long when it knows): labelled by cause, no answer
+      if (msg.type === 'freeze') return this.clientFreeze(typeof msg.ms === 'number' && Number.isFinite(msg.ms) ? msg.ms : null);
       if (msg.type === 'touch' && msg.phase === 'move' && typeof msg.seq !== 'number') {
         // an older client's move on the unordered channel (no `seq` to order it by): one older than the newest is late
         const t = typeof msg.t === 'number' ? msg.t : null;
@@ -843,6 +979,9 @@ export class RtcSession {
     for (const t of this.wakeTimers) clearTimeout(t);
     this.wakeTimers = [];
     this.uninfo?.();
+    this.unstate?.();
+    this.unhold?.();
+    this.unhold = undefined;
     if (this.ccTimer) clearInterval(this.ccTimer);
     if (this.viewer) this.src?.remove(this.viewer);
     this.viewer = undefined;
@@ -897,6 +1036,7 @@ export function rtcSignaling(backend: Backend, control: Control, udid: string, s
           // given nothing for a while, the phone is woken (its screen went off: 2026-11-18)
           session?.key();
           session?.stalled();
+          session?.clientFreeze(null, 'the client asked for a keyframe (its picture stalled)');
           return true;
         case 'rtc-close':
           session?.close('closed by the client');
@@ -917,6 +1057,10 @@ export function rtcSignaling(backend: Backend, control: Control, udid: string, s
     /** The WebRTC picture's size now, or null without one. */
     frame() {
       return session?.frame() ?? null;
+    },
+    /** 2026-11-27: the session's getStats()-like report (link, video, capture, freezes by cause), or null without one. */
+    stats() {
+      return session?.getStats() ?? null;
     },
   };
 }

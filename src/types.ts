@@ -318,6 +318,11 @@ export interface Backend {
   uiSource?(udid: string): Promise<unknown>;
   /** The foreground app's bundle id; null when it can't tell. */
   activeApp?(udid: string): Promise<string | null>;
+  /**
+   * 2026-11-27: the app in front as last known without asking the phone (a read, our own launch or Home), with when
+   * (Date.now()); null when nothing is known. The look budget keys on it (a video app's reads are budgeted).
+   */
+  knownApp?(udid: string): { bundleId: string | null; at: number } | null;
   /** The phone's apps (installed ones when they can be listed, plus the well-known ones). */
   apps?(udid: string): Promise<AppInfo[]>;
   /** Press a hardware button. */
@@ -366,5 +371,24 @@ export interface Backend {
   audio?(udid: string): import('./audio.js').AudioFeed | string;
   /** 2026-11-24: files onto a phone (src/files.ts drives it); none on a backend that can't. */
   files?: import('./phonefiles.js').PhoneFiles;
+  // ---- 2026-11-27 (docs/root-cause.md 13): the state machines, as the server says them ----
+  /** The phone's state as the clients name it (ready, busy, hung, restarting, needs-replug, down). */
+  phoneState?(udid: string): PhoneState;
+  /** What of ours is on the phone now (oldest first): the request, since when (ms since the epoch), the Mac stopped waiting. */
+  onPhone?(udid: string): { op: string; since: number; held: boolean }[];
+  /** The phone's capture as it is (Live, Still, Stale, WaitingUnlock...), why, and its newest picture's true age; null: none runs. */
+  captureState?(udid: string): { state: string; why: string | null; pictureAgeMs: number | null } | null;
+  /** Keeps the phone's capture running (a client's open, an agent's work) until the release; null when it can't run. */
+  holdPicture?(udid: string, reason: string): (() => void) | null;
+  /** The owner's setting: whether the agent's looks may use the capture (the server wires it to its settings). */
+  setAgentSeesCapture?(fn: () => boolean): void;
+  /**
+   * The API layer's close (an update, a signal): its own parts end, the device layer (WDA runners, forwards) stays up
+   * for the next server process. `stop()`: everything ends (a real stop).
+   */
   close(): Promise<void>;
+  stop?(): Promise<void>;
 }
+
+/** 2026-11-27: a phone's state as the clients name it (GET /phones `state`, the control socket's `control` messages). */
+export type PhoneState = 'ready' | 'busy' | 'hung' | 'restarting' | 'needs-replug' | 'down';

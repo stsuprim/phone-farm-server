@@ -1,6 +1,7 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
+import { systemTurn } from './lifecycle.js';
 import { classifyBuildError, exclusive } from './resign.js';
 
 /**
@@ -28,6 +29,9 @@ export interface ForkMeta {
   upstream: string;
   enabled?: boolean;
   liveTouch?: 'auto' | 'segmented' | 'off';
+  /** v7 experiments, thrown from afar like the switches above (absent: off; .env's WDA_* wins, src/index.ts). */
+  appHitTest?: boolean;
+  offMainGesture?: boolean;
 }
 
 export function readForkMeta(root: string): ForkMeta | null {
@@ -38,6 +42,8 @@ export function readForkMeta(root: string): ForkMeta | null {
     return {
       version, upstream: typeof j.upstream === 'string' ? j.upstream : 'unknown',
       enabled: j.enabled !== false, liveTouch: j.liveTouch === 'off' || j.liveTouch === 'segmented' ? j.liveTouch : 'auto',
+      ...(typeof j.appHitTest === 'boolean' ? { appHitTest: j.appHitTest } : {}),
+      ...(typeof j.offMainGesture === 'boolean' ? { offMainGesture: j.offMainGesture } : {}),
     };
   } catch {
     return null;
@@ -144,12 +150,102 @@ export function usableLiveMode(found: number, setting: 'auto' | 'segmented' | 'o
   return found;
 }
 
-export const FORK_ROUTES = { info: '/lotus/info', gesture: '/lotus/gesture', touch: '/lotus/touch', shot: '/lotus/shot', selftest: '/lotus/selftest', field: '/lotus/field', keys: '/lotus/keys' } as const;
+export const FORK_ROUTES = {
+  info: '/lotus/info', gesture: '/lotus/gesture', touch: '/lotus/touch', shot: '/lotus/shot', selftest: '/lotus/selftest', field: '/lotus/field', keys: '/lotus/keys',
+  beat: '/lotus/beat', gestureOffMain: '/lotus/gesture/offmain',
+} as const;
 
 /** The first version of our build with POST /lotus/field (read and clear the focused field, 2026-11-18). */
 export const FIELD_FORK_VERSION = 4;
 /** The first version of our build with keys and shortcuts: POST /lotus/keys, and WDA's own keyboardInput served (2026-11-24). */
 export const KEYS_FORK_VERSION = 5;
+/**
+ * The first version with the main-queue heartbeat (2026-11-27, docs/root-cause.md 13.4): GET /lotus/beat, /lotus/shot's
+ * own timing, /wda/activeAppInfo without the accessibility hit test, and the guarded /lotus/gesture/offmain.
+ */
+export const BEAT_FORK_VERSION = 7;
+
+/** v7's experiments, each off unless asked for (the runner reads them from its launch environment). */
+export interface ForkExperiments {
+  /** Upstream's accessibility hit test in /wda/activeAppInfo (it hung the main queue in TikTok, e8e390e). */
+  appHitTest?: boolean;
+  /** POST /lotus/gesture/offmain: a gesture played from a private serial queue instead of the main queue. */
+  offMainGesture?: boolean;
+}
+/** The launch environment's names (xcodebuild passes TEST_RUNNER_<NAME> on to the runner as <NAME>). */
+export const EXPERIMENT_ENV = { appHitTest: 'LOTUS_APP_HIT_TEST', offMainGesture: 'LOTUS_OFFMAIN_GESTURE' } as const;
+
+/** xcodebuild's extra environment for the experiments that are on (none at all by default). */
+export function forkExperimentEnv(x: ForkExperiments | undefined): Record<string, string> {
+  const env: Record<string, string> = {};
+  if (x?.appHitTest) env[`TEST_RUNNER_${EXPERIMENT_ENV.appHitTest}`] = '1';
+  if (x?.offMainGesture) env[`TEST_RUNNER_${EXPERIMENT_ENV.offMainGesture}`] = '1';
+  return env;
+}
+
+/** What the build says it can do (GET /lotus/beat and /lotus/info, v7). */
+export interface ForkCapabilities {
+  beat: boolean;
+  shotTiming: boolean;
+  /** activeAppInfo still runs the accessibility hit test (the experiment is on). */
+  appHitTest: boolean;
+  /** /lotus/gesture/offmain is served (the experiment is on). */
+  offMainGesture: boolean;
+}
+
+/** GET /lotus/beat?wait=ms: how long a no-op took to run on the runner's main queue. */
+export interface BeatAnswer {
+  version: number;
+  /** The no-op ran within the wait. */
+  main: boolean;
+  /** Its time on the main queue (ms), when it ran. */
+  mainMs: number | null;
+  /** How long the route waited (ms). */
+  waitedMs: number;
+  /** Not run yet: how long our earlier no-op has been waiting on the main queue (ms). */
+  pendingMs: number | null;
+  capabilities: ForkCapabilities;
+}
+
+const num = (v: unknown): number | null => (typeof v === 'number' && Number.isFinite(v) ? v : null);
+
+/** Reads a capabilities object (an older build has none: every field false). */
+export function readCapabilities(v: unknown): ForkCapabilities {
+  const c = (v && typeof v === 'object' ? v : {}) as Record<string, unknown>;
+  return { beat: c.beat === true, shotTiming: c.shotTiming === true, appHitTest: c.appHitTest === true, offMainGesture: c.offMainGesture === true };
+}
+
+/** A /lotus/beat answer made sure of, or null when it isn't one (a stock WebDriverAgent, an older build). */
+export function readBeat(v: unknown): BeatAnswer | null {
+  const b = (v && typeof v === 'object' ? v : null) as Record<string, unknown> | null;
+  const version = num(b?.lotus);
+  if (!b || version === null || typeof b.main !== 'boolean') return null;
+  const mainMs = num(b.mainMs);
+  return {
+    version, main: b.main, mainMs: b.main && mainMs !== null ? Math.max(0, mainMs) : null,
+    waitedMs: Math.max(0, num(b.waitedMs) ?? 0), pendingMs: b.main ? null : num(b.pendingMs),
+    capabilities: readCapabilities(b.capabilities),
+  };
+}
+
+/** /lotus/shot's own timing (v7): the whole route, the screenshot call through testmanagerd, and the main queue meanwhile. */
+export interface ShotTiming {
+  ms: number;
+  takeMs: number;
+  /** The screenshot call took over 250 ms: testmanagerd made it wait (behind an accessibility read, most likely). */
+  waited: boolean;
+  /** A no-op sent to the main queue as the shot began hadn't run when it ended. */
+  mainBusy: boolean;
+}
+
+/** The timing fields of a /lotus/shot answer, or null (an older build). */
+export function readShotTiming(v: unknown): ShotTiming | null {
+  const s = (v && typeof v === 'object' ? v : null) as Record<string, unknown> | null;
+  const ms = num(s?.ms);
+  const takeMs = num(s?.takeMs);
+  if (!s || ms === null || takeMs === null) return null;
+  return { ms, takeMs, waited: s.waited === true, mainBusy: s.mainBusy === true };
+}
 
 /** What our build needs to be launched on one phone. */
 export interface ForkLaunch {
@@ -159,6 +255,8 @@ export interface ForkLaunch {
   /** The port it listens on, on the phone and (forwarded) on the Mac. */
   port: number;
   token: string;
+  /** v7's experiments that are on (2026-11-27): none by default. */
+  experiments?: ForkExperiments;
 }
 
 /** How one phone's WebDriverAgent is launched: what xcodebuild runs, with which environment, and what is forwarded. */
@@ -201,7 +299,7 @@ export function launchPlan(
     return {
       flavor: 'fork', project: fork.project, derivedData: fork.derivedData,
       wda: { local: fork.port, device: fork.port }, mjpeg: null,
-      env: { TEST_RUNNER_USE_PORT: String(fork.port), [`TEST_RUNNER_${TOKEN_ENV}`]: fork.token },
+      env: { TEST_RUNNER_USE_PORT: String(fork.port), [`TEST_RUNNER_${TOKEN_ENV}`]: fork.token, ...forkExperimentEnv(fork.experiments) },
       args: args(fork.project, fork.derivedData),
     };
   }
@@ -373,8 +471,14 @@ export interface ForkOptions {
   prepare?: (udid: string) => Promise<unknown>;
   /** Our build was signed for the phone just now (the 6-day re-sign counts from here). */
   signed?: (udid: string) => void;
-  /** Someone is using the phone now (a viewer, a recent action): a self-test that's only being tried again waits. */
+  /**
+   * Someone is using the phone now (its lease isn't Free). 2026-11-27: an install, a re-try and a self-test are
+   * system:<op> work (docs/root-cause.md 13.3c): they wait for a Free lease (looked at again on the next check), one
+   * phone at a time; only a self-test the owner asks for goes at once.
+   */
   busy?: (udid: string) => boolean;
+  /** v7's experiments, given to our build at its launch. */
+  experiments?: ForkExperiments;
   /** Why nothing can be built at all (no team id, not macOS), or null. */
   problem?: () => string | null;
   now?: () => number;
@@ -495,7 +599,11 @@ export class ForkInstaller {
 
   /** What our build needs to be launched on `udid` (its token and port). */
   launch(udid: string): ForkLaunch {
-    return { project: this.o.project, derivedData: this.o.derivedData, port: this.o.port(udid), token: this.o.tokens.get(udid) };
+    const x = this.o.experiments;
+    return {
+      project: this.o.project, derivedData: this.o.derivedData, port: this.o.port(udid), token: this.o.tokens.get(udid),
+      ...(x && (x.appHitTest || x.offMainGesture) ? { experiments: { ...x } } : {}),
+    };
   }
 
   /** How the phone's WebDriverAgent starts when the server does: ours when it was installed and ran, else stock. */
@@ -556,9 +664,29 @@ export class ForkInstaller {
       return;
     }
     for (const udid of ids) {
-      if (this.due(udid)) await this.install(udid);
+      if (this.due(udid)) await this.systemWork('fork-install', udid, () => this.install(udid));
       else await this.liveRetry(udid);
     }
+  }
+
+  /** Phones whose system work waits for their lease (said once in the log until it runs). */
+  private held = new Set<string>();
+
+  /**
+   * system:<op> on one phone (src/lifecycle.ts systemTurn): only while its lease is Free (`busy` says no and the
+   * actor's leases agree); otherwise it's left for the next check. Never pre-empts anyone.
+   */
+  private async systemWork(op: string, udid: string, fn: () => Promise<unknown>): Promise<boolean> {
+    const r = this.o.busy?.(udid) ? { ran: false as const, why: 'the phone is in use' } : await systemTurn(op, udid, fn);
+    if (r.ran) {
+      this.held.delete(udid);
+      return true;
+    }
+    if (!this.held.has(udid)) {
+      this.held.add(udid);
+      this.log(`${udid.slice(-8)}: system:${op} waits: ${r.why}`);
+    }
+    return false;
   }
 
   private fail(udid: string, state: 'waiting' | 'rolled-back', reason: string): void {
@@ -716,8 +844,7 @@ export class ForkInstaller {
     const l = d.live;
     if (l && (l.tested || l.tries >= LIVE_TRIES || this.now() - l.at < LIVE_RETRY_MS)) return;
     // the self-test takes the screen for a few seconds and ends on the Home Screen: not under someone's hands
-    if (this.o.busy?.(udid)) return;
-    await this.liveTest(udid, 'retry');
+    await this.systemWork('selftest', udid, () => this.liveTest(udid, 'retry'));
   }
 
   status(): ForkStatus {

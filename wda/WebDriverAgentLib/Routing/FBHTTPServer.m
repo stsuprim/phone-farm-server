@@ -74,7 +74,7 @@ static BOOL LotusRouteAllowed(NSString *path)
       @"|(?:/session/[^/]+)?/wda/(?:screen|activeAppInfo|device/info|batteryInfo|pressButton|homescreen|keys"
       @"|lock|unlock|locked|tap|apps/launch|apps/activate|apps/terminate|apps/state|apps/list)"
       @"|/session/[^/]+/wda/element/0/keyboardInput"
-      @"|/lotus/(?:info|gesture|touch|shot|selftest|field|keys)"
+      @"|/lotus/(?:info|gesture|touch|shot|selftest|field|keys|beat|gesture/offmain)"
       @"|/lotus/files/(?:can|ask|begin|put|land|dir|drop)"
       @")/?$";
     allowed = [NSRegularExpression regularExpressionWithPattern:pattern

@@ -38,7 +38,11 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
   assert.equal(msg[0], 2);
   assert.equal(msg.readDoubleBE(1), 1234.5);
   assert.deepEqual([...msg.subarray(9)], [9, 8]);
-  assert.throws(() => new RecordParser(() => {}).push(Buffer.from([9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0])));
+  assert.throws(() => new RecordParser(() => {}).push(Buffer.from([11, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0])));
+  // 2026-11-27: 9 and 10 are an earlier picture encoded again: handed on as a key / delta with `repeat` and their own time
+  const reps: Rec[] = [];
+  new RecordParser((r) => reps.push(r)).push(Buffer.concat([encodeRecord(KIND.KEY_REPEAT, 1000, Buffer.from([1])), encodeRecord(KIND.DELTA_REPEAT, 1001, Buffer.from([2])), encodeRecord(KIND.KEY, 1002, Buffer.from([3]))]));
+  assert.deepEqual(reps.map((r) => [r.kind, r.time, !!r.repeat]), [[KIND.KEY, 1000, true], [KIND.DELTA, 1001, true], [KIND.KEY, 1002, false]]);
   ok('helper framing round-trips in any chunking; WS message = kind + float64 BE time + payload');
 }
 

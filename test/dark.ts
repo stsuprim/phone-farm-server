@@ -78,10 +78,12 @@ const until = async (cond: () => boolean | Promise<boolean>, ms = 3000) => {
 
 // ---- waking: WDA's unlock for a phone that says locked, Home presses for one that's only dark ----
 {
-  const run = async (o: { locked: boolean | null; dark: (boolean | null)[]; unlockFails?: boolean }) => {
+  const run = async (o: { locked: boolean | null; dark: (boolean | null)[]; unlockFails?: boolean; explicit?: boolean; force?: boolean }) => {
     const calls: string[] = [];
     const dark = [...o.dark];
     const ops: WakeOps = {
+      explicit: o.explicit,
+      force: o.force,
       locked: async () => o.locked,
       unlock: async () => {
         calls.push('unlock');
@@ -108,8 +110,15 @@ const until = async (cond: () => boolean | Promise<boolean>, ms = 3000) => {
   assert.deepEqual(await run({ locked: true, dark: [false] }), { calls: ['unlock', 'look'], error: '' });
   // it says locked and WDA's unlock fails: that's the error
   assert.equal((await run({ locked: true, dark: [false], unlockFails: true })).error, 'WDA said no');
-  // WDA doesn't say and its unlock fails: the screen still decides
-  assert.deepEqual(await run({ locked: null, dark: [true, false], unlockFails: true }), { calls: ['unlock', 'look', 'home', 'home', 'look'], error: '' });
+  // WDA doesn't say: an automatic wake doesn't unlock on that (2026-11-27), the screen decides
+  assert.deepEqual(await run({ locked: null, dark: [true, false] }), { calls: ['look', 'home', 'home', 'look'], error: '' });
+  // the owner's explicit wake: WDA's unlock goes (it checks the lock itself); it fails: the screen still decides
+  assert.deepEqual(await run({ locked: null, dark: [true, false], unlockFails: true, explicit: true }), { calls: ['unlock', 'look', 'home', 'home', 'look'], error: '' });
+  // 2026-11-27 (docs/root-cause.md section 6): a live view without a picture (`force`) on a busy WDA (no look): no Home
+  assert.deepEqual(await run({ locked: null, dark: [null], force: true }), { calls: ['look'], error: '' });
+  assert.deepEqual(await run({ locked: false, dark: [null], force: true, explicit: true }), { calls: ['look'], error: '' });
+  // a look that fails after the first round: no second round on a screen that couldn't be looked at
+  assert.deepEqual(await run({ locked: false, dark: [true, null] }), { calls: ['look', 'home', 'home', 'look'], error: '' });
   // it stays dark: two rounds, then it says so
   const stuck = await run({ locked: false, dark: [true] });
   assert.deepEqual(stuck.calls, ['look', 'home', 'home', 'look', 'home', 'home', 'look']);
@@ -181,7 +190,11 @@ const until = async (cond: () => boolean | Promise<boolean>, ms = 3000) => {
   try {
     const health = (await (await fetch(`http://${host}/health`)).json()) as Record<string, unknown>;
     const { uptimeS, rssMb, ...rest } = health;
-    assert.deepEqual(rest, { ok: true, mock: true, commit: 'abc1234', startedAt: '2026-11-16T00:00:00.000Z' }, 'public, with the build');
+    // 2026-11-27: also the build and our WebDriverAgent's version, said together (additive)
+    assert.deepEqual(rest, {
+      ok: true, mock: true, commit: 'abc1234', startedAt: '2026-11-16T00:00:00.000Z',
+      build: { commit: 'abc1234', startedAt: '2026-11-16T00:00:00.000Z' }, forkVersion: null,
+    }, 'public, with the build');
     assert.ok(typeof uptimeS === 'number' && uptimeS >= 0 && typeof rssMb === 'number' && rssMb > 0, 'and its uptime and memory');
     const [a, b2, c] = ((await (await fetch(`http://${host}/phones`, { headers: auth })).json()) as any[]).map((p) => p.udid as string);
 

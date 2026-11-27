@@ -4,10 +4,11 @@ import { frameAgrees, Orientation } from './orient.js';
 import { Image, ImageFormat } from './types.js';
 
 /**
- * Stills (2026-11-16): what the Phones agent, Lotus's phone tools and the server's own checks look at. Every one is
- * WebDriverAgent's own single screenshot of the screen, never a frame of the phone's USB screen capture (the live
- * view's H.264): a still never starts that capture, never keeps it running and never waits on it, because iOS tells
- * apps while it runs (UIScreen.isCaptured). Nothing here knows the capture at all.
+ * WebDriverAgent's stills (2026-11-16): WDA's own single screenshot of the screen. 2026-11-27 (docs/root-cause.md
+ * G5): only what the agent, Lotus's phone tools and the server's own checks fall back to when the phone's USB screen
+ * capture doesn't run (or the owner's `agentSeesCapture` keeps the agent from it): src/real.ts then asks for them as
+ * looks of the phone's actor, single-flight, coalesced and budgeted (src/phone/look.ts). Nothing here knows the
+ * capture.
  *
  * Two ways WDA gives a still: its PNG screenshot (GET /screenshot, always there), and, on a stock WDA, a frame of its
  * own MJPEG server (WDA's screenshots as JPEG, quicker and smaller). A WDA without the MJPEG server (our fork) gives

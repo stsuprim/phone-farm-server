@@ -24,6 +24,17 @@
  *                         order with no lookup of the app in front. v5 also serves WDA's own
  *                         /wda/element/0/keyboardInput (the server's first choice for shortcuts).
  *   /lotus/files/...      v6 (2026-11-24): files from the PC into Photos and Files (FBLotusFiles.inc)
+ *   GET  /lotus/beat      v7 (2026-11-27): the main queue's heartbeat, ?wait=50-30000 ms (5000) -> {main, mainMs |
+ *                         pendingMs, waitedMs, capabilities}. Off the main queue itself: it sends a no-op there and
+ *                         times it, so "busy", "main queue hung" and "process gone" can be told apart.
+ *   GET  /lotus/shot      v7: also {ms, takeMs, waited, mainBusy}: its own time, the screenshot call's (testmanagerd),
+ *                         whether that took over 250 ms, and whether the main queue stayed busy all the while.
+ *   POST /lotus/gesture/offmain?n=<unique>
+ *                         v7 EXPERIMENT, off unless the runner was launched with LOTUS_OFFMAIN_GESTURE=1: the body of
+ *                         /lotus/gesture played from a private serial queue instead of the main queue, answered once
+ *                         XCTest says it played (or not) -> {completed, played, ms, error}. `n` must differ per request
+ *                         (the HTTP layer shares one answer among identical requests in flight).
+ *   /wda/activeAppInfo    v7: no accessibility hit test unless LOTUS_APP_HIT_TEST=1 (FBCustomCommands.m)
  *
  * Coordinates are points of the screen as the record's orientation says (the Mac's server sends portrait points
  * with "orientation": 1, turning a landscape touch onto the panel itself).
@@ -66,7 +77,7 @@
 #pragma clang diagnostic ignored "-Weverything"
 
 /** The version of our changes. The Mac's server installs this build on a phone whose build says another number. */
-static const NSInteger LotusForkVersion = 6;
+static const NSInteger LotusForkVersion = 7;
 static NSString *const LotusUpstreamTag = @"v16.15.3";
 
 /** How long one step of a live move takes on the phone (seconds): about a frame. */
@@ -96,6 +107,16 @@ static CGPoint LotusLiveQueuedPoint;
 static CFAbsoluteTime LotusLiveHeardAt = 0;
 static NSString *LotusLiveError;
 static BOOL LotusLiveWatching = NO;
+
+// ---- v7: the main queue's heartbeat (touched under @synchronized(FBLotusCommands.class), from any queue) ----
+
+/** A no-op of ours waiting on the main queue since then (0: none waiting). */
+static CFAbsoluteTime LotusBeatQueuedAt = 0;
+/** How many of them have run, and the last one's time on the main queue (ms). */
+static NSUInteger LotusBeatRuns = 0;
+static double LotusBeatLastMs = 0;
+/** v7 experiment: the private serial queue /lotus/gesture/offmain plays from. */
+static dispatch_queue_t LotusOffMainQueue;
 
 /** Records every touch our own window gets during the self-test: B began, M moved, E ended, C cancelled. */
 @interface LotusProbeView : UIView
@@ -159,6 +180,8 @@ static BOOL LotusLiveWatching = NO;
     [[FBRoute POST:@"/lotus/selftest"].withoutSession respondWithTarget:self action:@selector(handleLotusSelfTest:)],
     [[FBRoute POST:@"/lotus/field"].withoutSession respondWithTarget:self action:@selector(handleLotusField:)],
     [[FBRoute POST:@"/lotus/keys"].withoutSession respondWithTarget:self action:@selector(handleLotusKeys:)],
+    [[FBRoute GET:@"/lotus/beat"].withoutSession.standalone respondWithTarget:self action:@selector(handleLotusBeat:)],
+    [[FBRoute POST:@"/lotus/gesture/offmain"].withoutSession.standalone respondWithTarget:self action:@selector(handleLotusGestureOffMain:)],
   ];
 }
 
@@ -195,6 +218,24 @@ static BOOL LotusLiveWatching = NO;
 + (id<FBResponsePayload>)lotus_invalid:(NSString *)message
 {
   return FBResponseWithStatus([FBCommandStatus invalidArgumentErrorWithMessage:message traceback:nil]);
+}
+
+/** v7: a switch from the launch environment ("1" or "true" is on; anything else, or none, is off). */
++ (BOOL)lotus_flag:(NSString *)name
+{
+  NSString *value = NSProcessInfo.processInfo.environment[name];
+  return [value isEqualToString:@"1"] || [value.lowercaseString isEqualToString:@"true"];
+}
+
+/** v7: what this build can do, so the Mac's server can tell (in /lotus/beat and /lotus/info). */
++ (NSDictionary *)lotus_capabilities
+{
+  return @{
+    @"beat": @YES,
+    @"shotTiming": @YES,
+    @"appHitTest": @([self lotus_flag:@"LOTUS_APP_HIT_TEST"]),
+    @"offMainGesture": @([self lotus_flag:@"LOTUS_OFFMAIN_GESTURE"]),
+  };
 }
 
 /** Lets the main run loop turn for `seconds` (touches reach our window, XCTest's answers come in). */
@@ -290,42 +331,13 @@ static BOOL LotusLiveWatching = NO;
  */
 + (id<FBResponsePayload>)handleLotusGesture:(FBRouteRequest *)request
 {
-  id pointsArg = request.arguments[@"points"];
-  NSArray *points = [pointsArg isKindOfClass:NSArray.class] ? (NSArray *)pointsArg : nil;
-  if (nil == points || points.count < 1 || points.count > 5000) {
-    return [self lotus_invalid:@"'points' must be [[x, y, ms], ...] (1 to 5000)"];
+  NSString *why = nil;
+  XCSynthesizedEventRecord *record = [self lotus_gestureRecord:request.arguments why:&why];
+  if (nil == record) {
+    return [self lotus_invalid:why];
   }
-  long long orientation = [self lotus_orientation:request.arguments[@"orientation"]];
-  XCPointerEventPath *path = nil;
-  double offset = 0;
-  for (id item in points) {
-    NSArray *p = [item isKindOfClass:NSArray.class] ? (NSArray *)item : nil;
-    if (nil == p || p.count < 2 || ![p[0] isKindOfClass:NSNumber.class] || ![p[1] isKindOfClass:NSNumber.class]) {
-      return [self lotus_invalid:@"each point must be [x, y, ms] (numbers)"];
-    }
-    CGPoint point = CGPointMake(((NSNumber *)p[0]).doubleValue, ((NSNumber *)p[1]).doubleValue);
-    if (p.count > 2 && [p[2] isKindOfClass:NSNumber.class]) {
-      double at = ((NSNumber *)p[2]).doubleValue / 1000.0;
-      if (at > offset) {
-        offset = at;
-      }
-    }
-    if (nil == path) {
-      path = [[XCPointerEventPath alloc] initForTouchAtPoint:point offset:offset];
-    } else {
-      [path moveToPoint:point atOffset:offset];
-    }
-  }
-  double hold = [self lotus_number:request.arguments[@"hold"] fallback:0 low:0 high:60000] / 1000.0;
-  if (points.count == 1 && hold <= 0.0) {
-    hold = 0.05;
-  }
-  [path liftUpAtOffset:offset + hold];
   // v3: a pause after this gesture before the next record (live mode 5); 0, the default, is v2's behaviour
   double gap = [self lotus_number:request.arguments[@"gap"] fallback:0 low:0 high:500] / 1000.0;
-  XCSynthesizedEventRecord *record = [[XCSynthesizedEventRecord alloc] initWithName:@"Lotus gesture"
-                                                               interfaceOrientation:orientation];
-  [record addPointerEventPath:path];
   if (nil == LotusGestureQueue) {
     LotusGestureQueue = [NSMutableArray array];
   }
@@ -341,6 +353,117 @@ static BOOL LotusLiveWatching = NO;
   NSUInteger waiting = LotusGestureQueue.count + LotusLiveOps.count + (LotusSynthBusy ? (NSUInteger)1 : (NSUInteger)0);
   [self lotus_pump];
   return FBResponseWithObject(@{@"queued": @(waiting), @"lotus": @(LotusForkVersion)});
+}
+
+/**
+ v7: the record of one whole gesture from a request's arguments ({"points", "hold", "orientation"}), built as
+ /lotus/gesture always has; nil with `why` when they aren't valid. Touches no state: any queue may call it.
+ */
++ (XCSynthesizedEventRecord *)lotus_gestureRecord:(NSDictionary *)arguments why:(NSString **)why
+{
+  id pointsArg = arguments[@"points"];
+  NSArray *points = [pointsArg isKindOfClass:NSArray.class] ? (NSArray *)pointsArg : nil;
+  if (nil == points || points.count < 1 || points.count > 5000) {
+    *why = @"'points' must be [[x, y, ms], ...] (1 to 5000)";
+    return nil;
+  }
+  long long orientation = [self lotus_orientation:arguments[@"orientation"]];
+  XCPointerEventPath *path = nil;
+  double offset = 0;
+  for (id item in points) {
+    NSArray *p = [item isKindOfClass:NSArray.class] ? (NSArray *)item : nil;
+    if (nil == p || p.count < 2 || ![p[0] isKindOfClass:NSNumber.class] || ![p[1] isKindOfClass:NSNumber.class]) {
+      *why = @"each point must be [x, y, ms] (numbers)";
+      return nil;
+    }
+    CGPoint point = CGPointMake(((NSNumber *)p[0]).doubleValue, ((NSNumber *)p[1]).doubleValue);
+    if (p.count > 2 && [p[2] isKindOfClass:NSNumber.class]) {
+      double at = ((NSNumber *)p[2]).doubleValue / 1000.0;
+      if (at > offset) {
+        offset = at;
+      }
+    }
+    if (nil == path) {
+      path = [[XCPointerEventPath alloc] initForTouchAtPoint:point offset:offset];
+    } else {
+      [path moveToPoint:point atOffset:offset];
+    }
+  }
+  double hold = [self lotus_number:arguments[@"hold"] fallback:0 low:0 high:60000] / 1000.0;
+  if (points.count == 1 && hold <= 0.0) {
+    hold = 0.05;
+  }
+  [path liftUpAtOffset:offset + hold];
+  XCSynthesizedEventRecord *record = [[XCSynthesizedEventRecord alloc] initWithName:@"Lotus gesture"
+                                                               interfaceOrientation:orientation];
+  [record addPointerEventPath:path];
+  return record;
+}
+
+/**
+ POST /lotus/gesture/offmain?n=<unique> (v7 EXPERIMENT, docs/root-cause.md 13.4 item 2): the same gesture as
+ /lotus/gesture, given to XCTest from a private serial queue instead of the main queue, so it never waits behind a
+ stuck read there. Whether XCTest allows that is what the experiment finds out: the answer says whether XCTest called
+ back (`completed`), whether it played (`played`), and how long it took. Off unless the runner was launched with
+ LOTUS_OFFMAIN_GESTURE=1. Never mixed with /lotus/gesture's queue: the Mac's server uses one or the other.
+ */
++ (id<FBResponsePayload>)handleLotusGestureOffMain:(FBRouteRequest *)request
+{
+  if (![self lotus_flag:@"LOTUS_OFFMAIN_GESTURE"]) {
+    return FBResponseWithStatus([FBCommandStatus unsupportedOperationErrorWithMessage:@"The off-main gesture experiment is off (LOTUS_OFFMAIN_GESTURE)"
+                                                                            traceback:nil]);
+  }
+  // identical standalone requests in flight share one answer (FBHTTPServer): each gesture names itself
+  id n = request.parameters[@"n"];
+  if (![n isKindOfClass:NSString.class] || ((NSString *)n).length == 0) {
+    return [self lotus_invalid:@"'n' (a number that differs per request) must be in the query"];
+  }
+  NSString *why = nil;
+  XCSynthesizedEventRecord *record = [self lotus_gestureRecord:request.arguments why:&why];
+  if (nil == record) {
+    return [self lotus_invalid:why];
+  }
+  static dispatch_once_t onceToken;
+  dispatch_once(&onceToken, ^{
+    LotusOffMainQueue = dispatch_queue_create("lotus.gesture.offmain", DISPATCH_QUEUE_SERIAL);
+  });
+  CFAbsoluteTime start = CFAbsoluteTimeGetCurrent();
+  double timeout = record.maximumOffset + 10.0;
+  __block BOOL completed = NO;
+  __block BOOL played = NO;
+  __block NSString *failure = nil;
+  dispatch_sync(LotusOffMainQueue, ^{
+    dispatch_semaphore_t done = dispatch_semaphore_create(0);
+    __block BOOL answered = NO;
+    __block BOOL succeeded = NO;
+    __block NSString *said = nil;
+    [[XCUIDevice.sharedDevice eventSynthesizer] synthesizeEvent:record completion:(id)^(BOOL result, NSError *invokeError) {
+      @synchronized (FBLotusCommands.class) {
+        answered = YES;
+        succeeded = result && nil == invokeError;
+        said = invokeError.localizedDescription;
+      }
+      dispatch_semaphore_signal(done);
+    }];
+    dispatch_semaphore_wait(done, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(timeout * (double)NSEC_PER_SEC)));
+    @synchronized (FBLotusCommands.class) {
+      completed = answered;
+      played = answered && succeeded;
+      failure = said;
+    }
+  });
+  NSMutableDictionary *answer = [NSMutableDictionary dictionary];
+  answer[@"lotus"] = @(LotusForkVersion);
+  answer[@"queue"] = @"offmain";
+  answer[@"completed"] = @(completed);
+  answer[@"played"] = @(played);
+  answer[@"ms"] = @((long long)((CFAbsoluteTimeGetCurrent() - start) * 1000.0));
+  if (nil != failure) {
+    answer[@"error"] = failure;
+  } else if (!completed) {
+    answer[@"error"] = @"XCTest did not call back in time";
+  }
+  return FBResponseWithObject(answer);
 }
 
 #pragma mark - Live touch
@@ -808,7 +931,67 @@ static BOOL LotusLiveWatching = NO;
     @"mjpeg": @NO,
     @"built": [NSString stringWithFormat:@"%s %s", __DATE__, __TIME__],
     @"touchDown": @(LotusLiveQueuedDown),
+    @"capabilities": [self lotus_capabilities],
   });
+}
+
+/**
+ GET /lotus/beat?wait=50-30000 (v7): the main queue's heartbeat. This route runs off the main queue; it sends a no-op
+ there and waits for it at most `wait` ms (5000 by default). `main` says whether it ran, `mainMs` how long it waited on
+ the main queue to run; when it hasn't, `pendingMs` says how long it has been waiting so far. At most one no-op of ours
+ waits there at a time: a beat while one is still waiting waits for that one (so a stuck main queue never fills up).
+ */
++ (id<FBResponsePayload>)handleLotusBeat:(FBRouteRequest *)request
+{
+  double wait = [self lotus_number:request.parameters[@"wait"] fallback:5000 low:50 high:30000] / 1000.0;
+  CFAbsoluteTime start = CFAbsoluteTimeGetCurrent();
+  NSUInteger runsBefore = 0;
+  BOOL send = NO;
+  @synchronized (FBLotusCommands.class) {
+    runsBefore = LotusBeatRuns;
+    if (LotusBeatQueuedAt <= 0) {
+      LotusBeatQueuedAt = start;
+      send = YES;
+    }
+  }
+  if (send) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+      CFAbsoluteTime ranAt = CFAbsoluteTimeGetCurrent();
+      @synchronized (FBLotusCommands.class) {
+        LotusBeatLastMs = (ranAt - LotusBeatQueuedAt) * 1000.0;
+        LotusBeatQueuedAt = 0;
+        LotusBeatRuns++;
+      }
+    });
+  }
+  BOOL ran = NO;
+  double mainMs = 0;
+  double pendingMs = 0;
+  while (YES) {
+    @synchronized (FBLotusCommands.class) {
+      if (LotusBeatRuns != runsBefore) {
+        ran = YES;
+        mainMs = LotusBeatLastMs;
+      } else if (LotusBeatQueuedAt > 0) {
+        pendingMs = (CFAbsoluteTimeGetCurrent() - LotusBeatQueuedAt) * 1000.0;
+      }
+    }
+    if (ran || CFAbsoluteTimeGetCurrent() - start >= wait) {
+      break;
+    }
+    [NSThread sleepForTimeInterval:0.002];
+  }
+  NSMutableDictionary *answer = [NSMutableDictionary dictionary];
+  answer[@"lotus"] = @(LotusForkVersion);
+  answer[@"main"] = @(ran);
+  answer[@"waitedMs"] = @((long long)((CFAbsoluteTimeGetCurrent() - start) * 1000.0));
+  if (ran) {
+    answer[@"mainMs"] = @(mainMs);
+  } else {
+    answer[@"pendingMs"] = @((long long)pendingMs);
+  }
+  answer[@"capabilities"] = [self lotus_capabilities];
+  return FBResponseWithObject(answer);
 }
 
 /**
@@ -819,16 +1002,25 @@ static BOOL LotusLiveWatching = NO;
 {
   double scale = [self lotus_number:request.parameters[@"scale"] fallback:100 low:5 high:100] / 100.0;
   double quality = [self lotus_number:request.parameters[@"quality"] fallback:60 low:1 high:100] / 100.0;
+  // v7: the shot's own timing, and whether the main queue was free meanwhile (a no-op sent there as it starts)
+  CFAbsoluteTime start = CFAbsoluteTimeGetCurrent();
+  dispatch_semaphore_t mainRan = dispatch_semaphore_create(0);
+  dispatch_async(dispatch_get_main_queue(), ^{
+    dispatch_semaphore_signal(mainRan);
+  });
   NSError *error = nil;
   XCUIScreen *screen = [FBScreen currentScreenWithError:&error];
   if (nil == screen) {
     return FBResponseWithStatus([FBCommandStatus unableToCaptureScreenErrorWithMessage:error.description traceback:nil]);
   }
+  CFAbsoluteTime takeStart = CFAbsoluteTimeGetCurrent();
   NSData *shot = [FBScreenshot takeInOriginalResolutionWithScreenID:screen.displayID
                                                  compressionQuality:quality
                                                                 uti:UTTypeJPEG
                                                             timeout:8.0
                                                               error:&error];
+  double takeMs = (CFAbsoluteTimeGetCurrent() - takeStart) * 1000.0;
+  BOOL mainBusy = 0 != dispatch_semaphore_wait(mainRan, DISPATCH_TIME_NOW);
   if (nil == shot) {
     return FBResponseWithStatus([FBCommandStatus unableToCaptureScreenErrorWithMessage:error.description traceback:nil]);
   }
@@ -845,6 +1037,10 @@ static BOOL LotusLiveWatching = NO;
   return FBResponseWithObject(@{
     @"lotus": @(LotusForkVersion),
     @"jpeg": [shot base64EncodedStringWithOptions:(NSDataBase64EncodingOptions)0],
+    @"ms": @((long long)((CFAbsoluteTimeGetCurrent() - start) * 1000.0)),
+    @"takeMs": @((long long)takeMs),
+    @"waited": @(takeMs > 250.0),
+    @"mainBusy": @(mainBusy),
   });
 }
 

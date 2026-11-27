@@ -224,19 +224,22 @@ const fakeSpawn = ((cmd: string) => {
     ok('an app that never answers accessibility: the card, polls and the picture ask nothing of it; every touch goes');
 
     // 3. Lotus reads the screen itself (phones_read): its read of the tree goes, bounded; the owner's touch meanwhile
-    //    is sent at once beside it (it used to wait its turn behind it in the lane and be dropped "busy"; on the phone
-    //    it then runs as soon as WDA's main thread is free); the read isn't answered in time: the app doesn't answer
-    //    accessibility, so its other reads (the app's name, the orientation) are refused at once, unsent, with why
+    //    is sent at once (it used to wait its turn behind it in the lane and be dropped "busy"). 2026-11-27: the read
+    //    on its way is stopped for the touch (never waited for; Lotus hears so), the journal keeps it while the phone
+    //    is still on it; still on it past its own time: the app doesn't answer accessibility, so its other reads (the
+    //    app's name, the orientation) are refused at once, unsent, with why
     w.appMs = 700;
     const hits0 = appHits();
     const reading = m.source('U1').then(() => 'answered', (err: Error) => err.message);
-    await sleep(30);
+    assert.ok(await until(() => m.linkHealth('U1')!.lane.inFlight === 'GET /source', 500), 'the read is on its way');
     const sentBefore = w.hits.filter((h) => h.endsWith('/wda/tap')).length;
     const touched = m.tap('U1', 30, 30).catch((err: Error) => err.message);
-    assert.ok(await until(() => w.hits.filter((h) => h.endsWith('/wda/tap')).length === sentBefore + 1, 150), 'the touch reached the phone at once, beside the read');
-    assert.equal(m.linkHealth('U1')!.lane.beside, 'POST /session/:id/wda/tap');
+    assert.ok(await until(() => w.hits.filter((h) => h.endsWith('/wda/tap')).length === sentBefore + 1, 150), 'the touch reached the phone at once');
+    assert.match(await reading, /GET \/source was stopped on its way \(not waited for\) so that POST \/session\/:id\/wda\/tap could go first/);
+    assert.deepEqual(m.journal('U1').map((j) => [j.label, j.state, j.appBound]).slice(0, 1), [['GET /source', 'abandoned', true]], 'the journal: the phone may still be on the read');
+    assert.equal(m.linkHealth('U1')!.lane.beside, null, 'nothing goes "beside" anything any more');
     await touched;
-    assert.match(await reading, /did not answer in time/);
+    assert.ok(await until(() => !!m.linkHealth('U1')!.appStall, 1000), 'still on it past its own time: a stall');
     assert.equal(appHits(), hits0 + 1, 'one read sent');
     const stall = m.linkHealth('U1')!.appStall;
     assert.ok(stall && /no answer to GET \/source within 0\.2 s/.test(stall.why ?? ''), JSON.stringify(stall));
@@ -245,10 +248,10 @@ const fakeSpawn = ((cmd: string) => {
     await assert.rejects(m.source('U1'), (err: HttpError) => err.status === 503 && /^iPhone-1 can't read the app in front right now: the app in front isn't answering accessibility reads/.test(err.message));
     assert.equal(appHits(), hits0 + 1, 'nothing more sent while it does not answer');
     assert.equal(m.linkHealth('U1')!.appReads.sent, 1);
-    ok("Lotus's own read goes, bounded; the owner's touch goes beside it; while the app doesn't answer, its reads are refused unsent");
+    ok("Lotus's own read goes, bounded; the owner's touch stops it and goes at once; while the app doesn't answer, its reads are refused unsent");
 
-    // 4. a read the phone never answers at all (held past its hold): WDA is not checked, nothing restarted (/status
-    //    answers: WDA is fine, the app in front isn't), and the touches went all along
+    // 4. a read the phone never answers at all (on the journal past its hold): WDA is not checked, nothing restarted
+    //    (/status answers: WDA is fine, the app in front isn't), not even for a touch stuck behind it on the phone
     const runners = xcodes.length;
     const sessions = w.made;
     (m as any).entries.get('U1').stallUntil = 0; // its pause is over: Lotus reads again
@@ -256,8 +259,9 @@ const fakeSpawn = ((cmd: string) => {
     await assert.rejects(m.activeApp('U1').then((v) => (v === null ? Promise.reject(new Error('null')) : v)));
     const t1 = Date.now();
     await m.tap('U1', 40, 40).catch(() => {}); // (the fake's one queue is stuck: this touch waits on the phone)
-    assert.ok(await until(() => m.linkHealth('U1')!.appReads.stuck === 1, 4000), 'the read was given up on after its hold');
-    assert.ok(logs.some((l) => /not even late: the app in front doesn't answer accessibility; nothing is checked or restarted for it/.test(l)));
+    assert.ok(await until(() => m.linkHealth('U1')!.appReads.stuck === 1, 4000), 'the read was given up on');
+    assert.ok(logs.some((l) => /the app in front doesn't answer accessibility; the phone may still be on it \(the journal says so\) and nothing is restarted for it/.test(l)));
+    assert.ok(await until(() => logs.some((l) => /POST \/session\/:id\/wda\/tap is still behind GET \/wda\/activeAppInfo on the phone \(the app in front doesn't answer accessibility\); WDA isn't checked for it/.test(l)), 4000), 'the touch behind it checks nothing');
     assert.deepEqual([xcodes.length, w.made, m.linkHealth('U1')!.recoveries, m.state('U1')], [runners, sessions, 0, 'ready'], 'no check, no restart, the session kept');
     assert.ok(Date.now() - t1 < 4000);
     ok('a read of the app in front never answered: nothing is checked or restarted for it (WDA answers /status)');

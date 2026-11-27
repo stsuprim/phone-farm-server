@@ -6,7 +6,7 @@ process.env.INPUT_LOG = '0';
 import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
 import { AddressInfo } from 'node:net';
-import { Agent, CHANGED_WHILE_TOUCHING, OWNER_QUIET_MS, SETTLE_MAX_MS, SETTLE_MIN_MS, UI_FRESH_MS } from '../src/agent.js';
+import { Agent, AGENT_CAPTURE_LINGER_MS, CHANGED_WHILE_TOUCHING, OWNER_QUIET_MS, SETTLE_MAX_MS, SETTLE_MIN_MS, SETTLE_ONE_LOOK_MS, UI_FRESH_MS } from '../src/agent.js';
 import { Control } from '../src/control.js';
 import { MockBackend } from '../src/mock.js';
 import { createServer } from '../src/server.js';
@@ -99,7 +99,8 @@ assert.equal(UI_FRESH_MS, 1000, 'a tree is kept about a second');
 
 // ---- a batch stops before its next step, waits, and hands back done and remaining ----
 {
-  const { st, agent } = phone(300);
+  // (a quiet longer than the settle's one look, SETTLE_ONE_LOOK_MS, so the owner is still touching after step 1)
+  const { st, agent } = phone(700);
   let n = 0;
   st.onTap = () => {
     if (++n === 1) agent.ownerInput('P'); // the owner touches while the first step runs
@@ -120,21 +121,73 @@ assert.equal(UI_FRESH_MS, 1000, 'a tree is kept about a second');
   ok('batch: the owner touching stops it before the next step; after the quiet it returns { paused: { ms, resumed }, done, remaining }');
 }
 
-// ---- the settle: as soon as the picture is still, never a fixed long wait ----
+// ---- the settle (2026-11-27): without a capture, one coalesced look; never a loop of WDA stills ----
 {
   const { st, agent } = phone();
+  let h0 = st.hashes;
   let t0 = performance.now();
   let r = await agent.action('P', { type: 'home' });
   let took = performance.now() - t0;
-  assert.ok(took < SETTLE_MIN_MS + 250, `a still screen: back in ${Math.round(took)} ms`);
-  assert.ok(r.timing && r.timing.settle >= SETTLE_MIN_MS - 5);
-  st.moving = 100; // a screen that never stops (a video)
-  t0 = performance.now();
+  assert.equal(st.hashes - h0, 2, 'one look before, one after: no loop of stills');
+  assert.ok(took >= SETTLE_ONE_LOOK_MS - 5 && took < SETTLE_ONE_LOOK_MS + 300, `one settle, one look: ${Math.round(took)} ms`);
+  assert.ok(r.timing && r.timing.settle >= SETTLE_ONE_LOOK_MS - 5);
+  st.moving = 100; // a screen that never stops (a video): still one look after the settle
+  h0 = st.hashes;
   r = await agent.action('P', { type: 'home' });
-  took = performance.now() - t0;
-  assert.ok(took >= SETTLE_MAX_MS - 50 && took < SETTLE_MAX_MS + 400, `a moving screen: capped (${Math.round(took)} ms)`);
+  assert.equal(st.hashes - h0, 2);
   assert.equal(r.changed, true);
-  ok('settle: back as soon as two stills agree (about 250 ms), capped for a screen that keeps moving');
+  ok('settle without a capture: one look after the settle, never a loop of stills');
+}
+
+// ---- the settle with the capture: as soon as no new frame comes, capped for a screen that keeps moving; no WDA ----
+{
+  const cap = { gen: 0, movedAt: 0, holds: 0, held: 0 };
+  let hashes = 0;
+  const b = {
+    mock: true,
+    screen: () => ({ width: 400, height: 800, scale: 3 }),
+    orientation: () => 'portrait' as const,
+    home: async () => {
+      // the screen changes for a moment after the press, then holds still
+      let n = 0;
+      const t = setInterval(() => {
+        cap.gen++;
+        cap.movedAt = Date.now();
+        if (++n >= 3) clearInterval(t);
+      }, 30);
+      return { via: 'mock' as const };
+    },
+    tap: async () => ({ via: 'mock' as const }),
+    frameHash: async () => (hashes++, 'wda-still'),
+    pictureToken: () => ({ gen: cap.gen, movedAt: cap.movedAt, keyAt: 1, width: 400, height: 800 }),
+    holdPicture: () => {
+      cap.holds++;
+      cap.held++;
+      return () => void cap.held--;
+    },
+  } as unknown as Backend;
+  const agent = new Agent(b, new Control(b), { ownerQuietMs: 300 });
+  let t0 = performance.now();
+  let r = await agent.action('P', { type: 'home' });
+  let took = performance.now() - t0;
+  assert.equal(r.changed, true, 'the capture saw the frames the press made');
+  assert.ok(took >= SETTLE_MIN_MS && took < SETTLE_MIN_MS + 400, `settled as soon as the frames stopped: ${Math.round(took)} ms`);
+  // a screen that never stops: capped
+  const mover = setInterval(() => {
+    cap.gen++;
+    cap.movedAt = Date.now();
+  }, 20);
+  t0 = performance.now();
+  r = await agent.action('P', { type: 'tap', x: 0.5, y: 0.5, unit: 'norm', natural: false });
+  took = performance.now() - t0;
+  clearInterval(mover);
+  assert.ok(took >= SETTLE_MAX_MS - 50 && took < SETTLE_MAX_MS + 400, `a moving screen: capped (${Math.round(took)} ms)`);
+  assert.equal(hashes, 0, 'never a WDA still while the capture runs');
+  assert.equal(cap.holds, 1, 'the agent holds the capture once while it works');
+  assert.equal(cap.held, 1, `and keeps it for ${AGENT_CAPTURE_LINGER_MS / 1000} s after its last work`);
+  agent.close();
+  assert.equal(cap.held, 0, 'released');
+  ok('settle with the capture: back as soon as no new frame comes, capped for a moving screen; the agent holds the capture, no WDA still');
 }
 
 // ---- over the server: the owner's input marks the phone, GET …/owner says so ----

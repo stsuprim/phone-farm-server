@@ -165,7 +165,8 @@ const fakeSpawn = ((cmd: string, args: string[]) => {
   ok('WDA heals: an expired session, a hung tap (quick error), a dead WDA (restarted), an exited iproxy; counted and logged as [wda-heal]');
 }
 
-// ---- Control: a hung action, bursts spaced, the probe before the first action after a quiet spell ----
+// ---- Control: a hung action, bursts spaced; 2026-11-27 (root cause section 2.3, 8): nothing but the input runs in an
+// input's turn: no probe before the first action or after a quiet spell, and no heal after a hung one ----
 {
   const calls: string[] = [];
   let hang: (() => void) | null = null;
@@ -192,11 +193,11 @@ const fakeSpawn = ((cmd: string, args: string[]) => {
   const heals: string[] = [];
   c.onHeal = async (_u, reason) => void heals.push(reason);
 
-  // the first action ever probes; one right after doesn't
+  // the first action ever goes as it is (no probe in front of it), and so does the next
   await c.handle('P', { type: 'tap', x: 1, y: 1, unit: 'pt' });
-  assert.deepEqual(heals, ['first action since the server started']);
+  assert.deepEqual(heals, [], 'no probe before the first action');
   await c.handle('P', { type: 'tap', x: 2, y: 2, unit: 'pt' });
-  assert.equal(heals.length, 1, 'not quiet: no probe');
+  assert.deepEqual(heals, []);
 
   // a burst: in order, never two at once, each a breath (minGapMs) after the last
   starts.length = 0;
@@ -205,13 +206,13 @@ const fakeSpawn = ((cmd: string, args: string[]) => {
   for (let i = 1; i < starts.length; i++) assert.ok(starts[i]! - starts[i - 1]! >= 28, `spaced ${(starts[i]! - starts[i - 1]!).toFixed(1)} ms`);
   assert.equal(overlap, false);
 
-  // a hung action: answered with 504 at the timeout, the phone healed; the next waits for it to settle, then runs
+  // a hung action: answered with 504 at the timeout, nothing restarted for it; the next waits for it to settle, then runs
   const t0 = performance.now();
   const stuck = c.handle('P', { type: 'tap', x: 99, y: 1, unit: 'pt' });
   const next = c.handle('P', { type: 'tap', x: 8, y: 1, unit: 'pt' });
-  await assert.rejects(stuck, (err: HttpError) => err.status === 504 && /no answer within/.test(err.message));
+  await assert.rejects(stuck, (err: HttpError) => err.status === 504 && /no answer within/.test(err.message) && /look at the screen/.test(err.message));
   assert.ok(performance.now() - t0 < 1000);
-  assert.ok(heals.some((r) => /^tap on the phone got no answer within/.test(r)), 'healed');
+  assert.deepEqual(heals, [], 'no heal (no WDA restart) for a hung action');
   await sleep(100);
   assert.equal(calls.at(-1), 'tap 99', 'the next one waits while the hung one may still be on its way');
   hang!();
@@ -219,15 +220,16 @@ const fakeSpawn = ((cmd: string, args: string[]) => {
   assert.equal(calls.at(-1), 'tap 8');
   assert.equal(overlap, false, 'never two at once');
 
-  // a quiet spell: the first action after it probes first
+  // a quiet spell: the first action after it goes as it is too
   await sleep(250);
-  const n = heals.length;
   await c.handle('P', { type: 'tap', x: 9, y: 1, unit: 'pt' });
-  assert.match(heals[n]!, /^first action after 0 s idle$/);
-  ok('control: a hung action errors at its timeout and heals; bursts spaced and never parallel; a probe before the first action after idle');
+  assert.equal(calls.at(-1), 'tap 9');
+  assert.deepEqual(heals, [], 'no probe after a quiet spell');
+  ok('control: a hung action errors at its timeout (nothing restarted); bursts spaced and never parallel; no probe or heal inside an input\'s turn');
 }
 
-// ---- wake-on-touch: a dark phone is probed, woken, then tapped, in one request; an unsure ask asks again ----
+// ---- wake-on-touch, 2026-11-27 (root cause sections 2.3, 6, 8; P4): only what was SEEN wakes a phone before an input.
+// Nothing is probed or asked in front of a touch; a phone seen locked (a health check, our own lock) is woken first ----
 {
   const calls: string[] = [];
   let locked: boolean | null = true;
@@ -250,11 +252,11 @@ const fakeSpawn = ((cmd: string, args: string[]) => {
   const c = new Control(b, undefined, { minGapMs: 0 });
   c.onInput = (u, d) => idle.activity(u, d);
   c.onHeal = async () => void calls.push('probe');
+  // the power state was never seen: the tap goes as it is (no probe, no lock ask, no wake in front of it)
   await c.handle('P', { type: 'tap', x: 1, y: 1, unit: 'pt' });
-  assert.deepEqual(calls, ['probe', 'locked?', 'unlock', 'locked?', 'tap 1'], 'probe, ask, wake, then the tap');
+  assert.deepEqual(calls, ['tap 1'], 'nothing in front of a tap on a phone whose screen was not seen');
 
-  // the phone can't say (WDA slow after a long sleep): the tap goes, and the NEXT tap asks again (it used to be 25 s
-  // of taps landing on a phone that may be dark)
+  // still unknown (the phone can't say): every tap goes as it is, none asks in front of it
   const idle2 = new IdleLock(b, () => 10, { tickMs: 0, log: () => {} });
   c.onInput = (u, d) => idle2.activity(u, d);
   calls.length = 0;
@@ -262,15 +264,16 @@ const fakeSpawn = ((cmd: string, args: string[]) => {
   await c.handle('Q', { type: 'tap', x: 2, y: 1, unit: 'pt' });
   locked = true;
   await c.handle('Q', { type: 'tap', x: 3, y: 1, unit: 'pt' });
-  assert.deepEqual(calls.filter((x) => x !== 'probe'), ['locked?', 'tap 2', 'locked?', 'unlock', 'locked?', 'tap 3']);
+  assert.deepEqual(calls, ['tap 2', 'tap 3'], 'an unseen lock is never inferred');
 
-  // a health check found it locked: the next input wakes it without asking first
+  // a health check SAW it locked: the next input wakes it first (the wake's own look, then the tap)
   calls.length = 0;
   locked = true;
   idle2.note('Q', true);
   await c.handle('Q', { type: 'tap', x: 4, y: 1, unit: 'pt' });
-  assert.deepEqual(calls, ['unlock', 'locked?', 'tap 4']);
-  ok('wake-on-touch: probe, wake, act in one request; an unanswered lock ask is asked again by the next input; a noted lock wakes first');
+  assert.ok(calls.includes('unlock') && calls.at(-1) === 'tap 4' && calls.indexOf('unlock') < calls.indexOf('tap 4'), `woken, then tapped: ${calls.join(', ')}`);
+  assert.ok(!calls.includes('probe'), 'no probe');
+  ok('wake-on-touch: nothing in front of a tap on an unseen screen; a lock that was seen wakes the phone first, then the tap');
 }
 
 // ---- units ----

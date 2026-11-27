@@ -94,15 +94,15 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
     await wakeScreen(ops).catch((e: Error) => (error = e.message));
     return { calls, error };
   };
-  // the capture gave no picture and the screen can't be looked at: Home, Home (once), then it's left as it is
-  assert.deepEqual(await run({ locked: false, dark: [null, null], force: true }), { calls: ['look', 'home', 'home', 'look'], error: '' });
-  // ...and woke it
-  assert.deepEqual(await run({ locked: false, dark: [null, false], force: true }), { calls: ['look', 'home', 'home', 'look'], error: '' });
+  // 2026-11-27 (root cause section 6, P4: no action from inference): the capture gave no picture and the screen can't
+  // be looked at: nothing is pressed, forced or not (it used to count as dark: Home, Home on TikTok)
+  assert.deepEqual(await run({ locked: false, dark: [null, null], force: true }), { calls: ['look'], error: '' });
+  assert.deepEqual(await run({ locked: false, dark: [null] }), { calls: ['look'], error: '' });
+  // a screen SEEN dark is woken (Home, Home), and looked at again
+  assert.deepEqual(await run({ locked: false, dark: [true, false] }), { calls: ['look', 'home', 'home', 'look'], error: '' });
   // a screen that shows something is never pressed, forced or not
   assert.deepEqual(await run({ locked: false, dark: [false], force: true }), { calls: ['look'], error: '' });
-  // not forced: nothing pressed blind (as before)
-  assert.deepEqual(await run({ locked: false, dark: [null] }), { calls: ['look'], error: '' });
-  ok('wake for a picture: a screen that can\'t be looked at counts as dark (Home, Home), one that shows something is never pressed');
+  ok('wake for a picture: a screen that can\'t be looked at is never pressed; one seen dark is woken; one that shows something never pressed');
 }
 {
   const calls: string[] = [];
@@ -115,18 +115,27 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
       calls.push(opts?.force ? 'unlock forced' : 'unlock');
       if (failWith) throw new Error(failWith);
     },
-    isLocked: async () => false,
+    isLocked: async () => {
+      calls.push('locked?');
+      return locked;
+    },
     silence: (_u: string, why: string) => void calls.push(`silence ${why}`),
   } as unknown as Backend;
+  let locked = false;
   const idle = new IdleLock(b, () => 0, { tickMs: 0, log: () => {} });
+  // 2026-11-27 (root cause sections 4, 6): the phone is looked at first, and only one seen locked is woken (never forced)
   assert.equal(await idle.wakeForPicture('P'), null);
-  assert.deepEqual(calls, ['unlock forced', 'silence woken'], 'woken (forced), then kept silent');
+  assert.deepEqual(calls, ['locked?'], 'not locked: nothing pressed');
+  calls.length = 0;
+  locked = true;
+  await idle.wakeForPicture('P');
+  assert.deepEqual(calls.slice(0, 3), ['locked?', 'unlock', 'silence woken'], 'seen locked: woken (not forced), then kept silent');
   calls.length = 0;
   failWith = "the phone's control link is restarting, so its screen can't be woken yet";
   assert.equal(await idle.wakeForPicture('P', false), failWith, 'why it could not be woken, in a line');
-  assert.deepEqual(calls, ['unlock']);
+  assert.deepEqual(calls, ['locked?', 'unlock']);
   idle.close();
-  ok('idle: a wake for a picture is forced, silences the phone after, and says why when it can\'t');
+  ok('idle: a wake for a picture looks first and wakes only a phone seen locked, silences it after, and says why when it can\'t');
 }
 
 // ---- 3. silent ----

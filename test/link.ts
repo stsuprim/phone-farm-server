@@ -65,7 +65,8 @@ const fakeWda = async () => {
       if (p === '/wda/screen') return json(200, { value: { scale: 3 } });
       if (p === '/screenshot') return json(200, { value: 'AAAA' }, w.slow.shot);
       const m = /^\/session\/([^/]+)(\/.*)?$/.exec(p);
-      if (!m) return json(404, { value: { error: 'unknown command', message: p } });
+      // (a WDA that stopped answering /status answers nothing else either: its router's 404s wait the same)
+      if (!m) return json(404, { value: { error: 'unknown command', message: p } }, w.slow.status);
       if (m[1] !== w.current) return json(404, { value: { error: 'invalid session id', message: 'Session does not exist' } });
       const sub = m[2] ?? '';
       if (sub === '') return json(200, { value: { capabilities: {} } }, w.slow.probe);
@@ -100,7 +101,7 @@ const xcodes = () => spawned.filter((c) => c === 'xcodebuild').length;
   const w = await fakeWda();
   const cfg = { wdaBasePort: w.port, mjpegBasePort: w.port + 1, wdaProject: '/x', wdaDerivedData: '/y' } as unknown as import('../src/config.js').Config;
   // quick clocks: a probe waits 80 ms, WDA is down after 3 misses over 200 ms, a state is said once it lasted 250 ms
-  // (hold: a request never answered at all holds the phone's lane 150 ms more, then WDA is checked)
+  // (hold: a request never answered at all stays on the journal 150 ms more, then WDA is checked; the lane isn't held)
   const m = new WdaManager(cfg, (u) => u, fakeSpawn, { input: 400, launch: 1000, probe: 80, restart: 4000, status: 80, misses: 3, missSpan: 200, debounce: 250, probes: 3, probeEvery: 100, backoff: [50, 100, 200], hold: 150 });
   try {
     m.start('U1');
@@ -119,10 +120,12 @@ const xcodes = () => spawned.filter((c) => c === 'xcodebuild').length;
     const asked = probes();
     assert.equal(await m.probe('U1', 'health check'), true);
     let h = m.linkHealth('U1')!;
-    assert.deepEqual([h.misses, h.lane.inFlight], [1, 'GET /session/:id'], 'the late check still holds the lane');
+    // 2026-11-27: the lane isn't held for it; the journal says the phone may still be on it
+    assert.deepEqual([h.misses, h.lane.inFlight, h.lane.held], [1, null, 'GET /session/:id'], 'the late check is on the journal, not holding the lane');
+    assert.deepEqual(h.journal.map((j) => [j.label, j.state]), [['GET /session/:id', 'abandoned']]);
     assert.equal(await m.probe('U1', 'health check'), true);
     assert.equal(probes() - asked, 1, 'no second check piled on top of the first');
-    assert.ok(await until(() => m.linkHealth('U1')!.misses === 0 && m.linkHealth('U1')!.lane.inFlight === null), 'the late answer came and cleared the count');
+    assert.ok(await until(() => m.linkHealth('U1')!.misses === 0 && m.linkHealth('U1')!.journal.length === 0), 'the late answer came, cleared the count and the journal');
     h = m.linkHealth('U1')!;
     assert.deepEqual([h.recoveries, h.runnerRestarts, h.state], [0, 0, 'ready']);
     assert.deepEqual([w.made, xcodes(), m.healStats('U1').heals], [sessions, runners, 0], 'no new session, no restart, no heal');
@@ -155,7 +158,7 @@ const xcodes = () => spawned.filter((c) => c === 'xcodebuild').length;
     assert.equal(w.made, sessions + 1, 'a new session');
     assert.deepEqual([...seen], ['ready'], 'a session remade in a moment is never shown as the link going down');
 
-    // 5. a real drop: WDA stops answering for good. Its check is never answered, not even late (its hold runs out),
+    // 5. a real drop: WDA stops answering for good. Its check is never answered, not even late (on the journal past hold),
     //    then /status asked three times, then (and only then) the runner is restarted; meanwhile the state says
     //    "recovering"
     w.slow.probe = Infinity;
@@ -182,7 +185,7 @@ const xcodes = () => spawned.filter((c) => c === 'xcodebuild').length;
     assert.ok(await until(() => m.state('U1') === 'ready' && !m.restarting('U1')));
     h = m.linkHealth('U1')!;
     assert.deepEqual([h.recoveries, h.runnerRestarts, h.misses], [1, 1, 0]);
-    assert.match(m.healStats('U1').lastHeal!.reason, /^restarting WDA \(attempt 1\/4\): no answer within [\d.]+ s to GET \/session\/:id, not even late; then \/status asked 3 times/);
+    assert.match(m.healStats('U1').lastHeal!.reason, /^restarting WDA \(attempt 1\/4\): no answer within [\d.]+ s to GET \/session\/:id[^;]*; then \/status asked 3 times/);
     clearInterval(watch);
 
     // 6. a slow answer under an action: the session that still answers is kept (it was only slow)

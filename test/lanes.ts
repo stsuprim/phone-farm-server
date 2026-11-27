@@ -26,7 +26,7 @@ const tick = () => new Promise((r) => setImmediate(r));
     encodeRecord((7 << 4) | KIND.INFO, 3, Buffer.from('{}')),
   ]));
   assert.deepEqual(got.map((r) => [r.lane, r.kind]), [[0, KIND.KEY], [2, KIND.DELTA], [7, KIND.INFO]]);
-  assert.throws(() => new RecordParser(() => {}).push(encodeRecord((1 << 4) | 9, 0, Buffer.alloc(0))));
+  assert.throws(() => new RecordParser(() => {}).push(encodeRecord((1 << 4) | 11, 0, Buffer.alloc(0))));
   ok('records: lane in the high nibble (0 = an older helper), kind in the low one');
 }
 
@@ -39,7 +39,7 @@ const tick = () => new Promise((r) => setImmediate(r));
     const out = new PassThrough();
     const rec = { args, lines: [] as string[], proc, out, kills: [] as string[] };
     stdin.on('data', (d: Buffer) => rec.lines.push(...d.toString().split('\n').filter(Boolean)));
-    Object.assign(proc, { stdin, stdout: out, stderr: new PassThrough(), kill: (s: string) => (rec.kills.push(s), true) });
+    Object.assign(proc, { stdin, stdout: out, stderr: new PassThrough(), kill: (s: string) => (rec.kills.push(s), setImmediate(() => proc.emit('exit', null, s)), true) });
     spawned.push(rec);
     return proc;
   };
@@ -99,7 +99,7 @@ const tick = () => new Promise((r) => setImmediate(r));
     const err = new PassThrough();
     const rec = { lines: [] as string[], proc, out, err, kills: [] as string[] };
     stdin.on('data', (d: Buffer) => rec.lines.push(...d.toString().split('\n').filter(Boolean)));
-    Object.assign(proc, { stdin, stdout: out, stderr: err, kill: (s: string) => (rec.kills.push(s), true) });
+    Object.assign(proc, { stdin, stdout: out, stderr: err, kill: (s: string) => (rec.kills.push(s), setImmediate(() => proc.emit('exit', null, s)), true) });
     spawned.push(rec);
     return proc;
   };
@@ -119,15 +119,26 @@ const tick = () => new Promise((r) => setImmediate(r));
   assert.equal(host.running, false);
   assert.ok(spawned[0]!.kills.includes('SIGTERM') && spawned[0]!.lines.includes('quit'), 'the silent process is ended');
   assert.deepEqual(exits, ['a: no picture', 'b: no picture']);
+  // 2026-11-27: Stopping before Starting: a start while the ended phonecap hasn't exited waits for it
+  const early = host.start({ fps: 60, scale: 100, bitrate: 8_000_000 }, { record: () => {}, exit: () => {} });
+  assert.equal(spawned.length, 1, 'no second phonecap while the first still holds the screen device');
+  assert.equal(host.running, true, 'it counts as running (its start is due)');
+  early.bitrate!(5_000_000);
+  await tick();
+  assert.equal(spawned.length, 2, 'started once the first one exited');
+  assert.ok(spawned[1]!.lines.includes('bitrate 0 5000000'), 'what it was told meanwhile is said once it runs');
+  early.stop();
+  await tick();
+  await tick();
   // ... and one that gives pictures only loses that lane
   const c = host.start({ fps: 60, scale: 100, bitrate: 8_000_000 }, { record: () => {}, exit: (why) => exits.push(`c: ${why}`) });
   const d = host.start({ fps: 30, scale: 50, bitrate: 1_500_000 }, { record: () => {}, exit: (why) => exits.push(`d: ${why}`) });
-  picture(1);
+  picture(2);
   await tick();
   d.restart!('no picture on lane 1');
   await tick();
   assert.equal(host.running, true, 'a process that gives pictures runs on');
-  assert.equal(spawned[1]!.lines.at(-1), 'unlane 1');
+  assert.equal(spawned[2]!.lines.at(-1), 'unlane 1');
   assert.equal(exits.length, 2);
   c.stop();
   host.close();

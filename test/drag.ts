@@ -213,7 +213,8 @@ assert.deepEqual([TOUCH_RELEASE_MS, TOUCH_QUIET_MS, HOLD_REPEAT_MS, OWNER_GRACE_
   ok("natural touch: the owner's live and buffered drags and whole swipes go as made; Lotus's swipe is a bowed flick, its tap offset and held");
 }
 
-// ---- a live press never waits for what only WDA needs: a health check, the idle probe, the breath between actions ----
+// ---- a live press never waits for what only WDA needs: a health check, the breath between actions. 2026-11-27 (root
+// cause sections 2.3, 8): and no probe is started for it at all (nothing but the input runs in an input's turn) ----
 {
   const { b, calls, at } = phone();
   const c = new Control(b, undefined, { minGapMs: 150, idleProbeMs: 0 });
@@ -232,8 +233,8 @@ assert.deepEqual([TOUCH_RELEASE_MS, TOUCH_QUIET_MS, HOLD_REPEAT_MS, OWNER_GRACE_
   await c.handle('P', touch('down', 10, 10, 1));
   const downMs = performance.now() - t0;
   assert.ok(checking, 'the check is still running');
-  assert.ok(downMs < 120, `the press went at once (${Math.round(downMs)} ms), beside the check and the probe`);
-  assert.equal(probes, 1, 'the probe was started (beside the press)');
+  assert.ok(downMs < 120, `the press went at once (${Math.round(downMs)} ms), beside the check`);
+  assert.equal(probes, 0, 'no probe was started for the press (none beside it either)');
   await c.handle('P', touch('move', 20, 20, 2));
   await c.handle('P', touch('up', 20, 20, 3));
   const upAt = at[at.length - 1]!;
@@ -241,18 +242,19 @@ assert.deepEqual([TOUCH_RELEASE_MS, TOUCH_QUIET_MS, HOLD_REPEAT_MS, OWNER_GRACE_
   await c.handle('P', touch('down', 30, 30, 4, 2));
   assert.ok(at[at.length - 1]! - upAt < 100, 'a quick second press goes at once');
   await c.handle('P', touch('up', 30, 30, 5, 2));
-  // what goes through WDA still waits for the check
+  // 2026-11-27 (root cause 13.1 P1): what goes through WDA doesn't wait for the check either (the check is background
+  // work of the phone's actor, never in front of an input; WDA's own lane keeps one request on the phone at a time)
   const t1 = performance.now();
   await c.handle('P', { type: 'tap', x: 5, y: 5, unit: 'pt', natural: false });
-  assert.equal(checking, false, 'a tap (WDA) waited for the check');
-  assert.ok(performance.now() - t1 >= 100);
+  assert.equal(checking, true, 'a tap (WDA) did not wait for the check');
+  assert.ok(performance.now() - t1 < 280, `the tap went in ${Math.round(performance.now() - t1)} ms (only the breath between actions, 150 ms)`);
   await check;
   assert.deepEqual(calls.map((x) => x.split(' ')[0]), ['down', 'move', 'up', 'down', 'up', 'tap']);
   // and a check is skipped while the phone is in use
   const busy = c.handle('P', { type: 'tap', x: 6, y: 6, unit: 'pt', natural: false });
   assert.equal(await c.check('P', async () => {}), false);
   await busy;
-  ok(`a live press goes at once (${Math.round(downMs)} ms) beside a health check and the idle probe; WDA's actions still wait for the check`);
+  ok(`a live press goes at once (${Math.round(downMs)} ms) beside a health check, no probe started; WDA's actions don't wait for the check either`);
 }
 
 // ---- the server: a held finger stays down while the socket pings, and is lifted when the socket goes quiet ----

@@ -9,6 +9,11 @@ import { HttpError } from './types.js';
 export interface Settings {
   /** Minutes with no input and no viewer before a phone is locked (screen off). 0 = never. */
   idleLockMinutes: number;
+  /**
+   * 2026-11-27: whether Lotus's agents see the phone through its USB capture (frames for their looks and settles,
+   * no WDA stills); unset: the server's own default (AGENT_SEES_CAPTURE, on). iOS tells apps while it's captured.
+   */
+  agentSeesCapture?: boolean;
 }
 
 // 2026-11-16: natural touch (src/human.ts) is always on; `naturalTouch` is no longer a setting (an older client's
@@ -56,6 +61,9 @@ export class SettingsStore {
         if (typeof val === 'number' && Number.isFinite(val) && val >= 0 && val <= MAX_IDLE_LOCK_MINUTES) {
           out.idleLockMinutes = Math.round(val * 100) / 100;
         } else if (!lenient) throw new HttpError(400, `"idleLockMinutes" must be a number from 0 (off) to ${MAX_IDLE_LOCK_MINUTES}`);
+      } else if (k === 'agentSeesCapture') {
+        if (typeof val === 'boolean') out.agentSeesCapture = val;
+        else if (!lenient) throw new HttpError(400, '"agentSeesCapture" must be true or false');
       } else if (k === 'naturalTouch') {
         continue; // not a setting any more: always on
       } else if (!lenient) throw new HttpError(400, `unknown setting ${JSON.stringify(k)}`);

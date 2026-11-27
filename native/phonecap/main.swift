@@ -12,6 +12,12 @@
 //          5 audio frame (Opus, 20 ms at 48 kHz; G.711 u-law 8 kHz mono when this Mac has no Opus encoder), its time the
 //            capture time of its first sample, 6 audio JSON ({codec, rate, channels, frame_ms, reason?} once, then
 //            {level_db, peak_db} every 2 s while it runs). Audio records only with --audio (see "audio" below).
+//          2026-11-27: 7 heartbeat JSON {running, finding, frames_in, frames_out, last_frame, lanes} once a second
+//            (while it looks for the device too, with finding true), so the server tells a still screen (running, no
+//            frames in) from a dead or hung capture (no heartbeat, or not running); 8 still (a JPEG of the newest
+//            picture, asked with "still"), its time that picture's own capture time; 9 and 10 a keyframe and a delta
+//            that re-encode an earlier picture (a key asked on a still screen, a turn, a lane added), their time that
+//            picture's original capture time, never "now".
 // Lanes: one capture feeds up to 8 encoders (lanes 0-7), each with its own size, fps and bitrate, so a far viewer gets a
 //   small 30 fps stream while the LAN keeps full size at 60 fps. Lane 0 starts from the command line (--fps --scale
 //   --bitrate --key-seconds); its records have the high nibble 0, exactly as before lanes.
@@ -19,7 +25,8 @@
 //   and "fps <lane> <fps>" change a running lane, "lane <id> <fps> <scale %> <bit/s> [<key seconds>]" adds or changes
 //   a lane, "unlane <id>" stops one, "rotate <0|90|180|270>" turns the picture that many degrees clockwise before
 //   encoding (every lane; a new info record and keyframe follow), "audio on|off" starts or stops sending the phone's
-//   sound (with --audio; off at start), "quit" exits. A lane without the number is lane 0.
+//   sound (with --audio; off at start), "still [<long side px>]" writes a kind 8 JPEG of the newest picture (2026-11-27),
+//   "quit" exits. A lane without the number is lane 0. "lane" on a lane that exists always gives it a keyframe.
 // Audio (--audio, 2026-11-16): the iPhone screen device is muxed (video and sound), so an AVCaptureAudioDataOutput is
 //   added to the SAME session (never a second device). While the phone is captured, iOS plays its sound out to the Mac
 //   (as with QuickTime's "iPhone" audio input) and its own speaker goes quiet; this must still be confirmed on the
@@ -29,7 +36,7 @@
 //   record and keyframe). If the buffers keep the size the session started with (the turned picture squashed into
 //   it), the output is asked for the screen's own size; if that doesn't take, phonecap exits 8 and the server starts
 //   it again (a new session takes the screen's size as it is).
-// phonecap-caps: lanes rotate audio
+// phonecap-caps: lanes rotate audio beat still repeat
 //   (scripts/build-native.mjs copies the caps above to build/phonecap.caps, so the server knows what this build speaks)
 // stderr: human-readable log lines. Exit codes: 2 no device, 3 camera access denied, 4 capture failed,
 //          5 device disconnected, 6 encoder failed, 7 several iPhones share a name and can't be told apart,
@@ -63,7 +70,8 @@ func nowMs() -> Double { Date().timeIntervalSince1970 * 1000 }
 /// 2026-11-23 (iPhone-2 stuck on "connecting" after a replug): a CoreMediaIO iPhone screen device opened right after
 /// a replug, or before the phone is ready, can run its session without ever handing over a frame until it's opened
 /// again. A session that gave no frame this long after startRunning exits 9 and the server starts a new one. Only the
-/// first frame is watched: a still screen sends no frames at all, so a quiet running capture is not a stuck one.
+/// first frame is watched here: a still screen sends no frames at all, so a quiet running capture is not a stuck one.
+/// 2026-11-27: after it, the heartbeat (kind 7) lets the server tell the two apart.
 let FIRST_FRAME_SECONDS = 5.0
 
 // MARK: - options
@@ -689,6 +697,7 @@ final class Encoder {
     private var frames = 0
     private var encSum = 0.0
     private var capSum = 0.0
+    private var capFrames = 0
     private var lastStats = nowMs()
     private static let startCode = Data([0, 0, 0, 1])
 
@@ -767,7 +776,8 @@ final class Encoder {
         }
     }
 
-    func encode(_ pb: CVPixelBuffer, captureMs: Double, forceKey: Bool) {
+    /// `again`: an earlier picture encoded again (kinds 9 and 10, its own capture time).
+    func encode(_ pb: CVPixelBuffer, captureMs: Double, forceKey: Bool, again: Bool = false) {
         let pts = CMClockGetTime(CMClockGetHostTimeClock())
         let props: CFDictionary? = forceKey ? [kVTEncodeFrameOptionKey_ForceKeyFrame: kCFBooleanTrue] as CFDictionary : nil
         let started = DispatchTime.now().uptimeNanoseconds
@@ -775,7 +785,7 @@ final class Encoder {
                                                  frameProperties: props, infoFlagsOut: nil) { [weak self] status, _, sbuf in
             guard status == noErr, let sbuf = sbuf, let self = self else { return }
             let encMs = Double(DispatchTime.now().uptimeNanoseconds - started) / 1e6
-            self.output(sbuf, captureMs: captureMs, encMs: encMs)
+            self.output(sbuf, captureMs: captureMs, encMs: encMs, again: again)
         }
         if st != noErr {
             log("encode failed (\(st))")
@@ -783,7 +793,7 @@ final class Encoder {
         }
     }
 
-    private func output(_ sb: CMSampleBuffer, captureMs: Double, encMs: Double) {
+    private func output(_ sb: CMSampleBuffer, captureMs: Double, encMs: Double, again: Bool) {
         var isKey = true
         if let atts = CMSampleBufferGetSampleAttachmentsArray(sb, createIfNecessary: false) as? [[String: Any]],
            let first = atts.first, let notSync = first[kCMSampleAttachmentKey_NotSync as String] as? Bool, notSync {
@@ -829,20 +839,25 @@ final class Encoder {
                 off += n
             }
         }
-        let kind: UInt8 = isKey ? 2 : 3
+        let kind: UInt8 = isKey ? (again ? 9 : 2) : (again ? 10 : 3)
         emit(tag | kind, captureMs, annexB)
 
         statsLock.lock()
         frames += 1
         encSum += encMs
-        capSum += max(0, nowMs() - captureMs)
+        if !again {
+            // a repeat's capture time is its picture's own (old) one: it isn't a capture -> encoded time
+            capSum += max(0, nowMs() - captureMs)
+            capFrames += 1
+        }
         let now = nowMs()
         if now - lastStats >= 1000 {
             let f = Double(frames)
-            let obj: [String: Any] = ["encode_ms": encSum / f, "capture_to_encoded_ms": capSum / f, "fps": f * 1000 / (now - lastStats)]
+            let obj: [String: Any] = ["encode_ms": encSum / f, "capture_to_encoded_ms": capSum / Double(max(1, capFrames)), "fps": f * 1000 / (now - lastStats)]
             frames = 0
             encSum = 0
             capSum = 0
+            capFrames = 0
             lastStats = now
             statsLock.unlock()
             emitJSON(tag | 4, obj)
@@ -1191,7 +1206,12 @@ final class Capturer: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate {
     private var lastBuffer: CVPixelBuffer?
     private var lastRaw: CVPixelBuffer? // the last frame as captured (before any turn)
     private var lastFrameAt = 0.0
+    private var lastCaptured = 0.0 // the newest device frame's own capture time (lastBuffer's), ms since the epoch
     private var gotFrame = false // a video frame came from the device (used on the capture queue only)
+    // 2026-11-27, the heartbeat (kind 7): frames in from the device and out to the encoders since the last one
+    private var framesIn = 0
+    private var framesOut = 0
+    private var beatTimer: DispatchSourceTimer?
     private var input: AVCaptureDeviceInput?
     var audio: AudioTap?
     // the buffers' shape against the screen's own (see followSource); used on the capture queue only
@@ -1272,6 +1292,39 @@ final class Capturer: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate {
             log("no frames from the iPhone screen device in \(Int(FIRST_FRAME_SECONDS)) s (running: \(self.session.isRunning)); starting over")
             exit(9)
         }
+        // 2026-11-27: the heartbeat, once a second on the capture queue (a hung queue sends none: the server sees it)
+        let beat = DispatchSource.makeTimerSource(queue: queue)
+        beat.schedule(deadline: .now() + 1.0, repeating: 1.0)
+        beat.setEventHandler { [weak self] in self?.heartbeat() }
+        beatTimer = beat
+        beat.resume()
+    }
+
+    /// Called on `queue`, once a second: the session runs, frames in and out since the last one, the newest frame's time.
+    private func heartbeat() {
+        emitJSON(7, ["running": session.isRunning, "finding": false, "frames_in": framesIn, "frames_out": framesOut,
+                     "last_frame": lastCaptured, "lanes": lanes.count])
+        framesIn = 0
+        framesOut = 0
+    }
+
+    /// Called on `queue`. A JPEG of the newest picture (kind 8), stamped with that picture's own capture time, at most
+    /// `longSide` pixels on its long side (0: as captured).
+    func still(_ longSide: Int) {
+        guard let pb = lastBuffer else { return }
+        var image = CIImage(cvPixelBuffer: pb)
+        let long = max(image.extent.width, image.extent.height)
+        if longSide > 0 && long > CGFloat(longSide) {
+            let s = CGFloat(longSide) / long
+            image = image.transformed(by: CGAffineTransform(scaleX: s, y: s))
+        }
+        let quality = CIImageRepresentationOption(rawValue: kCGImageDestinationLossyCompressionQuality as String)
+        guard let space = CGColorSpace(name: CGColorSpace.sRGB),
+              let jpeg = ciContext.jpegRepresentation(of: image, colorSpace: space, options: [quality: 0.8]) else {
+            log("still: the JPEG could not be made")
+            return
+        }
+        emit(8, lastCaptured, jpeg)
     }
 
     /// The screen's own picture size now (the device's video port format), or nil when it doesn't say.
@@ -1386,7 +1439,7 @@ final class Capturer: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate {
         for id in lanes.keys.sorted() {
             if let lane = lanes[id] {
                 lane.keyWanted = true
-                encode(lane, pb, captured: nowMs())
+                encode(lane, pb, captured: lastCaptured, again: true) // the same picture turned: its own time
             }
         }
     }
@@ -1410,6 +1463,8 @@ final class Capturer: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate {
         }
         lastBuffer = pb
         lastFrameAt = nowMs()
+        lastCaptured = captured
+        framesIn += 1
         for id in lanes.keys.sorted() {
             if let lane = lanes[id] { offer(lane, pb, captured: captured) }
         }
@@ -1459,7 +1514,8 @@ final class Capturer: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate {
         return dst
     }
 
-    private func encode(_ lane: EncodeLane, _ pb: CVPixelBuffer, captured: Double) {
+    /// `again`: an earlier picture encoded again (its kind says so, and `captured` is its own capture time).
+    private func encode(_ lane: EncodeLane, _ pb: CVPixelBuffer, captured: Double, again: Bool = false) {
         let w = CVPixelBufferGetWidth(pb)
         let h = CVPixelBufferGetHeight(pb)
         var tw = w
@@ -1488,15 +1544,17 @@ final class Capturer: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate {
         lane.keyWanted = false
         lane.pending = nil
         lane.lastEncodedAt = nowMs()
-        enc.encode(frame, captureMs: captured, forceKey: force)
+        framesOut += 1
+        enc.encode(frame, captureMs: captured, forceKey: force, again: again)
     }
 
-    /// Called on `queue`. Force an IDR on a lane; if the screen is still (no new frames), re-encode the last one now.
+    /// Called on `queue`. Force an IDR on a lane; if the screen is still (no new frames), re-encode the last one now
+    /// (2026-11-27: as a repeat, with that picture's own capture time).
     func requestKey(_ id: Int) {
         guard let lane = lanes[id] else { return }
         lane.keyWanted = true
         if let pb = lastBuffer, nowMs() - lastFrameAt > 30 {
-            encode(lane, pb, captured: nowMs())
+            encode(lane, pb, captured: lastCaptured, again: true)
         }
     }
 
@@ -1534,14 +1592,17 @@ final class Capturer: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate {
             lane.keySeconds = max(0.5, min(10, keySeconds))
             setFps(id, fps)
             setBitrate(id, bitrate)
+            // 2026-11-27: a lane taken up again (its viewer back during an audio hold) keeps its encoder: it needs a
+            // keyframe now, or its new viewer has no picture until the next interval
+            lane.keyWanted = true
         } else {
             lane = EncodeLane(id: id, fps: fps, scale: scale, bitrate: bitrate, keySeconds: keySeconds)
             lanes[id] = lane
         }
         log("lane \(id): \(lane.fps) fps, \(lane.scale)%, \(lane.bitrate / 1000) kbps")
-        // a still screen sends no frames: the lane's first picture comes from the last one
-        if lane.encoder == nil, let pb = lastBuffer, nowMs() - lastFrameAt > 30 {
-            encode(lane, pb, captured: nowMs())
+        // a still screen sends no frames: the lane's picture comes from the last one (a repeat, with its own time)
+        if let pb = lastBuffer, nowMs() - lastFrameAt > 30 {
+            encode(lane, pb, captured: lastCaptured, again: true)
         }
     }
 
@@ -1598,7 +1659,13 @@ var device: AVCaptureDevice?
 var linkedBy = ""
 var sameName: String?
 let deadline = Date().addingTimeInterval(opts.waitSeconds)
+var nextBeat = Date()
 while device == nil && Date() < deadline {
+    // 2026-11-27: the heartbeat while it looks (the server shows Finding, not a dead helper)
+    if Date() >= nextBeat {
+        emitJSON(7, ["running": false, "finding": true, "frames_in": 0, "frames_out": 0, "last_frame": 0, "lanes": 0])
+        nextBeat = Date().addingTimeInterval(1)
+    }
     switch pickDevice(opts) {
     case .found(let d, let how):
         device = d
@@ -1674,6 +1741,10 @@ Thread.detachNewThread {
             if n >= 2, let d = Int(parts[1]) {
                 capturer.queue.async { capturer.setRotation(d) }
             }
+        case "still":
+            // "still [<long side px>]": a kind 8 JPEG of the newest picture
+            let longSide = n >= 2 ? (Int(parts[1]) ?? 0) : 0
+            capturer.queue.async { capturer.still(longSide) }
         default:
             break
         }

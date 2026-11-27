@@ -148,7 +148,11 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
   assert.equal(info.remb, 1_500_000);
   assert.equal(info.wantsKey, true);
   const none = parseRtcp(Buffer.from([0x80, 201, 0, 1, 0, 0, 0, 1]));
-  assert.deepEqual(none, { fractionLost: null, rttMs: null, nacked: 0, remb: null, wantsKey: false });
+  assert.deepEqual(none, { fractionLost: null, rttMs: null, nacked: 0, remb: null, wantsKey: false, blocks: [] });
+  // 2026-11-27: each report block's source and interarrival jitter (90 kHz units for the video)
+  const rrj = Buffer.from(rr);
+  rrj.writeUInt32BE(11_430, 20); // 127 ms at 90 kHz
+  assert.deepEqual(parseRtcp(rrj).blocks, [{ ssrc: 1234, fractionLost: 0.25, jitter: 11_430 }]);
   assert.doesNotThrow(() => parseRtcp(Buffer.from([0x81, 201, 0, 50, 1, 2])));
   ok('RTCP: receiver report loss, NACKed packets, REMB, PLI in one compound packet; short packets are safe');
 

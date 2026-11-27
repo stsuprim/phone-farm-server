@@ -1,12 +1,17 @@
+import { actorsFor, Actors } from './phone/actor.js';
+import { AWAKE_FOR_MS, isPowerFeed, PowerTracker, PowerView } from './phone/power.js';
 import type { Backend } from './types.js';
 
 /**
  * Idle lock and wake. After `idleLockMinutes` (src/settings.ts) with no input and no open viewer on a phone, the
- * server locks it (screen off: WDA /wda/lock). Input or a new viewer (a stream or WebRTC session) counts as activity:
- * it wakes the phone by itself (WDA /wda/unlock: home press + swipe, which lands past the lock screen when there's no
- * passcode) before the input goes through.
+ * server locks it (screen off: WDA /wda/lock), under the phone's `system` lease (src/phone/actor.ts): only a phone
+ * that's Free (nobody driving it, nothing on its way) is locked, never inside an input's turn.
  *
- * Input only waits for a wake when the phone is known to be locked, so a tap on an awake phone pays nothing.
+ * 2026-11-27 (docs/root-cause.md 13.3d, G6): the power state comes from observations only (src/phone/power.ts).
+ * Nothing is pressed on inference: an input is never preceded by a "is it locked?" look of its own, a screen that
+ * couldn't be looked at is never woken with Home presses, and a wake goes out only when asked (POST /wake, the wake
+ * key, a viewer's open) or on an observed dark or locked screen. An input on a phone observed locked or dark (the
+ * server's own idle lock, a watch that saw it) has that phone woken first, as its own turn in the phone's queue.
  */
 
 export interface PowerState {
@@ -16,22 +21,24 @@ export interface PowerState {
   viewers: number;
   /** The last lock/wake failure (e.g. a passcode keeps it locked), or null. */
   error: string | null;
+  /** 2026-11-27: what was observed of the screen, and when (src/phone/power.ts): Unknown is never acted on. */
+  power?: PowerView;
 }
 
 interface Entry extends PowerState {
   known: boolean; // seen online + ready since the server started (idle time counts from then)
   busy?: Promise<void>; // a lock or wake in progress
-  checkedAt: number; // when the phone was last asked whether it's locked before an input
-  unsure?: boolean; // the last ask got no answer: every input asks again until one comes
+  busyKind?: 'wake' | 'lock';
   asked?: boolean; // locked on request (an idle lock, a lock key, a switch of the live phone), not found dark
 }
 
-/** A phone can't have gone dark by itself sooner than this after its last input (iOS's shortest Auto-Lock is 30 s). */
-export const AWAKE_FOR_MS = 25_000;
-/** An input waits this long at most to hear whether the phone is locked. */
-const LOCKED_ASK_MS = 4000;
+export { AWAKE_FOR_MS };
 /** A wake for a live view that has no picture waits this long at most for the phone's control link to come up. */
 export const PICTURE_WAKE_WAIT_MS = 150_000;
+/** A lock or wake (a power job) must start within this long, else it's refused (the phone is busy). */
+const POWER_START_MS = 30_000;
+/** A wake in front of an input takes at most this long; then the input goes anyway. */
+const WAKE_BEFORE_INPUT_MS = 30_000;
 
 export interface IdleOptions {
   now?: () => number;
@@ -40,6 +47,8 @@ export interface IdleOptions {
   log?: (m: string) => void;
   /** Which phones can be locked now (online, WDA ready); default: backend.list(). */
   devices?: () => Promise<string[]>;
+  /** The phones' actors (default: the backend's, shared with its Control). */
+  actors?: Actors;
 }
 
 export class IdleLock {
@@ -48,10 +57,18 @@ export class IdleLock {
   private now: () => number;
   private log: (m: string) => void;
   private ticking = false;
+  private actors: Actors;
+  /** What was observed of each phone's screen (src/phone/power.ts). */
+  readonly power: PowerTracker;
+  private unwatch?: () => void;
 
   constructor(private backend: Backend, private minutes: () => number, private o: IdleOptions = {}) {
     this.now = o.now ?? Date.now;
     this.log = o.log ?? ((m) => console.log(`[idle] ${m}`));
+    this.actors = o.actors ?? actorsFor(backend);
+    this.power = new PowerTracker(this.now);
+    // the backend says what it saw as it reads the screen (a moving capture, a still, WDA's lock word)
+    if (isPowerFeed(backend)) this.unwatch = backend.watchPower((udid, ob) => this.power.observe(udid, ob));
     const every = o.tickMs ?? 30_000;
     if (every > 0) {
       this.timer = setInterval(() => void this.tick(), every);
@@ -66,15 +83,16 @@ export class IdleLock {
 
   private entry(udid: string): Entry {
     let e = this.st.get(udid);
-    if (!e) this.st.set(udid, (e = { locked: null, screenOn: null, lastActive: null, viewers: 0, error: null, known: false, checkedAt: -Infinity }));
+    if (!e) this.st.set(udid, (e = { locked: null, screenOn: null, lastActive: null, viewers: 0, error: null, known: false }));
     return e;
   }
 
   state(udid: string): PowerState {
     const e = this.st.get(udid);
+    const power = this.power.view(udid);
     return e
-      ? { locked: e.locked, screenOn: e.screenOn, lastActive: e.lastActive, viewers: e.viewers, error: e.error }
-      : { locked: null, screenOn: null, lastActive: null, viewers: 0, error: null };
+      ? { locked: e.locked, screenOn: e.screenOn, lastActive: e.lastActive, viewers: e.viewers, error: e.error, power }
+      : { locked: null, screenOn: null, lastActive: null, viewers: 0, error: null, power };
   }
 
   /** Open viewers on every phone (the WDA re-sign waits for none unless expiry is close). */
@@ -84,88 +102,60 @@ export class IdleLock {
     return n;
   }
 
-  /**
-   * Input on the phone: counts as activity. Returns a promise to wait on only when the phone is known to be locked
-   * (the wake), or, for a `discrete` action (a tap, a swipe, a touch's down, typing) on a phone left alone long
-   * enough to have gone dark by itself, while it's asked and woken if it is; else null (nothing to wait for).
-   */
-  activity(udid: string, discrete = false): Promise<void> | null {
-    const e = this.entry(udid);
-    const now = this.now();
-    const quiet = e.lastActive === null ? Infinity : now - e.lastActive;
-    e.lastActive = now;
-    e.known = true;
-    if (e.busy) return e.busy.catch(() => {});
-    if (e.locked === true) return this.wake(udid).then(() => undefined, () => undefined);
-    if (discrete && this.supported && this.backend.isLocked && (quiet >= AWAKE_FOR_MS || e.unsure) && now - e.checkedAt >= AWAKE_FOR_MS) {
-      e.checkedAt = now;
-      return this.ensureAwake(udid).catch(() => {});
-    }
-    return null;
+  /** Observed off: locked by the server (and not woken since) or seen dark or locked. */
+  private observedOff(udid: string, e: Entry): boolean {
+    return e.locked === true || this.power.observedOff(udid);
   }
 
-  /** Ask the phone whether it's locked (it may have gone dark by itself) and wake it if it is; never presses blind. */
-  private ensureAwake(udid: string): Promise<void> {
+  /**
+   * Input on the phone: counts as activity. Returns a promise to wait on (as its own turn, before the input: see
+   * Control) only when the phone was observed locked or dark: the wake; else null. 2026-11-27: no look of its own
+   * before an input any more (it used to ask the phone after 25 s of quiet, inside the input's turn), and a lock in
+   * progress is never waited for (input never waits behind a power action).
+   */
+  activity(udid: string, _discrete = false): Promise<void> | null {
     const e = this.entry(udid);
-    return this.serial(e, async () => {
-      const ask = this.backend.isLocked!(udid).catch(() => null);
-      const l = await Promise.race([ask, new Promise<null>((r) => setTimeout(() => r(null), LOCKED_ASK_MS).unref?.())]);
-      if (l !== null) e.unsure = false;
-      if (l === false) {
-        e.locked = false;
-        e.screenOn = true;
-        return;
-      }
-      if (l !== true) {
-        // it can't tell (WDA slow to answer after a quiet spell): the input goes as it is, and the next one asks again
-        // rather than every input for the next 25 s going to a phone that may be dark
-        e.checkedAt = -Infinity;
-        e.unsure = true;
-        return;
-      }
-      e.locked = true;
-      e.screenOn = false;
-      await this.backend.unlock!(udid);
-      this.backend.silence?.(udid, 'woken before an input');
-      const still = await this.backend.isLocked!(udid).catch(() => null);
-      e.screenOn = true;
-      e.locked = still === true;
-      e.error = still ? 'still locked after wake (a passcode is set: enter it on the phone once, or remove it)' : null;
-      if (!still) this.log(`${udid.slice(-8)} was dark: woke before the input`);
-    });
+    e.lastActive = this.now();
+    e.known = true;
+    if (e.busy && e.busyKind === 'wake') return e.busy.catch(() => {});
+    // the wake goes into the phone's input line now, so it's the turn right before this input's
+    if (this.supported && !e.busy && this.observedOff(udid, e)) return this.wakeNow(udid, true, false, 'input').then(() => undefined, () => undefined);
+    return null;
   }
 
   /**
    * What a health check learned about the lock (not activity): a phone found locked is woken by the next input
-   * before it acts, without asking first. 2026-11-16: one found locked or dark that nobody asked to lock, while a
-   * viewer watches it (it went dark by itself: iOS's Auto-Lock), is woken now, so a watched phone never stays black.
+   * before it acts. 2026-11-16: one found locked or dark that nobody asked to lock, while a viewer watches it (it went
+   * dark by itself: iOS's Auto-Lock), is woken now (an observation, never an inference), so a watched phone never
+   * stays black. `null` (it couldn't tell) changes nothing.
    */
   note(udid: string, locked: boolean | null): void {
     if (locked === null) return;
     const e = this.entry(udid);
     if (e.busy) return; // a lock or wake in progress says better
-    e.unsure = false;
+    this.power.observe(udid, { screen: locked ? 'locked' : 'on', from: 'watch' });
     e.locked = locked;
     e.screenOn = !locked;
     if (!locked) e.asked = false;
     else if (!e.asked && e.viewers > 0 && this.supported) {
       this.log(`${udid.slice(-8)} went dark while watched: waking`);
-      void this.wake(udid).catch(() => {});
+      void this.wakeNow(udid, true).catch(() => {});
     }
   }
 
   /**
-   * A viewer opened (stream or WebRTC session): activity, and the phone wakes. Returns the release. 2026-11-17:
-   * `wake: false` (the control socket): activity only, the phone is left as it is (a Lotus that opens a phone's
-   * control link has had the owner press Unlock, which wakes it by POST /wake; a picture's own offer wakes it too).
+   * A viewer opened (stream or WebRTC session): activity, and the phone wakes if it's observed off. Returns the
+   * release. 2026-11-17: `wake: false` (the control socket): activity only, the phone is left as it is (a Lotus that
+   * opens a phone's control link has had the owner press Unlock, which wakes it by POST /wake; a picture's own offer
+   * wakes it too).
    */
   viewer(udid: string, wake = true): () => void {
     const e = this.entry(udid);
     e.viewers++;
     e.lastActive = this.now();
     e.known = true;
-    // a viewer isn't latency-critical: the phone is asked whether it's locked or dark unless it's known to be
-    // (2026-11-16: also when it's thought awake: a phone that went dark by itself says nothing, and showed black)
+    // a viewer isn't latency-critical: the phone is looked at (never pressed blind) and woken only when that shows
+    // it's locked or dark
     if (wake && this.supported) void this.wake(udid, e.locked !== true).catch(() => {});
     let done = false;
     return () => {
@@ -177,50 +167,72 @@ export class IdleLock {
   }
 
   /**
-   * Wake and unlock now. `check`: ask first and do nothing if it's already unlocked. `force` (2026-11-18: the live
-   * view's capture gives no picture): a screen that can't be looked at counts as dark (src/dark.ts wakeScreen).
-   * After a wake the phone is silenced again (src/audio.ts, at most every few minutes).
+   * Wake and unlock now. Without `check` it's the owner's explicit wake (POST /wake, the wake key): WDA's unlock goes
+   * even when the phone doesn't say whether it's locked. With `check` (a viewer, an offer) the phone is asked first and
+   * left alone when it's unlocked. Either way Home is pressed only on a screen observed dark (src/dark.ts). `force`
+   * is kept for callers and changes nothing now (2026-11-27). After a wake the phone is silenced again.
    */
-  wake(udid: string, check = false, force = false): Promise<PowerState> {
-    const e = this.entry(udid);
-    e.lastActive = this.now();
-    e.known = true;
-    return this.serial(e, async () => {
-      if (!this.backend.unlock) throw new Error('this backend cannot wake phones');
-      if (check && this.backend.isLocked) {
-        const l = await this.backend.isLocked(udid).catch(() => null);
-        if (l === false) {
-          e.locked = false;
-          e.screenOn = true;
-          return;
-        }
-      }
-      await (force ? this.backend.unlock(udid, { force: true }) : this.backend.unlock(udid));
-      this.backend.silence?.(udid, 'woken');
-      const still = this.backend.isLocked ? await this.backend.isLocked(udid).catch(() => null) : false;
-      e.asked = false;
-      e.screenOn = true;
-      e.locked = still === null ? false : still;
-      e.error = still ? 'still locked after wake (a passcode is set: enter it on the phone once, or remove it)' : null;
-      if (!still) this.log(`${udid.slice(-8)} woke`);
-    }).then(() => this.state(udid));
+  wake(udid: string, check = false, _force = false): Promise<PowerState> {
+    return this.wakeNow(udid, false, check).then(() => this.state(udid));
   }
 
   /**
-   * 2026-11-18 (a live view stuck on "connecting" while the phone's screen was off): the capture gave no picture, so
-   * the phone is woken now, whatever was thought of it (`force`: a screen that can't be looked at counts as dark).
-   * Resolves null when it's awake, else why not, in a line for the viewer.
+   * One wake as a power job of the phone's actor. `observed`: it's for an observed Locked/Dark (automatic), so WDA's
+   * unlock goes only on its own "locked". Inside an input's job (the owner's wake key) it runs in that turn.
    */
-  async wakeForPicture(udid: string, force = true): Promise<string | null> {
+  private wakeNow(udid: string, observed: boolean, check = false, line: 'input' | 'power' = 'power'): Promise<void> {
+    const e = this.entry(udid);
+    e.lastActive = this.now();
+    e.known = true;
+    return this.serial(e, 'wake', () =>
+      this.actors.of(udid).submit({
+        // before an input: its own turn in the input line (the input follows it); else a power job beside input
+        kind: line, label: 'wake', who: { server: 'power' }, startWithinMs: POWER_START_MS,
+        ...(line === 'input' ? { timeoutMs: WAKE_BEFORE_INPUT_MS, must: true } : {}),
+        run: async () => {
+          if (!this.backend.unlock) throw new Error('this backend cannot wake phones');
+          if (check && this.backend.isLocked) {
+            const l = await this.backend.isLocked(udid).catch(() => null);
+            if (l === false) {
+              this.power.observe(udid, { screen: 'on', from: 'wake-check' });
+              e.locked = false;
+              e.screenOn = true;
+              return;
+            }
+          }
+          this.power.waking(udid);
+          // `explicit`: src/real.ts reads it (the Backend type of src/types.ts says `force` only)
+          const opts = { force: false, explicit: !observed && !check };
+          await this.backend.unlock(udid, opts);
+          this.backend.silence?.(udid, 'woken');
+          const still = this.backend.isLocked ? await this.backend.isLocked(udid).catch(() => null) : false;
+          e.asked = false;
+          if (still === true) this.power.observe(udid, { screen: 'locked', from: 'wake' });
+          else if (still === false) this.power.observe(udid, { screen: 'on', from: 'wake' });
+          else this.power.forget(udid); // it couldn't be told: Unknown, never acted on
+          e.screenOn = still === null ? null : !still;
+          e.locked = still;
+          e.error = still ? 'still locked after wake (a passcode is set: enter it on the phone once, or remove it)' : null;
+          if (!still) this.log(`${udid.slice(-8)} woke`);
+        },
+      }),
+    );
+  }
+
+  /**
+   * 2026-11-18, 2026-11-27: the capture gave no picture. The phone is looked at and woken only if that shows it locked
+   * or dark (a screen that can't be looked at is never pressed: docs/root-cause.md section 6). Resolves null when it's
+   * awake (or nothing could be told), else why not, in a line for the viewer.
+   */
+  async wakeForPicture(udid: string, _force = true): Promise<string | null> {
     if (!this.supported) return 'this server cannot wake phones';
     // 2026-11-22 (iPhone-2 stuck on "connecting" after a replug): a phone just plugged in is locked, and its USB
     // screen capture shows nothing until it's unlocked once; the unlock needs its control link, which takes a minute
-    // or two to start after a replug. The wake gave up after 15 s ("restarting, so its screen can't be woken yet"),
-    // and nothing woke it when the link came up. Now it waits for the link (outside the phone's lock/wake turn, so
-    // nothing else waits behind it) and wakes the phone as soon as it can; the viewer's next try gets the picture.
+    // or two to start after a replug. It waits for the link (outside the phone's queue) and then looks.
     if (this.backend.whenControlReady) await this.backend.whenControlReady(udid, PICTURE_WAKE_WAIT_MS).catch(() => false);
     try {
-      const st = await this.wake(udid, false, force);
+      await this.wakeNow(udid, true, true);
+      const st = this.state(udid);
       if (st.locked) return st.error ?? 'the phone stayed locked (a passcode is set: enter it on the phone once, or remove it)';
       return null;
     } catch (err) {
@@ -228,22 +240,32 @@ export class IdleLock {
     }
   }
 
-  /** Lock (screen off) now. */
+  /** Lock (screen off) now: a power job (inside the owner's lock key it's that key's own turn). */
   lock(udid: string): Promise<PowerState> {
     const e = this.entry(udid);
-    return this.serial(e, async () => {
-      if (!this.backend.lock) throw new Error('this backend cannot lock phones');
-      await this.backend.lock(udid);
-      e.locked = true;
-      e.screenOn = false;
-      e.asked = true;
-      e.error = null;
-    }).then(() => this.state(udid));
+    return this.serial(e, 'lock', () =>
+      this.actors.of(udid).submit({
+        kind: 'power', label: 'lock', who: { server: 'power' }, startWithinMs: POWER_START_MS,
+        run: async () => {
+          if (!this.backend.lock) throw new Error('this backend cannot lock phones');
+          await this.backend.lock(udid);
+          this.power.observe(udid, { screen: 'locked', from: 'lock' });
+          e.locked = true;
+          e.screenOn = false;
+          e.asked = true;
+          e.error = null;
+        },
+      }),
+    ).then(() => this.state(udid));
   }
 
-  private serial(e: Entry, fn: () => Promise<void>): Promise<void> {
-    const prev = e.busy ?? Promise.resolve();
-    const p = prev.catch(() => {}).then(fn);
+  private serial(e: Entry, kind: 'wake' | 'lock', fn: () => Promise<void>): Promise<void> {
+    const start = () => {
+      e.busyKind = kind;
+      return fn();
+    };
+    // nothing in progress: started now (synchronously), so its job takes its place in the queue before the caller's next
+    const p = e.busy ? e.busy.catch(() => {}).then(start) : start();
     const mine = p.then(
       () => undefined,
       (err: Error) => {
@@ -252,7 +274,10 @@ export class IdleLock {
     );
     e.busy = mine;
     void mine.then(() => {
-      if (e.busy === mine) e.busy = undefined;
+      if (e.busy === mine) {
+        e.busy = undefined;
+        e.busyKind = undefined;
+      }
     });
     return p;
   }
@@ -263,7 +288,10 @@ export class IdleLock {
     return now - e.lastActive >= minutes * 60_000;
   }
 
-  /** The periodic check: learn the phones, lock the idle ones. Returns the phones it locked. */
+  /**
+   * The periodic check: learn the phones, lock the idle ones. Returns the phones it locked. Each lock takes the
+   * phone's system lease ("idle-lock"): a phone someone drives, or with anything on its way, is left for the next tick.
+   */
   async tick(): Promise<string[]> {
     if (this.ticking || !this.supported) return [];
     this.ticking = true;
@@ -284,6 +312,8 @@ export class IdleLock {
       for (const udid of ids) {
         const e = this.entry(udid);
         if (e.busy || !IdleLock.due(e, minutes, now)) continue;
+        const release = this.actors.of(udid).trySystem('idle-lock');
+        if (!release) continue; // not Free: tried again next tick
         try {
           await this.lock(udid);
           locked.push(udid);
@@ -291,6 +321,8 @@ export class IdleLock {
         } catch (err) {
           this.log(`${udid.slice(-8)} could not be locked: ${(err as Error).message}`);
           e.lastActive = now; // try again after another idle period, not every tick
+        } finally {
+          release();
         }
       }
     } finally {
@@ -301,5 +333,6 @@ export class IdleLock {
 
   close(): void {
     if (this.timer) clearInterval(this.timer);
+    this.unwatch?.();
   }
 }
