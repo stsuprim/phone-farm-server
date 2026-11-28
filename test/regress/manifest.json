@@ -24,6 +24,8 @@
     {"id": "xcodebuild-one-at-a-time", "title": "Runner restarts one phone at a time, old runner down first", "section": "§10", "commits": ["0f60be5", "54977f4"], "file": "xcodebuild-one-at-a-time.ts", "expectedAfterRebuild": false, "timeoutMs": 120000},
     {"id": "dead-stream-viewers-closed", "title": "Dead stream viewers closed; jittery or ping-less ones kept", "section": "§3/§11", "commits": ["c691b99"], "file": "dead-stream-viewers-closed.ts", "expectedAfterRebuild": false, "timeoutMs": 10000},
     {"id": "updates-do-not-restart-runners", "title": "Updates (API shutdown) do not restart runners", "section": "§11", "commits": ["c691b99"], "file": "updates-do-not-restart-runners.ts", "expectedAfterRebuild": false, "timeoutMs": 60000},
+    {"id": "silence-waits-for-install-check", "title": "Keep-silent volume presses wait for the fork install check (v7 rollback)", "section": "§11", "commits": ["0a0a389", "44cf2e7"], "file": "silence-waits-for-install-check.ts", "expectedAfterRebuild": false, "timeoutMs": 40000},
+    {"id": "install-check-still-retried", "title": "The install check's still is retried with a backoff", "section": "§11", "commits": ["0a0a389"], "file": "install-check-still-retried.ts", "expectedAfterRebuild": false, "timeoutMs": 40000},
     {"id": "soak-dry-run", "title": "The soak driver runs 20 s against mock mode with a clean verdict", "section": "tooling", "commits": [], "file": "soak-dry-run.ts", "expectedAfterRebuild": false, "timeoutMs": 90000}
   ]
 }

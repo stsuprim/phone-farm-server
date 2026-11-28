@@ -147,6 +147,8 @@ export interface FarmOptions {
   verbose?: boolean;
   /** Wait for every phone's control link to be ready (default true). */
   waitReady?: boolean;
+  /** Config overrides (e.g. phoneSilent: true). */
+  cfg?: Record<string, unknown>;
 }
 
 export interface Farm extends Api {
@@ -263,7 +265,7 @@ export async function startFarm(o: FarmOptions): Promise<Farm> {
     wdaBasePort: desk[0]!.port, mjpegBasePort: 40100 + Math.floor(Math.random() * 1000), wdaProject: '/fake/WebDriverAgent', wdaDerivedData: '/fake/dd',
     pollMs: o.pollMs || 60_000, autostartWda: true, autoUpdateSeconds: 0, autoUpdateMinutes: 0,
     h264: false, h264BitrateMbps: 8, audio: false, phoneSilent: false, hidInput: 'off', hidPython: 'python3', hidIdleSeconds: 60,
-    captureWarmSeconds: 0, dataDir: 'data', wdaTeamId: '', wdaResign: false, wdaResignHour: 3, wdaFork: false,
+    captureWarmSeconds: 0, dataDir: 'data', wdaTeamId: '', wdaResign: false, wdaResignHour: 3, wdaFork: false, ...(o.cfg ?? {}),
   };
   fs.mkdirSync('data', { recursive: true });
   // the phones' indexes, so phone n is on base + n (WdaManager reads data/ports.json)

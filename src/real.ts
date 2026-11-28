@@ -232,8 +232,15 @@ export class RealBackend implements Backend, CaptureLook, PowerFeed {
     // its known screen size by model (src/screens.ts), when WDA gives nothing usable
     this.wda.modelOf = (udid) => this.phones.get(udid)?.model || null;
     // 2026-11-18: every time a phone's WDA comes up (a start, a restart, a rebuild), its volume goes all the way down
+    // 2026-11-28: never while our build's install check runs (switchWda holds it): WDA takes one request at a time, so up
+    // to 17 volume presses made the check's /lotus/shot wait, fail, and the stock build went back (v7, 7 times)
     this.wda.onSession = (udid, fresh) => {
-      if (silent && fresh) void this.volume.silence(udid, true, 'its WebDriverAgent came up').catch(() => {});
+      if (!silent || !fresh) return;
+      if (this.silenceHold.has(udid)) {
+        this.silencePending.add(udid);
+        return;
+      }
+      void this.volume.silence(udid, true, 'its WebDriverAgent came up').catch(() => {});
     };
     this.wda.onOrientation = (udid) => {
       const c = this.capture.get(udid);
@@ -1079,12 +1086,28 @@ export class RealBackend implements Backend, CaptureLook, PowerFeed {
 
   /** Restart the phone's runner as the stock WebDriverAgent or our build, waiting until it answers. */
   async switchWda(udid: string, flavor: WdaFlavor): Promise<{ ok: boolean; why?: string }> {
-    const r = await this.wda.switchFlavor(udid, flavor);
-    if (!r.ok || flavor !== 'fork') return r;
-    // ours answers: it must also do the work (a session, the screen's size, a still) before it's kept
-    const missing = await this.wda.forkWorks(udid);
-    return missing ? { ok: false, why: missing } : r;
+    if (flavor !== 'fork') return this.wda.switchFlavor(udid, flavor);
+    // 2026-11-28: the keep-silent presses wait until the install check has passed (see onSession)
+    this.silenceHold.add(udid);
+    let passed = false;
+    try {
+      const r = await this.wda.switchFlavor(udid, flavor);
+      if (!r.ok) return r;
+      // ours answers: it must also do the work (a session, the screen's size, a still) before it's kept
+      const missing = await this.wda.forkWorks(udid);
+      passed = !missing;
+      return missing ? { ok: false, why: missing } : r;
+    } finally {
+      this.silenceHold.delete(udid);
+      const pending = this.silencePending.delete(udid);
+      // on a pass the phone is silenced now; on a failure the stock build goes back and its own session silences it
+      if (passed && pending) void this.volume.silence(udid, true, 'our WebDriverAgent passed its install check').catch(() => {});
+    }
   }
+
+  /** Phones whose keep-silent presses wait for our build's install check, and those that came up meanwhile. */
+  private silenceHold = new Set<string>();
+  private silencePending = new Set<string>();
 
   /** The phone's index (its Mac ports are the bases plus it; our build's port on the phone too). */
   wdaSlot(udid: string): number {

@@ -4243,14 +4243,22 @@ export class WdaManager {
     if (e.status !== 'ready') return 'its runner stopped right after it started';
     if (!e.sessionId) return 'it answers, but no session could be made';
     if (!e.screen) return "it answers, but doesn't say the screen's size";
-    try {
-      const jpeg = await this.shot(udid, 25, 40, 10_000);
-      if (jpeg.length < 4 || jpeg[0] !== 0xff || jpeg[1] !== 0xd8) return 'its still is not a JPEG';
-    } catch (err) {
-      return `it gave no still (${(err as Error).message})`;
+    // 2026-11-28: the still is tried again with a short backoff (a request ahead of it on the one-at-a-time queue, or a
+    // slow first screenshot, must not roll back a good build)
+    let last = '';
+    for (const wait of [0, 1500, 4000]) {
+      if (wait) await sleep(wait);
+      if (e.status !== 'ready') return 'its runner stopped right after it started';
+      try {
+        const jpeg = await this.shot(udid, 25, 40, 10_000);
+        if (jpeg.length < 4 || jpeg[0] !== 0xff || jpeg[1] !== 0xd8) return 'its still is not a JPEG';
+        this.setControl(e, 'ready');
+        return null;
+      } catch (err) {
+        last = (err as Error).message;
+      }
     }
-    this.setControl(e, 'ready');
-    return null;
+    return `it gave no still (${last})`;
   }
 
   /** One still as a JPEG from our build (GET /lotus/shot), `scale` and `quality` 1-100; never recovers anything. */
